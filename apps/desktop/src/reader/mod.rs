@@ -194,7 +194,7 @@ pub(crate) fn open_reader_staged(
     local_store: SyncStore,
     viewport: LayoutViewport,
     initial_href: Option<&rebook_publication::PublicationUrl>,
-    publish_toc: impl FnOnce(
+    mut publish_toc: impl FnMut(
         Arc<[rebook_publication::TocEntry]>,
         ReadingMode,
         Option<String>,
@@ -331,27 +331,15 @@ pub(crate) fn open_reader_staged(
         controller.remap_locator(&mut progress.locator);
     }
     let progress_ms = progress_started.elapsed().as_secs_f32() * 1_000.0;
-    let initial_title = initial_href
-        .or_else(|| {
-            stored_progress
-                .as_ref()
-                .map(|progress| &progress.locator.href)
-        })
-        .or_else(|| {
-            canonical_source
-                .book()
-                .sections
-                .first()
-                .map(|section| &section.href)
-        })
-        .and_then(|href| {
-            chrome::toc_label_for_href(&canonical_source.book().table_of_contents, href)
-        })
-        .map(str::to_owned);
+    let opening_toc: Arc<[rebook_publication::TocEntry]> =
+        canonical_source.book().table_of_contents.clone().into();
     let Some(viewport) = publish_toc(
-        canonical_source.book().table_of_contents.clone().into(),
+        opening_toc.clone(),
         reading_mode,
-        initial_title,
+        // A durable locator can point into a subsection of this document.
+        // Publish navigation immediately, and resolve the title from the same
+        // restored reader position used by the eventual visible header.
+        None,
         chrome::PdfToolbarState {
             available: pdf_ocr_available,
             mode: pdf_ocr_mode,
@@ -607,6 +595,22 @@ pub(crate) fn open_reader_staged(
     );
     desktop.scroll_section = scroll_section;
     desktop.canvas_size = Some((viewport.width, viewport.height));
+    if publish_toc(
+        opening_toc,
+        reading_mode,
+        Some(desktop.current_chapter_title().to_owned()),
+        chrome::PdfToolbarState {
+            available: pdf_ocr_available,
+            mode: pdf_ocr_mode,
+        },
+        viewport,
+    )
+    .is_none()
+    {
+        return Err(
+            std::io::Error::new(std::io::ErrorKind::Interrupted, "superseded book open").into(),
+        );
+    }
     Ok(desktop)
 }
 
@@ -5042,6 +5046,82 @@ mod tests {
             href: None,
             children,
         }
+    }
+
+    fn staged_title(
+        path: &std::path::Path,
+        metadata: super::BookDisplayMetadata,
+        store: crate::sync::SyncStore,
+    ) -> String {
+        let mut titles = Vec::new();
+        let desktop = super::open_reader_staged(
+            path, crate::fonts::embedded_reader_fonts(), Some(metadata), None, store,
+            LayoutViewport::new(1000, 700).unwrap(), None,
+            |_, _, title, _, viewport| { titles.push(title); Some(viewport) },
+        ).unwrap();
+        assert_eq!(titles.len(), 2);
+        assert_eq!(titles[0], None, "navigation should not guess a title from the document URL");
+        let final_title = desktop.current_chapter_title().to_owned();
+        assert_eq!(titles[1].as_deref(), Some(final_title.as_str()),
+            "the loading shell and visible reader must use the same restored chapter");
+        final_title
+    }
+
+    #[test]
+    fn staged_header_uses_restored_subsection_instead_of_document_title() {
+        use std::io::{Cursor, Write};
+        let root = std::env::temp_dir().join(format!("torto-title-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("book.epub");
+        let package = format!(r#"<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="id">{}</dc:identifier><dc:title>Book</dc:title></metadata><manifest><item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml"/><item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/></manifest><spine toc="ncx"><itemref idref="chapter"/></spine></package>"#, uuid::Uuid::new_v4());
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, text) in [
+            ("mimetype", "application/epub+zip"),
+            ("META-INF/container.xml", r#"<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0"><rootfiles><rootfile full-path="content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#),
+            ("content.opf", package.as_str()),
+            ("toc.ncx", r#"<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1"><navMap><navPoint id="chapter"><navLabel><text>Chapter</text></navLabel><content src="chapter.xhtml"/><navPoint id="first"><navLabel><text>First subsection</text></navLabel><content src="chapter.xhtml#first"/></navPoint><navPoint id="second"><navLabel><text>Second subsection</text></navLabel><content src="chapter.xhtml#second"/></navPoint></navPoint></navMap></ncx>"#),
+            ("chapter.xhtml", r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><h1>Chapter</h1><h2 id="first">First subsection</h2><p>First paragraph.</p><h2 id="second">Second subsection</h2><p>Resume paragraph in second subsection.</p></body></html>"#),
+        ] {
+            writer.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            writer.write_all(text.as_bytes()).unwrap();
+        }
+        std::fs::write(&path, writer.finish().unwrap().into_inner()).unwrap();
+        let source = rebook_formats::open_file(&path).unwrap().source();
+        let section = source.parse_section(0).unwrap();
+        let range = section.blocks.iter().find_map(|block| match block {
+            Block::Text(text) if crate::plugins::text_block_text(text).starts_with("Resume paragraph") => text.source.clone(),
+            _ => None,
+        }).unwrap();
+        let book_id = source.book().id.as_str().to_owned();
+        let mut locator = rebook_publication::LocatorV1::at_start(
+            source.book().id.clone(), source.book().sections[0].href.clone(),
+        );
+        assert!(locator.href.fragment().is_none());
+        locator.source = Some(range);
+        let metadata = super::BookDisplayMetadata { id: book_id.clone(), title: "Book".into(), authors: vec![] };
+        drop(source);
+        let store = crate::sync::SyncStore::open_at(root.join("sync.sqlite3"), "title-test").unwrap();
+        store.save_progress(&book_id, &locator).unwrap();
+        assert_eq!(staged_title(&path, metadata, store), "Second subsection");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires TORTO_TEST_HEADER_BOOK with a local library book"]
+    fn local_staged_header_matches_restored_reading_position() {
+        let path = std::path::PathBuf::from(std::env::var("TORTO_TEST_HEADER_BOOK").unwrap());
+        let library = crate::library::LocalLibrary::load_default().unwrap();
+        let book = library.books().iter().find(|book| book.path == path).unwrap();
+        let settings = crate::sync::SyncSettings::load_default().unwrap();
+        let original_store = crate::sync::SyncStore::open_default(settings.device_id).unwrap();
+        let root = std::env::temp_dir().join(format!("torto-local-title-{}", uuid::Uuid::new_v4()));
+        let store = crate::sync::SyncStore::open_at(root.join("sync.sqlite3"), "title-audit").unwrap();
+        if let Some(progress) = original_store.load_progress(&book.id).unwrap() {
+            store.save_progress(&book.id, &progress.locator).unwrap();
+        }
+        let title = staged_title(&path, super::BookDisplayMetadata::from(book), store);
+        eprintln!("Local restored header: {title}");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

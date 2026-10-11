@@ -2169,11 +2169,15 @@ impl DesktopReader {
             screen.top() + (TOOLBAR_HEIGHT - TOOLBAR_CONTROL_SIZE) * 0.5,
         );
         egui::Area::new(egui::Id::new("reader-window-menu"))
+            .fade_in(false)
             .order(egui::Order::Foreground)
             .fixed_pos(origin)
             .constrain(false)
             .default_size(Vec2::splat(TOOLBAR_CONTROL_SIZE))
             .show(ctx, |ui| {
+                if self.ui.opening_toolbar_pending {
+                    chrome::dim_loading_controls(ui);
+                }
                 if icon_button(ui, Icon::Menu)
                     .on_hover_text(self.language.text("菜单", "Menu"))
                     .clicked()
@@ -2209,11 +2213,15 @@ impl DesktopReader {
             && !(self.is_focus_mode() && (self.ui.sidebar_open || floating))
         {
             egui::Area::new(egui::Id::new("reader-left-sidebar-toggle"))
+                .fade_in(false)
                 .order(egui::Order::Foreground)
                 .fixed_pos(Pos2::new(left + f32::from(SIDEBAR_PADDING), y))
                 .constrain(false)
                 .default_size(Vec2::splat(TOOLBAR_CONTROL_SIZE))
                 .show(ctx, |ui| {
+                    if self.ui.opening_toolbar_pending {
+                        chrome::dim_loading_controls(ui);
+                    }
                     if icon_button(ui, Icon::PanelLeft)
                         .on_hover_text(if self.ui.sidebar_open {
                             self.language.text("收起左侧栏", "Close left sidebar")
@@ -2228,6 +2236,7 @@ impl DesktopReader {
         }
         if hovered || self.ui.assistant_panel.is_some() {
             egui::Area::new(egui::Id::new("reader-right-sidebar-toggle"))
+                .fade_in(false)
                 .order(egui::Order::Foreground)
                 .fixed_pos(Pos2::new(
                     super::chrome::right_sidebar_button_left(page_rect.right(), menu_left),
@@ -2236,6 +2245,9 @@ impl DesktopReader {
                 .constrain(false)
                 .default_size(Vec2::splat(TOOLBAR_CONTROL_SIZE))
                 .show(ctx, |ui| {
+                    if self.ui.opening_toolbar_pending {
+                        chrome::dim_loading_controls(ui);
+                    }
                     if icon_button(ui, Icon::PanelRight)
                         .on_hover_text(
                             if self.assistant_is_docked() && self.ui.assistant_motion.target > 0.5 {
@@ -2269,6 +2281,9 @@ impl DesktopReader {
                 ui.set_min_width(toolbar_width);
                 ui.set_min_height(TOOLBAR_CONTROL_SIZE);
                 ui.horizontal(|ui| {
+                    if self.ui.opening_toolbar_pending {
+                        chrome::dim_loading_controls(ui);
+                    }
                     ui.spacing_mut().item_spacing.x = 0.0;
                     let left_control_count = 3.0 + self.pdf_ocr_toolbar_control_count();
                     let left_controls_width = TOOLBAR_CONTROL_SIZE * left_control_count;
@@ -2473,7 +2488,7 @@ impl DesktopReader {
             .unwrap_or(default)
     }
 
-    fn current_chapter_title(&self) -> &str {
+    pub(super) fn current_chapter_title(&self) -> &str {
         let Some(active_id) = self.snapshot.active_toc_id.as_deref() else {
             return &self.display_metadata.title;
         };
@@ -2497,7 +2512,7 @@ impl DesktopReader {
             self.reading_mode,
             self.ui.sidebar_pinned,
             self.ui.sidebar_tab,
-            true,
+            !self.ui.opening_toolbar_pending,
         ) {
             Some(chrome::SidebarAction::TogglePin) => {
                 self.ui.sidebar_pinned = !self.ui.sidebar_pinned
@@ -7397,6 +7412,92 @@ mod reference_suggestion_label_tests {
     /// carry that paragraph into the conversation, exactly as opening the panel
     /// on it would; the paragraph left behind keeps its own reference, and a
     /// closed panel leaves the context alone.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn opening_toolbar_icons_are_dim_from_first_frame_and_opaque_when_ready() {
+        use crate::app::window_chrome;
+        use crate::preferences::ReadingMode;
+        use rebook_formats::BookFormat;
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for (mode, format) in [
+            (ReadingMode::Classic, BookFormat::Epub),
+            (ReadingMode::Focus, BookFormat::Epub),
+            (ReadingMode::Classic, BookFormat::Pdf),
+        ] {
+            let sidebar = chrome::SidebarState::default().for_mode(mode);
+            let book = crate::library::LibraryBook {
+                id: "loading-icon-audit".into(),
+                title: "Current chapter".into(),
+                authors: vec![],
+                file_name: format!("book.{}", format.storage_extension()),
+                path: "book".into(),
+                cover_bytes: None,
+                added_at: 0,
+                cached_toc: None,
+            };
+            let mut opening = crate::shelf::OpeningShell::new(
+                book.clone(), Instant::now(), mode, sidebar,
+            );
+            opening.pdf_toolbar.available = true;
+            let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+            reader.reading_mode = mode;
+            reader.display_metadata = crate::reader::BookDisplayMetadata::from(&book);
+            reader.format = format;
+            reader.pdf_ocr.available = true;
+            reader.adopt_opening_chrome(mode, sidebar, sidebar);
+            let ctx = egui::Context::default();
+            crate::ui::configure(&ctx, &Default::default(), AppLanguage::English, runtime.handle());
+            let mut covers = crate::shelf::covers::CoverCache::default();
+            let mut loading_icons = Vec::new();
+            for stage in 0..4 {
+                if stage == 3 {
+                    // Production clears this only after the first successful
+                    // GPU presentation, not merely after parsing finishes.
+                    reader.mark_open_presented(&ctx);
+                }
+                let mut output = ctx.run_ui(egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+                    ..Default::default()
+                }, |root| {
+                    window_chrome::begin_frame(root.ctx());
+                    if stage < 2 {
+                        opening.ui(root, &mut covers, AppLanguage::English, &Default::default(), false);
+                    } else {
+                        reader.ui(root, None, false);
+                    }
+                });
+                output.textures_delta.clear();
+                let mut icons: Vec<_> = output.shapes.iter().filter_map(|shape| {
+                    let egui::Shape::Rect(rect) = &shape.shape else { return None; };
+                    rect.brush.as_ref()?;
+                    let center = rect.rect.center();
+                    if (center.y - 22.0).abs() > 1.0 { return None; }
+                    Some((center.x, rect.fill.a()))
+                }).collect();
+                icons.sort_by(|left, right| left.0.total_cmp(&right.0));
+                if stage < 2 {
+                    assert!(icons.len() >= if mode == ReadingMode::Classic { 9 } else { 5 },
+                        "toolbar and sidebar icons must paint on the first loading frame: {icons:?}");
+                    assert!(icons.iter().all(|(_, alpha)| (126..=129).contains(alpha)),
+                        "all loading icons share one half-opacity fade, stage={stage}: {icons:?}");
+                    if stage == 0 { loading_icons = icons; }
+                    else { assert_eq!(loading_icons, icons, "loading opacity must not change on the next frame"); }
+                } else if stage == 2 {
+                    assert!(!icons.is_empty());
+                    assert!(icons.iter().all(|(_, alpha)| (126..=129).contains(alpha)),
+                        "prepared reader must stay dim until its body is presented: {icons:?}");
+                } else if stage == 3 {
+                    for (center, _) in &loading_icons {
+                        assert!(icons.iter().any(|(x, alpha)| (x - center).abs() < 1.0 && *alpha == 255),
+                            "ready icon must restore full opacity at x={center}, mode={mode:?}, format={format:?}: {icons:?}");
+                    }
+                }
+                output.textures_delta.clear();
+            }
+        }
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn pdf_header_buttons_keep_their_slots_from_opening_through_loaded_source_states() {

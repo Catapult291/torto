@@ -184,6 +184,7 @@ impl OpeningShell {
                         if blocked {
                             ui.disable();
                         }
+                        crate::reader::chrome::dim_loading_controls(ui);
                         ui.add_space(8.0);
                         if icon_button(ui, Icon::PanelLeft)
                             .on_hover_text(language.text("目录", "Contents"))
@@ -252,6 +253,7 @@ impl OpeningShell {
                     );
                     ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                         ui.set_clip_rect(ui.clip_rect().intersect(rect));
+                        crate::reader::chrome::dim_loading_controls(ui);
                         ui.add_enabled_ui(false, |ui| {
                             icon_button(ui, glyph).on_disabled_hover_text(hint);
                         });

@@ -7,6 +7,14 @@ use crate::preferences::ReadingMode;
 
 pub(crate) const SIDEBAR_COVER_SIZE: [u32; 2] = [52, 74];
 
+/// Apply the loading appearance to a scoped toolbar from its first frame.
+/// Actions may remain usable (back, pin, contents), but share the same opacity.
+/// Disabled children must not apply a second fade on top of this one.
+pub(crate) fn dim_loading_controls(ui: &mut egui::Ui) {
+    ui.multiply_opacity(ui.visuals().disabled_alpha());
+    ui.visuals_mut().disabled_alpha = 1.0;
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PdfToolbarState {
     pub available: bool,
@@ -192,6 +200,9 @@ pub(crate) fn sidebar_toolbar(
     use crate::ui::{Icon, icon_button, selectable_icon_button};
     let mut action = None;
     ui.horizontal(|ui| {
+        if !reader_ready {
+            dim_loading_controls(ui);
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if mode != ReadingMode::Focus
                 && icon_button(ui, if pinned { Icon::Pin } else { Icon::PinOff })

@@ -313,6 +313,7 @@ impl Opening {
                     return Err("superseded book open".to_owned());
                 }
                 let cache_book = request.book.clone();
+                let mut cached_toc = cache_book.cached_toc.clone();
                 let cancelled = request.cancelled.clone();
                 let mut reader = crate::reader::open_reader_staged(
                     &request.book.path,
@@ -343,10 +344,11 @@ impl Opening {
                                 pdf_toolbar,
                             }),
                         );
-                        if cache_book.cached_toc.as_deref() != Some(toc.as_ref())
-                            && let Err(error) = crate::library::cache_book_toc(&cache_book, &toc)
-                        {
-                            tracing::warn!(%error, "failed to cache library TOC");
+                        if cached_toc.as_deref() != Some(toc.as_ref()) {
+                            match crate::library::cache_book_toc(&cache_book, &toc) {
+                                Ok(()) => cached_toc = Some(toc),
+                                Err(error) => tracing::warn!(%error, "failed to cache library TOC"),
+                            }
                         }
                         (!cancelled.load(std::sync::atomic::Ordering::Acquire)).then_some(viewport)
                     },
