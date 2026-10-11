@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use kurbo::{Affine, Rect, RoundedRect};
+use kurbo::{Affine, Rect, RoundedRect, Shape};
 use peniko::{Color, Fill, ImageData};
 use rebook_formats::BookFormat;
 use rebook_layout::quote_accent_color;
@@ -11,6 +12,8 @@ use vello::Scene;
 
 use super::super::DesktopReader;
 use super::vello::VelloScene;
+
+static NEXT_LAYER_ID: AtomicU64 = AtomicU64::new(1);
 
 const PAGE_SCENE_CACHE_CAPACITY: usize = 32;
 const PDF_PAGE_SCENE_CACHE_CAPACITY: usize = 4;
@@ -58,8 +61,9 @@ pub(crate) struct PageSceneKey {
 }
 
 pub(crate) struct PageSceneLayers {
-    underlay: Arc<Scene>,
-    content: Arc<Scene>,
+    pub(super) generation: u64,
+    pub(super) underlay: Arc<Scene>,
+    pub(super) content: Arc<Scene>,
     images: Arc<[ImageData]>,
 }
 
@@ -182,61 +186,7 @@ impl DesktopReader {
         let content_padding = self.scroll_content_padding(viewport.size.y);
         let visible_bottom = viewport.offset_y + viewport.size.y;
         let mut scene = Scene::new();
-        if self.is_focus_mode()
-            && focus_unit_activation_visible(
-                self.selection.is_some(),
-                self.focus_selection_anchor.is_some(),
-            )
-            && let Some(group) = self
-                .focus_units
-                .get(self.focus_unit_index)
-                .and_then(|u| u.list_group.as_ref())
-            && group.split
-        {
-            let rect = group.rect;
-            let background = RoundedRect::from_rect(
-                Rect::new(
-                    f64::from(rect.left()),
-                    f64::from(rect.top() + content_padding - viewport.offset_y),
-                    f64::from(rect.right()),
-                    f64::from(rect.bottom() + content_padding - viewport.offset_y),
-                ),
-                7.0,
-            );
-            let neutral = if crate::ui::palette().dark {
-                Color::from_rgba8(180, 180, 180, 24)
-            } else {
-                Color::from_rgba8(90, 90, 90, 20)
-            };
-            scene.fill(Fill::NonZero, Affine::IDENTITY, neutral, None, &background);
-        }
-        if self.is_focus_mode()
-            && focus_unit_activation_visible(
-                self.selection.is_some(),
-                self.focus_selection_anchor.is_some(),
-            )
-            && let Some(rect) = self
-                .focus_units
-                .get(self.focus_unit_index)
-                .and_then(|unit| unit.rectangular_activation_rect)
-        {
-            let background = RoundedRect::from_rect(
-                Rect::new(
-                    f64::from(rect.left()),
-                    f64::from(rect.top() + content_padding - viewport.offset_y),
-                    f64::from(rect.right()),
-                    f64::from(rect.bottom() + content_padding - viewport.offset_y),
-                ),
-                7.0,
-            );
-            let color = self
-                .focus_units
-                .get(self.focus_unit_index)
-                .map_or_else(focus_block_activation_color, |unit| {
-                    focus_unit_activation_color(unit.structured_activation)
-                });
-            scene.fill(Fill::NonZero, Affine::IDENTITY, color, None, &background);
-        }
+        self.paint_scroll_backdrop(&mut scene, viewport, content_padding);
         let mut images = Vec::new();
         for (index, entry) in layout.pages.iter().enumerate() {
             let top = layout.page_tops[index] + content_padding;
@@ -283,12 +233,100 @@ impl DesktopReader {
                 ))),
             );
         }
+        self.paint_scroll_bridges(&mut scene, &layout, viewport, content_padding);
+        ReaderScene::new(scene, images.into())
+    }
+
+    pub(super) fn paint_scroll_backdrop(
+        &self,
+        scene: &mut Scene,
+        viewport: super::super::ScrollViewportState,
+        content_padding: f32,
+    ) -> Rect {
+        let mut bounds: Option<Rect> = None;
+        if self.is_focus_mode()
+            && focus_unit_activation_visible(
+                self.selection.is_some(),
+                self.focus_selection_anchor.is_some(),
+            )
+            && let Some(group) = self
+                .focus_units
+                .get(self.focus_unit_index)
+                .and_then(|u| u.list_group.as_ref())
+            && group.split
+        {
+            let rect = group.rect;
+            let background = RoundedRect::from_rect(
+                Rect::new(
+                    f64::from(rect.left()),
+                    f64::from(rect.top() + content_padding - viewport.offset_y),
+                    f64::from(rect.right()),
+                    f64::from(rect.bottom() + content_padding - viewport.offset_y),
+                ),
+                7.0,
+            );
+            let neutral = if crate::ui::palette().dark {
+                Color::from_rgba8(180, 180, 180, 24)
+            } else {
+                Color::from_rgba8(90, 90, 90, 20)
+            };
+            let rect = background.bounding_box();
+            bounds = Some(bounds.map_or(rect, |previous| previous.union(rect)));
+            scene.fill(Fill::NonZero, Affine::IDENTITY, neutral, None, &background);
+        }
+        if self.is_focus_mode()
+            && focus_unit_activation_visible(
+                self.selection.is_some(),
+                self.focus_selection_anchor.is_some(),
+            )
+            && let Some(rect) = self
+                .focus_units
+                .get(self.focus_unit_index)
+                .and_then(|unit| unit.rectangular_activation_rect)
+        {
+            let background = RoundedRect::from_rect(
+                Rect::new(
+                    f64::from(rect.left()),
+                    f64::from(rect.top() + content_padding - viewport.offset_y),
+                    f64::from(rect.right()),
+                    f64::from(rect.bottom() + content_padding - viewport.offset_y),
+                ),
+                7.0,
+            );
+            let color = self
+                .focus_units
+                .get(self.focus_unit_index)
+                .map_or_else(focus_block_activation_color, |unit| {
+                    focus_unit_activation_color(unit.structured_activation)
+                });
+            let rect = background.bounding_box();
+            bounds = Some(bounds.map_or(rect, |previous| previous.union(rect)));
+            scene.fill(Fill::NonZero, Affine::IDENTITY, color, None, &background);
+        }
+        bounds.unwrap_or(Rect::ZERO)
+    }
+
+    pub(super) fn paint_scroll_bridges(
+        &self,
+        scene: &mut Scene,
+        layout: &super::super::ScrollSectionLayout,
+        viewport: super::super::ScrollViewportState,
+        content_padding: f32,
+    ) -> Rect {
+        let mut bounds: Option<Rect> = None;
         for bridge in &layout.quote_bridges {
             let top = bridge.top + content_padding - viewport.offset_y;
             let bottom = bridge.bottom + content_padding - viewport.offset_y;
             if bottom < 0.0 || top > viewport.size.y {
                 continue;
             }
+            let rect = Rect::new(
+                f64::from(bridge.style.x),
+                f64::from(top - 0.5),
+                f64::from(bridge.style.x + bridge.style.width),
+                f64::from(bottom + 0.5),
+            );
+            bounds = Some(bounds.map_or(rect, |previous| previous.union(rect)));
             scene.fill(
                 Fill::NonZero,
                 Affine::IDENTITY,
@@ -302,10 +340,10 @@ impl DesktopReader {
                 ),
             );
         }
-        ReaderScene::new(scene, images.into())
+        bounds.unwrap_or(Rect::ZERO)
     }
 
-    fn scroll_page_layers(&mut self, entry: &ReaderSectionPage) -> Arc<PageSceneLayers> {
+    pub(super) fn scroll_page_layers(&mut self, entry: &ReaderSectionPage) -> Arc<PageSceneLayers> {
         let key = PageSceneKey {
             section: entry.position.section_index,
             segment: entry.position.segment_index,
@@ -322,6 +360,7 @@ impl DesktopReader {
             .page
             .paint_non_image_content_at(&mut VelloScene::new(&mut content), 0.0);
         let layers = Arc::new(PageSceneLayers {
+            generation: NEXT_LAYER_ID.fetch_add(1, Ordering::Relaxed),
             underlay: Arc::new(underlay),
             content: Arc::new(content),
             images: Arc::from([]),
@@ -332,7 +371,7 @@ impl DesktopReader {
         layers
     }
 
-    fn page_scene_layers(&mut self) -> Arc<PageSceneLayers> {
+    pub(super) fn page_scene_layers(&mut self) -> Arc<PageSceneLayers> {
         let key = PageSceneKey {
             section: self.snapshot.location.section_index,
             segment: self.snapshot.location.segment_index,
@@ -370,6 +409,7 @@ impl DesktopReader {
             }
         }
         let layers = Arc::new(PageSceneLayers {
+            generation: NEXT_LAYER_ID.fetch_add(1, Ordering::Relaxed),
             underlay: Arc::new(underlay),
             content: Arc::new(content),
             images: Arc::from([]),
@@ -420,7 +460,7 @@ impl DesktopReader {
         }
     }
 
-    fn paint_page_overlays(
+    pub(super) fn paint_page_overlays(
         &self,
         page: &PageDisplayList,
         scene: &mut VelloScene<'_>,
@@ -483,7 +523,7 @@ impl DesktopReader {
         }
     }
 
-    fn paint_page_foreground(
+    pub(super) fn paint_page_foreground(
         &self,
         page: &PageDisplayList,
         scene: &mut VelloScene<'_>,

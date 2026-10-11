@@ -1,5 +1,8 @@
 mod application;
 mod gpu;
+mod reader_layers;
+#[cfg(test)]
+pub(crate) use reader_layers::tests::LayerAudit;
 mod repaint;
 
 pub(crate) use application::run;

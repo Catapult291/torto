@@ -276,6 +276,10 @@ impl DesktopApp {
         self.reader.as_mut().map(DesktopReader::page_scene)
     }
 
+    pub(crate) fn reader_layers(&mut self) -> Option<crate::reader::LayeredReaderScene> {
+        self.reader.as_mut().and_then(DesktopReader::layered_scene)
+    }
+
     pub(crate) fn record_open_presentation(&mut self, ready: bool, ctx: &egui::Context) {
         self.shelf.record_open_presentation(ready);
         if ready && let Some(reader) = self.reader.as_mut() {

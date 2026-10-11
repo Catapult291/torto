@@ -91,6 +91,7 @@ mod ui_controller;
 
 use chat_autocomplete::ChatReference;
 pub(crate) use egui_view::{ReaderFramePlan, ReaderPageTexture};
+pub(crate) use render::LayeredReaderScene;
 pub(crate) use render::ReaderScene;
 use render::{PageSceneKey, PageSceneLayers};
 

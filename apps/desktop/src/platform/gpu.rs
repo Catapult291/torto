@@ -13,6 +13,7 @@ use wgpu::{TextureFormat, TextureUsages};
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
+use super::reader_layers::LayerRenderer;
 use crate::app::DesktopApp;
 use crate::reader::{ReaderFramePlan, ReaderPageTexture, ReaderScene};
 
@@ -38,9 +39,17 @@ struct ReaderGpuResidency {
 
 impl ReaderGpuResidency {
     fn observe(&mut self, scene: &ReaderScene, now: Instant) {
+        self.observe_rasters(
+            &scene.images,
+            crate::reader::render::scene_encoding_bytes(&scene.scene),
+            now,
+        );
+    }
+
+    fn observe_rasters(&mut self, images: &[peniko::ImageData], scene_bytes: usize, now: Instant) {
         let mut current = std::collections::HashSet::new();
         self.current_image_bytes = 0;
-        for image in scene.images.iter() {
+        for image in images {
             let id = image.data.id();
             if current.insert(id) {
                 self.current_image_bytes += image.data.len();
@@ -49,7 +58,7 @@ impl ReaderGpuResidency {
                 self.uploaded_bytes += image.data.len();
             }
         }
-        self.current_scene_bytes = crate::reader::render::scene_encoding_bytes(&scene.scene);
+        self.current_scene_bytes = scene_bytes;
         self.peak_scene_bytes = self.peak_scene_bytes.max(self.current_scene_bytes);
         self.rendered_at = Some(now);
     }
@@ -101,6 +110,7 @@ pub(super) struct GpuState {
     surface_config: wgpu::SurfaceConfiguration,
     egui_renderer: Renderer,
     vello_renderer: Option<VelloRenderer>,
+    layer_renderer: Option<LayerRenderer>,
     prewarm_id: Option<u64>,
     page_target: Option<PageTarget>,
     retired_page_textures: Vec<TextureId>,
@@ -176,6 +186,9 @@ impl GpuState {
         surface.configure(&device, &surface_config);
 
         let egui_renderer = Renderer::new(&device, format, RendererOptions::default());
+        // Compile this tiny compositor with the other startup pipelines, rather
+        // than on the user's first scroll or first selection after opening.
+        let layer_renderer = Some(LayerRenderer::new(&device));
         Ok(Self {
             surface,
             device,
@@ -183,6 +196,7 @@ impl GpuState {
             surface_config,
             egui_renderer,
             vello_renderer: None,
+            layer_renderer,
             prewarm_id: None,
             page_target: None,
             retired_page_textures: Vec::new(),
@@ -419,6 +433,12 @@ impl GpuState {
             {
                 self.vello_renderer = None;
                 self.reader_residency = ReaderGpuResidency::default();
+                if let Some(layers) = &mut self.layer_renderer {
+                    layers.clear();
+                }
+                if let Some(target) = &mut self.page_target {
+                    target.rendered_scene = None;
+                }
             }
             let recreated = self.ensure_page_target(plan, pixels_per_point);
             page_target_recreated = recreated;
@@ -451,6 +471,11 @@ impl GpuState {
             }
             let needs_render = recreated
                 || trim
+                || (window.has_focus()
+                    && self
+                        .layer_renderer
+                        .as_ref()
+                        .is_some_and(LayerRenderer::pending))
                 || self
                     .page_target
                     .as_ref()
@@ -461,7 +486,8 @@ impl GpuState {
                     .as_ref()
                     .is_some_and(|target| target.rendered_scene.is_none());
                 let encoding_started = Instant::now();
-                if let Some(scene) = app.reader_scene() {
+                let layered = self.render_reader_layers(app, plan, pixels_per_point)?;
+                if !layered && let Some(scene) = app.reader_scene() {
                     let encoding_ms = encoding_started.elapsed().as_secs_f32() * 1000.0;
                     if cfg!(debug_assertions) && capture_timings {
                         crate::diagnostics::log(
@@ -475,6 +501,14 @@ impl GpuState {
                     self.render_reader_scene(&scene, plan, pixels_per_point)?;
                     self.reader_residency.observe(&scene, Instant::now());
                 }
+            }
+            if window.has_focus()
+                && self
+                    .layer_renderer
+                    .as_ref()
+                    .is_some_and(LayerRenderer::pending)
+            {
+                egui_ctx.request_repaint_after(Duration::from_millis(16));
             }
             if let Some(delay) = self.reader_residency.trim_delay(Instant::now()) {
                 egui_ctx.request_repaint_after(delay.max(Duration::from_millis(1)));
@@ -494,6 +528,9 @@ impl GpuState {
                 self.vello_renderer = None;
             }
             self.reader_residency = ReaderGpuResidency::default();
+            if let Some(layers) = &mut self.layer_renderer {
+                layers.clear();
+            }
         }
         if page_target_recreated {
             // This frame intentionally retains the old texture at its old logical
@@ -702,6 +739,18 @@ impl GpuState {
             "memory.gpu",
             &[
                 crate::diagnostics::Field::Usize("page_target_bytes", page_bytes),
+                crate::diagnostics::Field::Usize(
+                    "tile_cache_bytes",
+                    self.layer_renderer
+                        .as_ref()
+                        .map_or(0, LayerRenderer::cache_bytes),
+                ),
+                crate::diagnostics::Field::Usize(
+                    "layer_atlas_bytes",
+                    self.layer_renderer
+                        .as_ref()
+                        .map_or(0, LayerRenderer::atlas_bytes),
+                ),
                 crate::diagnostics::Field::Usize("retained_frame_bytes", retained_bytes),
                 crate::diagnostics::Field::U64("vello_buffer_bytes", vello_buffers),
                 crate::diagnostics::Field::Usize(
@@ -825,7 +874,9 @@ impl GpuState {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: TextureFormat::Rgba8Unorm,
-            usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
+            usage: TextureUsages::STORAGE_BINDING
+                | TextureUsages::TEXTURE_BINDING
+                | TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -850,6 +901,64 @@ impl GpuState {
             self.retired_page_textures.push(previous.texture_id);
         }
         true
+    }
+
+    fn render_reader_layers(
+        &mut self,
+        app: &mut DesktopApp,
+        plan: ReaderFramePlan,
+        scale: f32,
+    ) -> Result<bool, String> {
+        let Some(scene) = app.reader_layers() else {
+            if let Some(layers) = &mut self.layer_renderer {
+                layers.clear();
+            }
+            return Ok(false);
+        };
+        if self.vello_renderer.is_none() {
+            self.vello_renderer = Some(new_reader_renderer(&self.device)?);
+        }
+        if self.layer_renderer.is_none() {
+            self.layer_renderer = Some(LayerRenderer::new(&self.device));
+        }
+        let Some(target) = self.page_target.as_mut() else {
+            return Ok(false);
+        };
+        let stats = self.layer_renderer.as_mut().unwrap().render(
+            &self.device,
+            &self.queue,
+            self.vello_renderer.as_mut().unwrap(),
+            &target.view,
+            target.size,
+            plan,
+            scale,
+            &scene,
+        )?;
+        let Some(stats) = stats else {
+            return Ok(false);
+        };
+        self.reader_residency
+            .observe_rasters(&stats.images, stats.scene_bytes, Instant::now());
+        target.rendered_scene = Some((plan.scene_id, plan.scene_revision));
+        if cfg!(debug_assertions) && (stats.tiles > 0 || stats.submit_ms >= 16.0) {
+            use crate::diagnostics::{Field, log};
+            log(
+                "render.reader_layers",
+                &[
+                    Field::Usize("cache_hits", stats.hits),
+                    Field::Usize("new_tiles", stats.tiles),
+                    Field::Usize("rasterized_pixels", stats.rasterized_pixels),
+                    Field::Usize("uploaded_image_bytes", stats.image_bytes),
+                    Field::Usize(
+                        "tile_cache_bytes",
+                        self.layer_renderer.as_ref().unwrap().cache_bytes(),
+                    ),
+                    Field::F32("submit_ms", stats.submit_ms),
+                    Field::Bool("pending", stats.pending),
+                ],
+            );
+        }
+        Ok(true)
     }
 
     fn render_reader_scene(
