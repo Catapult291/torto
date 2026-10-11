@@ -1074,6 +1074,36 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires TORTO_TEST_OCR_SYNC_BOOK with a local OCR cache"]
+    fn local_ocr_archive_round_trips_reused_resources() {
+        let book_id = std::env::var("TORTO_TEST_OCR_SYNC_BOOK").unwrap();
+        let exported = export_pdf_ocr_sync_data(&book_id).unwrap().unwrap();
+        let expected_document = exported.document.clone();
+        let expected_resources = exported
+            .resources
+            .iter()
+            .map(|(name, bytes)| (name.clone(), sha256(bytes)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(expected_resources.len(), exported.resources.len());
+        let archive = pack_ocr_archive(exported).unwrap();
+        let archive_len = archive.len();
+        let unpacked = unpack_ocr_archive(archive).unwrap();
+        assert_eq!(unpacked.document, expected_document);
+        let actual_resources = unpacked
+            .resources
+            .iter()
+            .map(|(name, bytes)| (name.clone(), sha256(bytes)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(actual_resources, expected_resources);
+        let document: serde_json::Value = serde_json::from_slice(&unpacked.document).unwrap();
+        eprintln!(
+            "OCR sync audit: references={} unique_files={} archive_bytes={archive_len}",
+            document["resources"].as_array().unwrap().len(),
+            actual_resources.len()
+        );
+    }
+
+    #[test]
     fn ocr_manifest_identity_does_not_include_provider_or_model() {
         let manifest = ocr_manifest("book", b"current result");
         let json = serde_json::to_value(manifest).unwrap();

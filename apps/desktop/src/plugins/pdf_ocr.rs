@@ -1767,8 +1767,14 @@ pub(crate) fn export_pdf_ocr_sync_data(book_id: &str) -> io::Result<Option<PdfOc
     document.view_mode = PdfOcrViewMode::Original;
     let resource_directory = book_directory(book_id)?.join("resources");
     let mut resources = Vec::with_capacity(document.resources.len());
+    let mut resource_names = BTreeSet::new();
     for resource in &document.resources {
         validate_sync_resource_name(&resource.file_name)?;
+        // Multiple pages can refer to the same content-addressed image. Keep
+        // every document reference, but include its physical file only once.
+        if !resource_names.insert(&resource.file_name) {
+            continue;
+        }
         resources.push((
             resource.file_name.clone(),
             fs::read(resource_directory.join(&resource.file_name))?,
@@ -1820,13 +1826,14 @@ pub(crate) fn import_pdf_ocr_sync_data(book_id: &str, data: PdfOcrSyncData) -> i
         ));
     }
     document.view_mode = PdfOcrViewMode::Original;
+    let resource_count = data.resources.len();
     let resources = data.resources.into_iter().collect::<BTreeMap<_, _>>();
     let expected_resources = document
         .resources
         .iter()
         .map(|resource| resource.file_name.clone())
         .collect::<BTreeSet<_>>();
-    if expected_resources.len() != document.resources.len()
+    if resources.len() != resource_count
         || expected_resources.len() != resources.len()
         || !expected_resources
             .iter()
@@ -3574,6 +3581,68 @@ mod tests {
             }
             assert!(failures.is_empty(), "invalid OCR sections: {failures:?}");
         }
+    }
+
+    #[test]
+    fn ocr_sync_round_trips_reused_images_without_duplicate_archive_files() {
+        let book_id = uuid::Uuid::new_v4().simple().to_string();
+        let directory = book_directory(&book_id).unwrap();
+        let document = serde_json::to_vec(&json!({
+            "version": 1, "book_id": book_id, "provider": "paddle-ocr", "model": "fixture",
+            "view_mode": "original", "pages": [{"markdown": "![first](OcrResources/shared.jpg)\n\n![second](OcrResources/shared.jpg)"}],
+            "resources": [
+                {"href": "OcrResources/shared.jpg", "file_name": "shared.jpg", "media_type": "image/jpeg"},
+                {"href": "OcrResources/alias.jpg", "file_name": "shared.jpg", "media_type": "image/jpeg"}
+            ]
+        })).unwrap();
+        let image = ("shared.jpg".to_owned(), vec![1, 2, 3]);
+        import_pdf_ocr_sync_data(
+            &book_id,
+            PdfOcrSyncData {
+                document: document.clone(),
+                resources: vec![image.clone()],
+            },
+        )
+        .unwrap();
+        let exported = export_pdf_ocr_sync_data(&book_id).unwrap().unwrap();
+        assert_eq!(exported.resources, vec![image.clone()]);
+        let exported_document: Value = serde_json::from_slice(&exported.document).unwrap();
+        let input_document: Value = serde_json::from_slice(&document).unwrap();
+        assert_eq!(exported_document["resources"], input_document["resources"]);
+        assert_eq!(exported_document["pages"], input_document["pages"]);
+        import_pdf_ocr_sync_data(&book_id, exported).unwrap();
+        let saved = fs::read(directory.join(DOCUMENT_FILE)).unwrap();
+        // Duplicate archive payloads are still invalid, even though repeated
+        // references inside the document are legitimate.
+        assert!(
+            import_pdf_ocr_sync_data(
+                &book_id,
+                PdfOcrSyncData {
+                    document: document.clone(),
+                    resources: vec![image.clone(), ("shared.jpg".into(), vec![9])],
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            import_pdf_ocr_sync_data(
+                &book_id,
+                PdfOcrSyncData {
+                    document,
+                    resources: Vec::new(),
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(directory.join(DOCUMENT_FILE)).unwrap(), saved);
+        assert_eq!(
+            fs::read(directory.join("resources/shared.jpg")).unwrap(),
+            image.1
+        );
+        fs::remove_file(directory.join("resources/shared.jpg")).unwrap();
+        fs::remove_file(directory.join(DOCUMENT_FILE)).unwrap();
+        fs::remove_dir(directory.join("resources")).unwrap();
+        fs::remove_dir(directory).unwrap();
     }
 
     #[test]

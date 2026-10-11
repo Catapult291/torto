@@ -4,6 +4,7 @@ use super::pdf_ocr::{PdfModeSource, PdfOcrLoadedSource, PdfOcrViewMode};
 use rebook_formats::pdf_reflow::{self, ReflowSource, Statistics};
 use rebook_publication::BookSource;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -225,7 +226,11 @@ pub(crate) fn export(book_id: &str) -> io::Result<Option<Vec<(String, Vec<u8>)>>
         let name = format!("sections/{index}.json");
         files.push((name.clone(), fs::read(generation.join(name))?));
     }
+    let mut resource_names = BTreeSet::new();
     for name in source.manifest.resources {
+        if !resource_names.insert(name.clone()) {
+            continue;
+        }
         files.push((name.clone(), fs::read(generation.join(name))?));
     }
     Ok(Some(files))
@@ -496,6 +501,28 @@ mod tests {
             ),
         ]
     }
+    #[test]
+    fn native_sync_exports_reused_resource_once_without_changing_manifest() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut files = fixture(&id);
+        let mut manifest: serde_json::Value = serde_json::from_slice(&files[0].1).unwrap();
+        manifest["resources"] = serde_json::json!(["resources/shared.jpg", "resources/shared.jpg"]);
+        files[0].1 = serde_json::to_vec(&manifest).unwrap();
+        files.push(("resources/shared.jpg".into(), vec![1, 2, 3]));
+        import(&id, files.clone()).unwrap();
+        let exported = export(&id).unwrap().unwrap();
+        assert_eq!(exported, files);
+        import(&id, exported).unwrap();
+        assert_eq!(open(&id).unwrap().unwrap().manifest.resources.len(), 2);
+        let root = directory(&id).unwrap();
+        let current: Current =
+            serde_json::from_slice(&fs::read(root.join("current.json")).unwrap()).unwrap();
+        // Test-generated directory, isolated by a UUID.
+        fs::remove_dir_all(root.join(current.generation)).unwrap();
+        // The first import left a retired generation; remove only this fixture.
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn native_cache_reads_without_pdf_and_failed_import_preserves_generation() {
         let id = uuid::Uuid::new_v4().to_string();
