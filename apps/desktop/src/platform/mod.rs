@@ -1,4 +1,5 @@
 mod application;
+mod clipboard;
 mod gpu;
 mod reader_layers;
 #[cfg(test)]
@@ -6,6 +7,7 @@ pub(crate) use reader_layers::tests::LayerAudit;
 mod repaint;
 
 pub(crate) use application::run;
+pub(crate) use clipboard::{ClipboardImage, images_without_text};
 
 pub(crate) enum UserEvent {
     RepaintAfter(std::time::Duration),
