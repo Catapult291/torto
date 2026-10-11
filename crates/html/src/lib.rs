@@ -21,6 +21,7 @@ mod image_context;
 mod media_context_tests;
 mod media_semantics;
 mod nested_media;
+mod paragraph_lists;
 mod style_query;
 mod table_captions;
 use font_size::FontSize;
@@ -275,8 +276,28 @@ pub fn parse_section_with_image_classifier(
 pub fn parse_section_with_hints_and_image_classifier(
     xml: &str,
     descriptor: &SpineItem,
+    load_stylesheet: impl FnMut(&PublicationUrl) -> Option<String>,
+    is_decorative_separator_image: impl FnMut(&PublicationUrl) -> bool,
+    hints: SectionParseHints,
+) -> Result<Section, HtmlError> {
+    parse_section_with_image_metadata(
+        xml,
+        descriptor,
+        load_stylesheet,
+        is_decorative_separator_image,
+        |_| None,
+        hints,
+    )
+}
+
+/// Image metadata is queried only for structurally plausible leading markers.
+/// Implementations should read headers in the section parsing worker, not pixels.
+pub fn parse_section_with_image_metadata(
+    xml: &str,
+    descriptor: &SpineItem,
     mut load_stylesheet: impl FnMut(&PublicationUrl) -> Option<String>,
     mut is_decorative_separator_image: impl FnMut(&PublicationUrl) -> bool,
+    mut image_dimensions: impl FnMut(&PublicationUrl) -> Option<[u32; 2]>,
     hints: SectionParseHints,
 ) -> Result<Section, HtmlError> {
     #[cfg(debug_assertions)]
@@ -304,6 +325,14 @@ pub fn parse_section_with_hints_and_image_classifier(
         footnote_links,
         &mut is_decorative_separator_image,
     );
+    if !hints.note_section {
+        parser.inferred_lists = paragraph_lists::detect(
+            root,
+            &parser.styles,
+            &descriptor.href,
+            &mut image_dimensions,
+        );
+    }
     parser.navigation_documents.extend(
         hints
             .navigation_documents
@@ -362,6 +391,7 @@ struct IndentedQuoteCandidate {
 }
 
 struct ReadingIrParser<'a> {
+    inferred_lists: HashMap<roxmltree::NodeId, paragraph_lists::ListItem>,
     // Nodes and styles are immutable for the lifetime of one section parse.
     indented_quote_candidates: HashMap<roxmltree::NodeId, Option<IndentedQuoteCandidate>>,
     failed_indented_quotes: HashSet<roxmltree::NodeId>,
@@ -402,6 +432,7 @@ impl<'a> ReadingIrParser<'a> {
         is_decorative_separator_image: &'a mut dyn FnMut(&PublicationUrl) -> bool,
     ) -> Self {
         Self {
+            inferred_lists: HashMap::new(),
             indented_quote_candidates: HashMap::new(),
             failed_indented_quotes: HashSet::new(),
             #[cfg(debug_assertions)]
@@ -517,6 +548,12 @@ impl<'a> ReadingIrParser<'a> {
     }
 
     fn parse_note_section_nodes(&mut self, nodes: &[Node<'_, '_>]) -> Result<(), HtmlError> {
+        // Note regions can be discovered after the section-wide list scan.
+        // Invalidate only the derived candidates; keep the existing note parser
+        // and its source-node allocation unchanged, including fallback entries.
+        for node in nodes.iter().flat_map(|node| node.descendants()) {
+            self.inferred_lists.remove(&node.id());
+        }
         let mut index = 0;
         while index < nodes.len() {
             let node = nodes[index];
@@ -744,6 +781,13 @@ impl<'a> ReadingIrParser<'a> {
         container: Node<'_, '_>,
         siblings: &[Node<'_, '_>],
     ) -> Result<Option<usize>, HtmlError> {
+        if !self.inside_note_definition
+            && siblings
+                .first()
+                .is_some_and(|node| self.inferred_lists.contains_key(&node.id()))
+        {
+            return Ok(None);
+        }
         if let Some(consumed) = self.try_parse_indented_attributed_quote(container, siblings)? {
             return Ok(Some(consumed));
         }
@@ -778,7 +822,10 @@ impl<'a> ReadingIrParser<'a> {
                 pending_stanza_break = Some(body.len() - 1);
                 continue;
             }
-            if !is_quote_text_candidate(node) || is_numbered_media_paragraph(node) {
+            if !self.inside_note_definition && self.inferred_lists.contains_key(&node.id())
+                || !is_quote_text_candidate(node)
+                || is_numbered_media_paragraph(node)
+            {
                 break;
             }
 
@@ -912,6 +959,9 @@ impl<'a> ReadingIrParser<'a> {
     }
 
     fn indented_quote_candidate(&mut self, node: Node<'_, '_>) -> Option<IndentedQuoteCandidate> {
+        if !self.inside_note_definition && self.inferred_lists.contains_key(&node.id()) {
+            return None;
+        }
         if let Some(candidate) = self.indented_quote_candidates.get(&node.id()) {
             return *candidate;
         }
@@ -1014,7 +1064,8 @@ impl<'a> ReadingIrParser<'a> {
                 self.push_text_block(node, TextBlockKind::Heading(level), style)?;
             }
             "p" => {
-                if (!has_descendant_image(node) || node_has_visible_text(node))
+                if (!self.inferred_lists.contains_key(&node.id()) || self.inside_note_definition)
+                    && (!has_descendant_image(node) || node_has_visible_text(node))
                     && !is_numbered_media_paragraph(node)
                     && (has_pullquote_semantics(node)
                         || self.styles.has_standalone_quote_layout(node)
@@ -1047,6 +1098,18 @@ impl<'a> ReadingIrParser<'a> {
                         && is_inferred_figure_caption(node, &self.styles)
                     {
                         TextBlockKind::Caption
+                    } else if !self.inside_quote
+                        && !self.inside_note_definition
+                        && let Some(item) = self.inferred_lists.get(&node.id())
+                    {
+                        style.list_group = Some(item.group);
+                        style.authored_list_marker = Some(item.prefix_chars);
+                        TextBlockKind::ListItem {
+                            ordered: item.ordered,
+                            ordinal: item.ordinal,
+                            depth: item.depth,
+                            marker_visible: false,
+                        }
                     } else if has_marker || markerless_nested_item {
                         TextBlockKind::ListItem {
                             ordered: false,
@@ -1058,7 +1121,9 @@ impl<'a> ReadingIrParser<'a> {
                         self.paragraph_list_indents.clear();
                         TextBlockKind::Paragraph
                     };
-                    if matches!(kind, TextBlockKind::ListItem { .. }) {
+                    if matches!(kind, TextBlockKind::ListItem { .. })
+                        && style.authored_list_marker.is_none()
+                    {
                         style.indent = 0.0;
                     }
                     self.push_text_block(node, kind, style)?;
@@ -1893,8 +1958,15 @@ impl<'a> ReadingIrParser<'a> {
             &mut collector,
         );
         collector.finish();
+        if let Some(marker_chars) = style.authored_list_marker {
+            style.authored_list_marker = Some(paragraph_lists::prefix_length(
+                &collector.content,
+                marker_chars,
+            ));
+        }
         if node.tag_name().name().eq_ignore_ascii_case("p")
             && matches!(kind, TextBlockKind::ListItem { .. })
+            && style.authored_list_marker.is_none()
         {
             strip_authored_list_marker(&mut collector.content);
         }

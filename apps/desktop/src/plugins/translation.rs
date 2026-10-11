@@ -1578,6 +1578,64 @@ fn push_translation_style_markup(output: &mut String, run: &TextRun) {
 /// A translated RTL paragraph uses LTR left alignment; other source styles stay intact.
 fn normalize_rtl_translation(block: &mut TextBlock) {
     use rebook_publication::{TextAlignment, TextDirection};
+    if block.style.authored_list_marker.is_some() {
+        let text: String = block
+            .content
+            .iter()
+            .filter_map(|inline| match inline {
+                Inline::Text(run) => Some(run.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let leading_spaces = text.chars().take_while(|c| c.is_whitespace()).count();
+        let value = text.trim_start();
+        let image_marker = block
+            .content
+            .iter()
+            .find(|inline| !matches!(inline, Inline::Text(run) if run.text.trim().is_empty()))
+            .is_some_and(|inline| matches!(inline, Inline::Image(_)));
+        let token_chars = if image_marker {
+            Some(0)
+        } else if value
+            .chars()
+            .next()
+            .is_some_and(|c| "•●◦▪▫‣⁃·◇◆♦◊○■□※»①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳".contains(c))
+        {
+            Some(1)
+        } else if matches!(block.kind, TextBlockKind::ListItem { ordered: true, .. }) {
+            value
+                .char_indices()
+                .take(7)
+                .find(|(_, c)| matches!(c, '.' | ')' | '、' | '．' | '）' | ']'))
+                .and_then(|(end, _)| {
+                    let label = value[..end].trim_start_matches(['(', '（', '[']);
+                    let valid = !label.is_empty()
+                        && label.len() <= 3
+                        && label.bytes().all(|c| c.is_ascii_digit())
+                        || label.len() == 1 && label.bytes().all(|c| c.is_ascii_alphabetic())
+                        || ["i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x"]
+                            .contains(&label.to_ascii_lowercase().as_str())
+                        || ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十"]
+                            .contains(&label);
+                    valid.then_some(value[..end].chars().count() + 1)
+                })
+        } else {
+            None
+        };
+        if let Some(token_chars) = token_chars {
+            let spaces = value
+                .chars()
+                .skip(token_chars)
+                .take_while(|c| c.is_whitespace())
+                .count();
+            block.style.authored_list_marker = Some((leading_spaces + token_chars + spaces) as u32);
+        } else {
+            block.style.authored_list_marker = None;
+            if let TextBlockKind::ListItem { marker_visible, .. } = &mut block.kind {
+                *marker_visible = true;
+            }
+        }
+    }
     if block.style.direction == TextDirection::Rtl {
         block.style.direction = TextDirection::Ltr;
         block.style.align = TextAlignment::Start;
@@ -2413,6 +2471,50 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn translated_authored_list_prefix_uses_its_current_whitespace() {
+        for (text, expected) in [
+            ("●正文", Some(1)),
+            ("● 正文", Some(2)),
+            ("12.  正文", Some(5)),
+            ("正文", None),
+            ("Hello. World", None),
+        ] {
+            let mut block = TextBlock {
+                kind: TextBlockKind::ListItem {
+                    ordered: text.starts_with('1'),
+                    ordinal: 1,
+                    depth: 0,
+                    marker_visible: false,
+                },
+                content: vec![Inline::Text(TextRun {
+                    text: text.into(),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: BlockStyle {
+                    authored_list_marker: Some(2),
+                    list_group: Some(10),
+                    ..Default::default()
+                },
+                source: None,
+            };
+            normalize_rtl_translation(&mut block);
+            assert_eq!(block.style.authored_list_marker, expected);
+            assert_eq!(block.style.list_group, Some(10));
+            if expected.is_none() {
+                assert!(matches!(
+                    block.kind,
+                    TextBlockKind::ListItem {
+                        marker_visible: true,
+                        ..
+                    }
+                ));
+            }
+        }
+    }
+
     #[test]
     fn ruby_only_prose_is_translatable_without_pronunciation_text() {
         use rebook_publication::{RubyRun, TextBlockKind};

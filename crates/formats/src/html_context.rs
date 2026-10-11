@@ -8,6 +8,16 @@ use rebook_html::SectionParseHints;
 use rebook_publication::{NOTE_SECTION_PROPERTY, PublicationUrl, SpineItem, TocEntry};
 use roxmltree::{Document, Node};
 
+/// Only inspect the raster header; callers run while parsing a section.
+pub(crate) fn image_dimensions(bytes: &[u8]) -> Option<[u32; 2]> {
+    let (width, height) = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    Some([width, height])
+}
+
 /// Container-independent navigation and note hints, computed once per book.
 #[derive(Debug, Default)]
 pub struct HtmlContext {

@@ -1244,10 +1244,15 @@ pub struct BlockStyle {
     /// Whether start/end alignment follows direction rather than physical edges.
     #[serde(default = "default_logical_alignment")]
     pub logical_alignment: bool,
-    /// Source-local identity of the outermost authored list container.
-    /// Absent for inferred paragraph lists and older serialized content.
+    /// Source-local identity of the outermost authored container or recovered list.
+    /// Absent for legacy paragraph lists and older serialized content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub list_group: Option<u64>,
+    /// Source text scalars occupied by an inferred, already authored list marker.
+    /// Inline marker images have zero source length. Retain the original content
+    /// so saved locations, selections and translations use unchanged offsets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authored_list_marker: Option<u32>,
     pub align: TextAlignment,
     /// Horizontal alignment explicitly supplied by the publication. This stays
     /// `None` when `align` only contains the reader/parser default, allowing
@@ -1288,6 +1293,7 @@ impl Default for BlockStyle {
             direction: TextDirection::Auto,
             logical_alignment: true,
             list_group: None,
+            authored_list_marker: None,
             align: TextAlignment::Start,
             authored_alignment: None,
             semantic_alignment: None,

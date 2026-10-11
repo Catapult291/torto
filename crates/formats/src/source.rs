@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rebook_html::parse_section_with_hints_and_image_classifier;
+use rebook_html::parse_section_with_image_metadata;
 use rebook_publication::{
     Block, Book, BookSource, ImageBlock, ImageStyle, Inline, Metadata, PublicationError,
     PublicationId, PublicationUrl, RenditionLayout, Resource, Section, SpineItem, SpineItemId,
@@ -454,7 +454,7 @@ impl BookSource for DirectBookSource {
                 let document = html_document(body).map_err(PublicationError::InvalidPublication)?;
                 let document = resolve_fragment_links(document, index, &self.fragment_sections)
                     .map_err(PublicationError::InvalidPublication)?;
-                let mut section = parse_section_with_hints_and_image_classifier(
+                let mut section = parse_section_with_image_metadata(
                     &document,
                     descriptor,
                     |href| {
@@ -468,6 +468,11 @@ impl BookSource for DirectBookSource {
                                 .get(href.path())
                                 .map(|resource| Arc::clone(&resource.bytes))
                         })
+                    },
+                    |href| {
+                        crate::html_context::image_dimensions(
+                            &self.resources.get(href.path())?.bytes,
+                        )
                     },
                     self.html_context.hints(descriptor),
                 )

@@ -9,7 +9,10 @@ use crc32fast::hash as crc32;
 use flate2::read::DeflateDecoder;
 use quick_xml::Reader;
 use quick_xml::events::Event;
-use rebook_html::{SectionParseHints, parse_section_with_hints_and_image_classifier};
+use rebook_html::{
+    SectionParseHints, parse_section_with_hints_and_image_classifier,
+    parse_section_with_image_metadata,
+};
 use rebook_publication::{
     Book, BookSource, Metadata, PublicationError, PublicationId, PublicationUrl, RenditionLayout,
     Resource, Section, SpineItem, SpineItemId, TocEntry, promote_single_toc_root,
@@ -227,11 +230,12 @@ impl EpubPublication {
         }
 
         let xml = self.archive.read_content_xml(&descriptor.href)?;
-        let mut section = parse_section_with_hints_and_image_classifier(
+        let mut section = parse_section_with_image_metadata(
             &xml,
             descriptor,
             |href| self.archive.read_stylesheet(href).ok(),
             |href| self.is_decorative_separator_image(href),
+            |href| crate::html_context::image_dimensions(&self.archive.read(href).ok()?),
             self.html_context.hints(descriptor),
         )?;
         if let Some(hints) = self.toc_heading_hints.get(descriptor.href.path()) {
@@ -2078,6 +2082,52 @@ mod tests {
         assert!(!publication.is_decorative_separator_image(
             &PublicationUrl::parse("OPS/Text/formula.png").unwrap()
         ));
+    }
+
+    #[test]
+    fn recovers_small_image_list_markers_through_the_archive_metadata_reader() {
+        let marker = png(9, 10);
+        let chapter = br#"<html><body><p>Use two resources:</p><div>
+            <p class="bulllist"><a id="first"/><img src="marker.png"/>&#160;First resource.</p>
+            <p class="bulllist"><img src="marker.png"/>&#160;Second resource.</p>
+            </div></body></html>"#;
+        let mut entries = minimal_entries();
+        entries[5] = (
+            "OPS/Text/chapter.xhtml",
+            chapter,
+            CompressionMethod::Deflated,
+        );
+        entries.push(("OPS/Text/marker.png", &marker, CompressionMethod::Deflated));
+        let publication = EpubPublication::open_bytes(zip_entries(&entries)).unwrap();
+        let section = publication.parse_section(0).unwrap();
+        let items: Vec<_> = section
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                rebook_publication::Block::Text(text)
+                    if matches!(
+                        text.kind,
+                        rebook_publication::TextBlockKind::ListItem { .. }
+                    ) =>
+                {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].style.authored_list_marker, Some(1));
+        assert_eq!(items[0].style.list_group, items[1].style.list_group);
+        assert!(matches!(
+            items[0].content[0],
+            rebook_publication::Inline::Image(_)
+        ));
+        assert!(
+            section
+                .anchors
+                .iter()
+                .any(|anchor| anchor.fragment == "first")
+        );
     }
 
     fn png(width: u32, height: u32) -> Vec<u8> {

@@ -2796,6 +2796,37 @@ impl LayoutEngine {
             }
             ruby.push(placement);
         }
+        let marker_width = if matches!(block.kind, TextBlockKind::ListItem { .. }) {
+            let marker_end = if reader_style.typesetting.mode == TypesettingMode::Unified {
+                block
+                    .style
+                    .authored_list_marker
+                    .map(|count| {
+                        text.char_indices()
+                            .nth(count as usize)
+                            .map_or(text.len(), |(i, _)| i)
+                    })
+                    .unwrap_or(source_text_start)
+            } else {
+                source_text_start
+            };
+            self.measure_list_marker_width(&text[..marker_end], &font_stack, typography)
+                + if block.style.authored_list_marker.is_some()
+                    && reader_style.typesetting.mode == TypesettingMode::Unified
+                {
+                    inline_images
+                        .iter()
+                        .filter(|image| {
+                            image.index < marker_end || marker_end == 0 && image.index == 0
+                        })
+                        .map(|image| image.width)
+                        .sum::<f32>()
+                } else {
+                    0.0
+                }
+        } else {
+            0.0
+        };
         let mut layout = self.build_text_layout_with_boundaries(
             &text,
             &spans,
@@ -2816,9 +2847,7 @@ impl LayoutEngine {
         self.apply_text_indents(
             &mut layout,
             block,
-            &text[..source_text_start],
-            typography,
-            &font_stack,
+            marker_width,
             first_line_indent,
         );
         let should_optimize = optimize_line_breaks
@@ -2854,11 +2883,7 @@ impl LayoutEngine {
             .map(|(offset, glyph)| (*offset, glyph.width))
             .collect::<HashMap<_, _>>();
         let mut selected_hyphens = Vec::new();
-        let continuation_indent = if matches!(block.kind, TextBlockKind::ListItem { .. }) {
-            self.measure_list_marker_width(&text[..source_text_start], &font_stack, typography)
-        } else {
-            0.0
-        };
+        let continuation_indent = marker_width;
         let mut optimized = false;
         let mut shaping_breaks = Vec::new();
         // Reshape at chosen discretionary breaks and remeasure before accepting
@@ -2895,9 +2920,7 @@ impl LayoutEngine {
                     self.apply_text_indents(
                         &mut layout,
                         block,
-                        &text[..source_text_start],
-                        typography,
-                        &font_stack,
+                        marker_width,
                         first_line_indent,
                     );
                     continue;
@@ -2923,9 +2946,7 @@ impl LayoutEngine {
                     self.apply_text_indents(
                         &mut adjusted,
                         block,
-                        &text[..source_text_start],
-                        typography,
-                        &font_stack,
+                        marker_width,
                         first_line_indent,
                     );
                     if linebreak::parley::apply_breaks(
@@ -2971,9 +2992,7 @@ impl LayoutEngine {
             self.apply_text_indents(
                 &mut layout,
                 block,
-                &text[..source_text_start],
-                typography,
-                &font_stack,
+                marker_width,
                 first_line_indent,
             );
         }
@@ -3010,9 +3029,7 @@ impl LayoutEngine {
                             self.apply_text_indents(
                                 &mut adjusted,
                                 block,
-                                &text[..source_text_start],
-                                typography,
-                                &font_stack,
+                                marker_width,
                                 first_line_indent,
                             );
                             linebreak::parley::apply_breaks(
@@ -3573,9 +3590,7 @@ impl LayoutEngine {
         &mut self,
         layout: &mut Layout<TextBrush>,
         block: &TextBlock,
-        marker: &str,
-        typography: &ReaderTypography,
-        font_stack: &str,
+        marker_width: f32,
         first_line_indent: f32,
     ) {
         if first_line_indent.abs() > f32::EPSILON {
@@ -3587,7 +3602,9 @@ impl LayoutEngine {
                 },
             );
         }
-        self.apply_list_indent(layout, block.kind, marker, typography, font_stack);
+        if marker_width > 0.0 {
+            apply_list_hanging_indent(layout, block.kind, marker_width);
+        }
     }
 
     fn measure_list_marker_width(
@@ -3596,6 +3613,9 @@ impl LayoutEngine {
         font_stack: &str,
         typography: &ReaderTypography,
     ) -> f32 {
+        if marker.is_empty() {
+            return 0.0;
+        }
         let mut builder =
             self.layout_context
                 .ranged_builder(&mut self.font_context, marker, 1.0, false);
@@ -3611,21 +3631,6 @@ impl LayoutEngine {
         let mut layout: Layout<TextBrush> = builder.build(marker).into();
         break_text_lines(&mut layout, None);
         layout.full_width()
-    }
-
-    fn apply_list_indent(
-        &mut self,
-        layout: &mut Layout<TextBrush>,
-        kind: TextBlockKind,
-        marker: &str,
-        typography: &ReaderTypography,
-        font_stack: &str,
-    ) {
-        if marker.is_empty() {
-            return;
-        }
-        let marker_width = self.measure_list_marker_width(marker, font_stack, typography);
-        apply_list_hanging_indent(layout, kind, marker_width);
     }
 
     fn shape_fixed_page_replacement(
@@ -4709,7 +4714,11 @@ fn prepare_inline_content(
     } else {
         Vec::new()
     };
-    let prefix = list_marker_prefix(block.kind);
+    let prefix = if block.style.authored_list_marker.is_some() {
+        String::new()
+    } else {
+        list_marker_prefix(block.kind)
+    };
     if !prefix.is_empty() {
         let start = text.len();
         text.push_str(&prefix);
@@ -6945,6 +6954,57 @@ mod tests {
     }
 
     #[test]
+    fn inferred_image_marker_hanging_indent_includes_the_actual_image_advance() {
+        let block = TextBlock {
+            kind: TextBlockKind::ListItem { ordered: false, ordinal: 1, depth: 0, marker_visible: false },
+            content: vec![
+                Inline::Image(Box::new(rebook_publication::InlineImageRun {
+                    image: ImageBlock { formula_image: false, formula: None,
+                        href: PublicationUrl::parse("images/diamond.gif").unwrap(), alt: "image".into(),
+                        style: ImageStyle::default(), source: None, text_layer: None },
+                    size_scale: 1.0, intrinsic_sizing: true,
+                    vertical_align: InlineImageAlignment::Middle, presentation: false,
+                })),
+                Inline::Text(TextRun { text: "\u{00a0}A large general corpus for developing the static initial language model. This could be any static language model previously presented.".into(), style: TextStyle::default(), link: None }),
+            ],
+            style: BlockStyle { authored_list_marker: Some(1), ..Default::default() }, source: None,
+        };
+        let raster = RasterImage {
+            deferred: None,
+            origin: None,
+            blob: None,
+            width: 9,
+            height: 10,
+            pixels: vec![0; 9 * 10 * 4].into(),
+        };
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+        let mut engine = LayoutEngine::new();
+        let prepared = engine.shape_text_with_sources(
+            &block,
+            &style,
+            300.0,
+            40.0,
+            &[Some(raster), None],
+            vec![],
+            true,
+            None,
+        );
+        assert!(prepared.layout.len() > 1);
+        assert_eq!(prepared.inline_images.len(), 1);
+        assert_eq!(prepared.source_text_start, 0);
+        let advance = prepared.inline_images[0].width
+            + engine.measure_list_marker_width(
+                "\u{00a0}",
+                &style.typography.default_stack(),
+                &style.typography,
+            );
+        assert!((prepared.layout.get(1).unwrap().metrics().offset - advance).abs() < 0.01);
+    }
+
+    #[test]
     fn quote_accent_tracks_the_reader_foreground_theme() {
         assert_eq!(
             quote_accent_for_foreground(Rgba::BLACK),
@@ -8774,6 +8834,56 @@ mod tests {
                 (end - prepared.available_width).abs() < 1.0,
                 "list text right edge {end} differs from available width {}",
                 prepared.available_width
+            );
+        }
+    }
+
+    #[test]
+    fn authored_markers_keep_source_offsets_and_align_wrapped_body() {
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+        for (prefix, count) in [("● ", 2), ("12. ", 4), ("·", 1)] {
+            let block = TextBlock {
+                kind: TextBlockKind::ListItem {
+                    ordered: prefix.starts_with('1'),
+                    ordinal: 12,
+                    depth: 0,
+                    marker_visible: false,
+                },
+                content: vec![Inline::Text(TextRun {
+                    text: format!(
+                        "{prefix}Create hierarchy. Type embodies what you want to say with your design, and it creates and supports your website structure."
+                    ),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: BlockStyle {
+                    authored_list_marker: Some(count),
+                    ..Default::default()
+                },
+                source: None,
+            };
+            let mut engine = LayoutEngine::new();
+            let resolved = resolve_text_block(&block, &style, TextContext::Flow);
+            let prepared = engine.shape_text_with_min_width(&resolved, &style, 260.0, 40.0);
+            assert!(prepared.layout.len() > 1);
+            assert!(prepared.text.starts_with(prefix));
+            assert_eq!(prepared.source_text_start, 0);
+            let advance = engine.measure_list_marker_width(
+                prefix,
+                &style.typography.default_stack(),
+                &style.typography,
+            );
+            assert!((prepared.layout.get(1).unwrap().metrics().offset - advance).abs() < 0.01);
+            let book_mode =
+                engine.shape_text_with_min_width(&block, &ReaderStyle::default(), 260.0, 40.0);
+            assert!(book_mode.text.starts_with(prefix));
+            assert!(
+                book_mode.layout.get(1).unwrap().metrics().offset.abs() < 0.01,
+                "prefix {prefix:?}, book offset {:?}",
+                book_mode.layout.get(1).unwrap().metrics().offset
             );
         }
     }

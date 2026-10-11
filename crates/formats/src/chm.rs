@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use encoding_rs::{Encoding, UTF_8, WINDOWS_1252};
 use libchm::{ChmFile, EntrySel};
-use rebook_html::parse_section_with_hints_and_image_classifier;
+use rebook_html::{
+    parse_section_with_hints_and_image_classifier, parse_section_with_image_metadata,
+};
 use rebook_publication::{
     Book, BookSource, Metadata, PublicationError, PublicationId, PublicationUrl, RenditionLayout,
     Resource, Section, SpineItem, SpineItemId, TableOfContentsOrigin, TocEntry,
@@ -368,7 +370,7 @@ impl BookSource for ChmPublication {
             .ok_or_else(|| PublicationError::ResourceNotFound(descriptor.href.to_string()))?;
         let xhtml =
             html_to_xhtml(&decode_text(bytes)).map_err(PublicationError::InvalidPublication)?;
-        let mut section = parse_section_with_hints_and_image_classifier(
+        let mut section = parse_section_with_image_metadata(
             &xhtml,
             descriptor,
             |href| resource_bytes(&self.resources, href).map(decode_text),
@@ -376,6 +378,7 @@ impl BookSource for ChmPublication {
                 self.html_context
                     .is_separator_image(href, || resource_bytes(&self.resources, href))
             },
+            |href| crate::html_context::image_dimensions(resource_bytes(&self.resources, href)?),
             self.html_context.hints(descriptor),
         )
         .map_err(|error| PublicationError::InvalidPublication(error.to_string()))?;

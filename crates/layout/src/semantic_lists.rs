@@ -62,6 +62,8 @@ pub fn semantic_list_groups(blocks: &[&Block]) -> Vec<Range<usize>> {
         let start = previous.filter(|&i| {
             spine(i) == spine(first) && matches!(blocks[i], Block::Text(t)
                 if t.kind == TextBlockKind::Paragraph
+                    && (matches!(blocks[first], Block::Text(item) if item.style.authored_list_marker.is_none())
+                        || is_list_introduction(t))
                     && !super::is_display_formula(t)
                     && !t.content.iter().any(|i|matches!(i, Inline::Image(_)))
                     && t.content.iter().any(|i|matches!(i, Inline::Text(r) if !r.text.trim().is_empty())))
@@ -70,6 +72,23 @@ pub fn semantic_list_groups(blocks: &[&Block]) -> Vec<Range<usize>> {
         index = end;
     }
     result
+}
+
+fn is_list_introduction(text: &rebook_publication::TextBlock) -> bool {
+    let value = text
+        .content
+        .iter()
+        .filter_map(|inline| match inline {
+            Inline::Text(run) => Some(run.text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    let value = value.trim_end();
+    value.ends_with([':', '：'])
+        || value.chars().count() <= 150
+            && ["如下", "以下", "包括"]
+                .iter()
+                .any(|word| value.contains(word))
 }
 
 #[cfg(test)]
@@ -162,6 +181,36 @@ mod tests {
             assert_eq!(
                 semantic_list_groups(&blocks.iter().collect::<Vec<_>>()),
                 vec![1..2, 2..3]
+            );
+        }
+    }
+
+    #[test]
+    fn newly_inferred_lists_attach_only_actual_introductions() {
+        for (intro, start) in [
+            ("Unrelated preceding prose.", 1),
+            ("Use these two corpora:", 0),
+            ("练习包括这些项目。", 0),
+        ] {
+            let mut blocks = vec![
+                text("intro", TextBlockKind::Paragraph),
+                text("a", item(0)),
+                text("b", item(0)),
+            ];
+            if let Block::Text(t) = &mut blocks[0] {
+                if let Inline::Text(run) = &mut t.content[0] {
+                    run.text = intro.into();
+                }
+            }
+            for block in &mut blocks[1..] {
+                if let Block::Text(t) = block {
+                    t.style.authored_list_marker = Some(2);
+                    t.style.list_group = Some(10);
+                }
+            }
+            assert_eq!(
+                semantic_list_groups(&blocks.iter().collect::<Vec<_>>()),
+                vec![start..3]
             );
         }
     }

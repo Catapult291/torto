@@ -20,7 +20,7 @@ use rebook_publication::*;
 use serde::{Deserialize, Serialize};
 
 // The revision also isolates semantic/translation caches from older grouping.
-pub const VERSION: u32 = 13;
+pub const VERSION: u32 = 14;
 pub const PAGE_ANCHOR_PREFIX: &str = "pdf-page-";
 pub use quality::{Assessment, TextRoute, assess};
 const MAX_SECTION_BYTES: u64 = 32 * 1024 * 1024;
