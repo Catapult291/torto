@@ -175,6 +175,10 @@ impl DesktopReader {
             rect,
             scene_id: self.scene_id,
             scene_revision: self.scene_revision,
+            content_left: 0.0,
+            preview_left: 0.0,
+            reflow_pending: false,
+            live_resize_preview: false,
             background: peniko::Color::from_rgba8(
                 colors.background.r(),
                 colors.background.g(),

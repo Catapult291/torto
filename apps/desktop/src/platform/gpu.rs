@@ -23,6 +23,7 @@ struct PageTarget {
     texture_id: TextureId,
     size: [u32; 2],
     logical_size: egui::Vec2,
+    content_left: f32,
     rendered_scene: Option<(u64, u64)>,
 }
 
@@ -115,13 +116,28 @@ pub(super) struct GpuState {
     page_target: Option<PageTarget>,
     retired_page_textures: Vec<TextureId>,
     clear_color: wgpu::Color,
-    last_frame: Option<wgpu::Texture>,
-    resize_pending: bool,
     reader_residency: ReaderGpuResidency,
     memory_sample_at: Option<Instant>,
     sampled_frames: usize,
     sampled_ui_ms: f32,
     sampled_frame_ms: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WindowFrameState {
+    size: PhysicalSize<u32>,
+    scale_factor: f64,
+    maximized: bool,
+}
+
+impl WindowFrameState {
+    fn capture(window: &Window) -> Self {
+        Self {
+            size: window.inner_size(),
+            scale_factor: window.scale_factor(),
+            maximized: window.is_maximized(),
+        }
+    }
 }
 
 impl GpuState {
@@ -178,9 +194,6 @@ impl GpuState {
             .ok_or_else(|| "当前 GPU 不支持窗口 Surface".to_owned())?;
         surface_config.format = format;
         surface_config.usage = TextureUsages::RENDER_ATTACHMENT;
-        if capabilities.usages.contains(TextureUsages::COPY_DST) {
-            surface_config.usage |= TextureUsages::COPY_DST;
-        }
         surface_config.view_formats = vec![format];
         surface_config.desired_maximum_frame_latency = 1;
         surface.configure(&device, &surface_config);
@@ -200,8 +213,6 @@ impl GpuState {
             prewarm_id: None,
             page_target: None,
             retired_page_textures: Vec::new(),
-            last_frame: None,
-            resize_pending: false,
             reader_residency: ReaderGpuResidency::default(),
             memory_sample_at: None,
             sampled_frames: 0,
@@ -282,7 +293,6 @@ impl GpuState {
         {
             return;
         }
-        self.resize_pending = true;
         self.surface_config.width = size.width;
         self.surface_config.height = size.height;
         self.surface.configure(&self.device, &self.surface_config);
@@ -401,17 +411,15 @@ impl GpuState {
         }
         // Fullscreen transitions can deliver a redraw before their Resized event.
         // Always configure from the window's current client size before acquiring.
-        self.resize(window.inner_size());
-
-        if self.resize_pending {
-            self.present_resize_preview(window)?;
-        }
+        let frame_state = WindowFrameState::capture(window);
+        self.resize(frame_state.size);
 
         let raw_input = self.take_egui_input(window, egui_state);
         let mut viewport_info = root_viewport_info(&raw_input);
         let mut plan = None;
+        let previous_texture = self.page_texture();
         let mut output = egui_ctx.run_ui(raw_input, |ui| {
-            plan = app.ui(ui, self.page_texture());
+            plan = app.ui(ui, previous_texture);
         });
         let ui_finished = frame_started.elapsed();
         crate::ui::resolve_interface_font_fallbacks(egui_ctx, &output.shapes);
@@ -422,6 +430,17 @@ impl GpuState {
         egui_state.handle_platform_output(window, std::mem::take(&mut output.platform_output));
         process_root_viewport_commands(window, egui_ctx, &mut viewport_info, &mut output);
         let platform_finished = frame_started.elapsed();
+
+        // Maximize/restore commands run after egui has laid out this frame.
+        // Windows may already have moved the HWND to its new bounds while the
+        // swapchain and these shapes still have the previous size. Submitting
+        // that frame exposes an old-sized window image at the new origin.
+        if frame_state != WindowFrameState::capture(window) {
+            self.update_egui_textures(&mut output.textures_delta);
+            self.free_egui_textures(&mut output.textures_delta);
+            window.request_redraw();
+            return Ok(());
+        }
 
         let mut page_target_recreated = false;
         if let Some(plan) = plan {
@@ -440,7 +459,13 @@ impl GpuState {
                     target.rendered_scene = None;
                 }
             }
-            let recreated = self.ensure_page_target(plan, pixels_per_point);
+            let hold = hold_reader_texture(
+                self.page_target
+                    .as_ref()
+                    .and_then(|target| target.rendered_scene),
+                plan,
+            );
+            let recreated = !hold && self.ensure_page_target(plan, pixels_per_point);
             page_target_recreated = recreated;
             let trim = self
                 .reader_residency
@@ -480,7 +505,7 @@ impl GpuState {
                     .page_target
                     .as_ref()
                     .is_some_and(|target| reader_scene_needs_render(target.rendered_scene, plan));
-            if needs_render && self.prewarm_id.is_none() {
+            if needs_render && !hold && self.prewarm_id.is_none() {
                 let capture_timings = self
                     .page_target
                     .as_ref()
@@ -532,10 +557,30 @@ impl GpuState {
                 layers.clear();
             }
         }
-        if page_target_recreated {
-            // This frame intentionally retains the old texture at its old logical
-            // size, so it is clipped instead of stretched. The next frame uses the
-            // freshly rendered target without rerunning stateful UI in this frame.
+        // UI state is evaluated once. Substitute only the body image after its
+        // new pixels are ready, keeping chrome, scroll anchors and the body in
+        // the same presentation instead of showing a one-frame-old texture.
+        let mut body_submitted = false;
+        if let Some(plan) = plan
+            && let Some(target) = &mut self.page_target
+            && (!reader_scene_needs_render(target.rendered_scene, plan)
+                || hold_reader_texture(target.rendered_scene, plan))
+        {
+            if !hold_reader_texture(target.rendered_scene, plan) {
+                target.content_left = plan.content_left;
+            }
+            if let Some(previous) = previous_texture {
+                let texture = ReaderPageTexture {
+                    id: target.texture_id,
+                    size: target.logical_size,
+                    content_left: target.content_left,
+                };
+                body_submitted =
+                    replace_reader_texture(&mut output.shapes, previous.id, texture, plan);
+            }
+        }
+        if page_target_recreated && !body_submitted {
+            // The first body has no image placeholder in the opening shell.
             window.request_redraw();
         }
 
@@ -546,12 +591,7 @@ impl GpuState {
             size_in_pixels: [self.surface_config.width, self.surface_config.height],
             pixels_per_point,
         };
-        for (id, image_deltas) in output.textures_delta.set.drain() {
-            for image_delta in image_deltas {
-                self.egui_renderer
-                    .update_texture(&self.device, &self.queue, id, &image_delta);
-            }
-        }
+        self.update_egui_textures(&mut output.textures_delta);
 
         let textures_finished = frame_started.elapsed();
         let Some(frame) = self.acquire_surface_frame(window)? else {
@@ -559,33 +599,29 @@ impl GpuState {
             return Ok(());
         };
         let acquisition_finished = frame_started.elapsed();
-        // Retain the complete UI on the GPU, including panels and popups.
-        let retain_frame = self.surface_config.usage.contains(TextureUsages::COPY_DST);
-        if retain_frame {
-            let size = frame.texture.size();
-            if self
-                .last_frame
-                .as_ref()
-                .is_none_or(|texture| texture.size() != size)
+        let extent = frame.texture.size();
+        let current_state = WindowFrameState::capture(window);
+        if frame_state != current_state
+            || extent.width != frame_state.size.width
+            || extent.height != frame_state.size.height
+        {
+            drop(frame);
+            if current_state.size != frame_state.size {
+                self.resize(current_state.size);
+            } else if extent.width != frame_state.size.width
+                || extent.height != frame_state.size.height
             {
-                self.last_frame = Some(self.device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("retained-window-frame"),
-                    size,
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: self.surface_config.format,
-                    usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
-                    view_formats: &[],
-                }));
+                self.surface.configure(&self.device, &self.surface_config);
             }
+            self.free_egui_textures(&mut output.textures_delta);
+            window.request_redraw();
+            return Ok(());
         }
-        let target = if retain_frame {
-            self.last_frame.as_ref().unwrap()
-        } else {
-            &frame.texture
-        };
-        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        // Resize presents one complete UI at the current window size. Reusing
+        // the body texture avoids an extra full-window screenshot/copy/present.
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -618,29 +654,19 @@ impl GpuState {
             self.egui_renderer
                 .render(&mut pass.forget_lifetime(), &paint_jobs, &screen);
         }
-        if retain_frame {
-            encoder.copy_texture_to_texture(
-                self.last_frame.as_ref().unwrap().as_image_copy(),
-                frame.texture.as_image_copy(),
-                frame.texture.size(),
-            );
-        }
         let encoding_finished = frame_started.elapsed();
         self.queue
             .submit(callback_commands.into_iter().chain([encoder.finish()]));
         let submission_finished = frame_started.elapsed();
         window.pre_present_notify();
+        crate::smoke::validate_presentation(
+            [window.inner_size().width, window.inner_size().height],
+            screen.size_in_pixels,
+            [extent.width, extent.height],
+        )?;
         self.queue.present(frame);
         let presentation_finished = frame_started.elapsed();
-        // A newly allocated target was not yet part of this frame's UI shapes.
-        // Count opening only once the UI actually submits the prepared texture.
-        let reader_ready = plan.is_some_and(|plan| {
-            !page_target_recreated
-                && self
-                    .page_target
-                    .as_ref()
-                    .is_some_and(|target| !reader_scene_needs_render(target.rendered_scene, plan))
-        });
+        let reader_ready = body_submitted;
         app.record_open_presentation(reader_ready, egui_ctx);
         if presentation_finished.as_millis() >= 100 {
             use crate::diagnostics::{Field, log};
@@ -678,9 +704,6 @@ impl GpuState {
                 })
                 .map_err(|error| error.to_string())?;
             crate::smoke::presented(reader_ready, app.startup_error())?;
-        }
-        for id in self.retired_page_textures.drain(..) {
-            self.egui_renderer.free_texture(&id);
         }
         self.free_egui_textures(&mut output.textures_delta);
         // Process completed submissions and dropped resource handles without
@@ -723,9 +746,7 @@ impl GpuState {
         let page_bytes = self.page_target.as_ref().map_or(0, |target| {
             target.size[0] as usize * target.size[1] as usize * 4
         });
-        let retained_bytes = self.last_frame.as_ref().map_or(0, |texture| {
-            texture.width() as usize * texture.height() as usize * 4
-        });
+        let retained_bytes = 0;
         let allocator = self.device.generate_allocator_report();
         let vello_buffers = allocator.as_ref().map_or(0, |report| {
             report
@@ -792,53 +813,19 @@ impl GpuState {
         );
     }
 
-    /// Present old pixels without scaling before expensive UI layout starts.
-    fn present_resize_preview(&mut self, window: &Window) -> Result<(), String> {
-        let Some(frame) = self.acquire_surface_frame(window)? else {
-            return Ok(());
-        };
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("resize-preview"),
-            });
-        {
-            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("resize-background"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(self.clear_color),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
+    fn update_egui_textures(&mut self, textures_delta: &mut egui::TexturesDelta) {
+        for (id, image_deltas) in textures_delta.set.drain() {
+            for image_delta in image_deltas {
+                self.egui_renderer
+                    .update_texture(&self.device, &self.queue, id, &image_delta);
+            }
         }
-        if let Some(previous) = &self.last_frame {
-            encoder.copy_texture_to_texture(
-                previous.as_image_copy(),
-                frame.texture.as_image_copy(),
-                retained_frame_extent(previous.size(), frame.texture.size()),
-            );
-        }
-        self.queue.submit([encoder.finish()]);
-        window.pre_present_notify();
-        self.queue.present(frame);
-        self.resize_pending = false;
-        // Keep the last complete frame, not this temporary partially empty one.
-        Ok(())
     }
 
     fn free_egui_textures(&mut self, textures_delta: &mut egui::TexturesDelta) {
+        for id in self.retired_page_textures.drain(..) {
+            self.egui_renderer.free_texture(&id);
+        }
         for id in textures_delta.free.drain() {
             self.egui_renderer.free_texture(&id);
         }
@@ -848,6 +835,7 @@ impl GpuState {
         self.page_target.as_ref().map(|target| ReaderPageTexture {
             id: target.texture_id,
             size: target.logical_size,
+            content_left: target.content_left,
         })
     }
 
@@ -895,6 +883,7 @@ impl GpuState {
             texture_id,
             size,
             logical_size: plan.rect.size(),
+            content_left: plan.content_left,
             rendered_scene: None,
         });
         if let Some(previous) = previous {
@@ -1111,6 +1100,69 @@ fn reader_scene_needs_render(rendered_scene: Option<(u64, u64)>, plan: ReaderFra
     rendered_scene != Some((plan.scene_id, plan.scene_revision))
 }
 
+fn hold_reader_texture(rendered_scene: Option<(u64, u64)>, plan: ReaderFramePlan) -> bool {
+    plan.reflow_pending
+        && !plan.live_resize_preview
+        && rendered_scene.is_some_and(|(id, _)| id == plan.scene_id)
+}
+
+/// Replace just the reader image in already evaluated UI output. Its clip and
+/// z-order stay intact; updating the native binding early would stretch the old
+/// rectangle, and rerunning UI could process input or scroll restoration twice.
+fn replace_reader_texture(
+    shapes: &mut [egui::epaint::ClippedShape],
+    previous: TextureId,
+    texture: ReaderPageTexture,
+    plan: ReaderFramePlan,
+) -> bool {
+    fn replace(
+        shape: &mut egui::Shape,
+        previous: TextureId,
+        texture: ReaderPageTexture,
+        rect: egui::Rect,
+    ) -> bool {
+        match shape {
+            egui::Shape::Mesh(mesh) if mesh.texture_id == previous => {
+                let bounds = mesh.calc_bounds();
+                if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
+                    return false;
+                }
+                let mesh = Arc::make_mut(mesh);
+                mesh.texture_id = texture.id;
+                for vertex in &mut mesh.vertices {
+                    vertex.pos = egui::pos2(
+                        rect.left()
+                            + (vertex.pos.x - bounds.left()) / bounds.width() * rect.width(),
+                        rect.top()
+                            + (vertex.pos.y - bounds.top()) / bounds.height() * rect.height(),
+                    );
+                }
+                true
+            }
+            egui::Shape::Rect(image) => {
+                let Some(brush) = image
+                    .brush
+                    .as_mut()
+                    .filter(|brush| brush.fill_texture_id == previous)
+                else {
+                    return false;
+                };
+                Arc::make_mut(brush).fill_texture_id = texture.id;
+                image.rect = rect;
+                true
+            }
+            egui::Shape::Vec(children) => children.iter_mut().fold(false, |found, child| {
+                replace(child, previous, texture, rect) || found
+            }),
+            _ => false,
+        }
+    }
+    let rect = texture.destination(plan.rect, plan.preview_left);
+    shapes.iter_mut().fold(false, |found, shape| {
+        replace(&mut shape.shape, previous, texture, rect) || found
+    })
+}
+
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -1157,6 +1209,10 @@ mod tests {
             scene_id,
             scene_revision,
             background: peniko::Color::BLACK,
+            content_left: 0.0,
+            preview_left: 0.0,
+            reflow_pending: false,
+            live_resize_preview: false,
         }
     }
 
@@ -1168,36 +1224,79 @@ mod tests {
     }
 }
 
-// Copy the intersection at origin (0, 0); never scale the previous frame.
-fn retained_frame_extent(previous: wgpu::Extent3d, current: wgpu::Extent3d) -> wgpu::Extent3d {
-    wgpu::Extent3d {
-        width: previous.width.min(current.width),
-        height: previous.height.min(current.height),
-        depth_or_array_layers: 1,
-    }
-}
-
 #[cfg(test)]
-mod resize_preview_tests {
-    use super::retained_frame_extent;
+mod resize_presentation_tests {
+    use super::*;
     #[test]
-    fn retained_pixels_are_clipped_not_stretched() {
-        let size = |width, height| wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
+    fn new_body_replaces_old_image_in_the_same_frame_without_changing_chrome() {
+        let previous = TextureId::User(1);
+        let texture = ReaderPageTexture {
+            id: TextureId::User(2),
+            size: egui::vec2(1400.0, 700.0),
+            content_left: 300.0,
         };
-        assert_eq!(
-            retained_frame_extent(size(800, 600), size(1200, 900)),
-            size(800, 600)
+        let plan = ReaderFramePlan {
+            rect: egui::Rect::from_min_size(egui::pos2(256.0, 48.0), texture.size),
+            scene_id: 3,
+            scene_revision: 4,
+            background: peniko::Color::WHITE,
+            content_left: 300.0,
+            preview_left: 300.0,
+            reflow_pending: false,
+            live_resize_preview: false,
+        };
+        let chrome = egui::Shape::rect_filled(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(256.0, 700.0)),
+            0.0,
+            egui::Color32::WHITE,
         );
-        assert_eq!(
-            retained_frame_extent(size(1200, 900), size(800, 600)),
-            size(800, 600)
+        let mut shapes = vec![
+            egui::epaint::ClippedShape {
+                clip_rect: plan.rect,
+                shape: egui::Shape::image(
+                    previous,
+                    egui::Rect::from_min_size(plan.rect.min, egui::vec2(800.0, 500.0)),
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                ),
+            },
+            egui::epaint::ClippedShape {
+                clip_rect: egui::Rect::EVERYTHING,
+                shape: chrome.clone(),
+            },
+        ];
+        assert!(replace_reader_texture(&mut shapes, previous, texture, plan));
+        let egui::Shape::Mesh(body) = &shapes[0].shape else {
+            panic!("expected body image mesh")
+        };
+        assert_eq!(body.texture_id, texture.id);
+        assert_eq!(body.calc_bounds(), plan.rect);
+        assert_eq!(shapes[0].clip_rect, plan.rect);
+        assert_eq!(shapes[1].shape, chrome);
+    }
+
+    #[test]
+    fn drag_keeps_only_a_prepared_texture_from_the_current_book() {
+        let mut plan = ReaderFramePlan {
+            rect: egui::Rect::NOTHING,
+            scene_id: 3,
+            scene_revision: 5,
+            background: peniko::Color::WHITE,
+            content_left: 0.0,
+            preview_left: 0.0,
+            reflow_pending: true,
+            live_resize_preview: false,
+        };
+        assert!(hold_reader_texture(Some((3, 4)), plan));
+        assert!(!hold_reader_texture(Some((2, 4)), plan));
+        assert!(!hold_reader_texture(None, plan));
+        plan.live_resize_preview = true;
+        assert!(
+            !hold_reader_texture(Some((3, 4)), plan),
+            "scroll previews must draw the exposed area before reflow completes"
         );
-        assert_eq!(
-            retained_frame_extent(size(800, 900), size(1200, 600)),
-            size(800, 600)
-        );
+        plan.live_resize_preview = false;
+        plan.reflow_pending = false;
+        assert!(!hold_reader_texture(Some((3, 4)), plan));
     }
 }

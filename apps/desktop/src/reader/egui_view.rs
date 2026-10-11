@@ -362,12 +362,40 @@ pub(crate) struct ReaderFramePlan {
     pub(crate) scene_id: u64,
     pub(crate) scene_revision: u64,
     pub(crate) background: peniko::Color,
+    /// Horizontal body origin already painted into the texture.
+    pub(crate) content_left: f32,
+    pub(crate) preview_left: f32,
+    pub(crate) reflow_pending: bool,
+    /// Scroll views can paint newly exposed content from the installed layout
+    /// without waiting for the background layout to finish.
+    pub(crate) live_resize_preview: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReaderPageTexture {
     pub(crate) id: TextureId,
     pub(crate) size: Vec2,
+    pub(crate) content_left: f32,
+}
+
+impl ReaderPageTexture {
+    pub(crate) fn destination(self, page_rect: Rect, preview_left: f32) -> Rect {
+        Rect::from_min_size(
+            page_rect.min + Vec2::new(preview_left - self.content_left, 0.0),
+            self.size,
+        )
+    }
+}
+
+fn resize_preview_left(width: f32, layout_width: f32, style: &rebook_layout::ReaderStyle) -> f32 {
+    if style.spread == SpreadMode::Double && (width - layout_width).abs() > 0.1 {
+        // Keep the installed column count throughout a drag. Crossing the
+        // one/two-column breakpoint must not move the old body back and forth.
+        (reading_content_left(layout_width, style) + (width - layout_width) * 0.5)
+            .max(style.minimum_horizontal_margin)
+    } else {
+        reading_content_left(width, style)
+    }
 }
 
 fn selected_image_layer_id() -> egui::LayerId {
@@ -555,6 +583,22 @@ fn supports_image_preview(format: rebook_formats::BookFormat, ocr_mode: PdfOcrVi
 }
 
 impl DesktopReader {
+    pub(super) fn preview_content_left(&self, width: f32) -> f32 {
+        if self.source.book().metadata.layout == rebook_publication::RenditionLayout::PrePaginated {
+            width * 0.5
+        } else {
+            resize_preview_left(
+                width,
+                self.reader.viewport().width as f32,
+                &self.reader.style(),
+            )
+        }
+    }
+
+    pub(super) fn preview_offset_x(&self, width: f32) -> f32 {
+        self.preview_content_left(width)
+            - self.preview_content_left(self.reader.viewport().width as f32)
+    }
     pub(crate) fn prepare_sidebar_cover(
         &mut self,
         ctx: &egui::Context,
@@ -695,7 +739,8 @@ impl DesktopReader {
                             ui.allocate_exact_size(size, egui::Sense::click_and_drag());
                         let painter = ui.painter().with_clip_rect(rect);
                         painter.rect_filled(rect, 0.0, background_ui);
-                        let texture_rect = page_texture_destination(rect, texture.size);
+                        let texture_rect =
+                            texture.destination(rect, self.preview_content_left(rect.width()));
                         painter.image(
                             texture.id,
                             texture_rect,
@@ -720,6 +765,7 @@ impl DesktopReader {
                     f64::from(page_rect.height()),
                     ui.ctx().pixels_per_point(),
                 );
+                self.request_frame_repaint(ui.ctx());
 
                 let progress = unit_f32(self.progress());
                 let (track, _) = ui.allocate_exact_size(
@@ -802,6 +848,14 @@ impl DesktopReader {
             rect: page_rect,
             scene_id: self.scene_id,
             scene_revision: self.scene_revision,
+            content_left: self.preview_content_left(if self.is_scroll_mode() {
+                page_rect.width()
+            } else {
+                self.reader.viewport().width as f32
+            }),
+            preview_left: self.preview_content_left(page_rect.width()),
+            reflow_pending: self.semantic_layout.pending_viewport.is_some(),
+            live_resize_preview: self.is_scroll_mode(),
             background: peniko::Color::from_rgba8(
                 background.red,
                 background.green,
@@ -823,6 +877,7 @@ impl DesktopReader {
         background: Color32,
         interaction_blocked: bool,
     ) -> Rect {
+        self.retain_viewport_reflow_anchor(size);
         let layout = match self.current_scroll_layout() {
             Ok(layout) => layout,
             Err(error) => {
@@ -869,6 +924,11 @@ impl DesktopReader {
         }
         if rebuild_focus_units || (self.is_focus_mode() && self.scroll_viewport.is_none()) {
             let restored = self.restore_focus_reflow_anchor(&layout, size.y);
+            if restored.is_some() {
+                // This offset already includes the new viewport's focus
+                // padding. Do not schedule another height correction below.
+                self.scroll_viewport = None;
+            }
             #[cfg(debug_assertions)]
             if restored.is_some() {
                 ui.ctx().data_mut(|data| {
@@ -907,6 +967,12 @@ impl DesktopReader {
             scroll_area = scroll_area.vertical_scroll_offset(target_offset);
         }
 
+        if let Some(offset) = self.viewport_preview_offset(size.y, layout.content_height) {
+            scroll_area = scroll_area.vertical_scroll_offset(offset);
+            self.focus_target_offset = None;
+            self.ui.focus_scroll_motion = None;
+        }
+
         let mut page_rect = Rect::NOTHING;
         let keyboard_scroll_delta = std::mem::take(&mut self.pending_keyboard_scroll_delta);
         let scroll_output = scroll_area.show_viewport(ui, |ui, viewport| {
@@ -937,7 +1003,10 @@ impl DesktopReader {
             if let Some(texture) = page_texture {
                 painter.image(
                     texture.id,
-                    page_texture_destination(visible_rect, texture.size),
+                    texture.destination(
+                        visible_rect,
+                        self.preview_content_left(visible_rect.width()),
+                    ),
                     Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                     Color32::WHITE,
                 );
@@ -1075,7 +1144,8 @@ impl DesktopReader {
             sidebar_consumes_width,
             assistant_consumes_width,
         );
-        self.ui.sidebar_width = sidebar_width;
+        // A narrow window constrains this frame, not the user's preferred width.
+        self.ui.sidebar_display_width = sidebar_width;
         if self.is_focus_mode() {
             assistant_width =
                 focus_assistant_sidebar_width(viewport_width, self.ui.assistant_width)
@@ -1083,7 +1153,7 @@ impl DesktopReader {
         }
         if sidebar_consumes_width {
             egui::Panel::left("reader-sidebar")
-                .exact_size(self.ui.sidebar_width * sidebar_progress)
+                .exact_size(sidebar_width * sidebar_progress)
                 .resizable(false)
                 .show_separator_line(false)
                 .frame(chrome::sidebar_frame(false))
@@ -1136,7 +1206,7 @@ impl DesktopReader {
             if let Some(pointer_x) = panel_resize_pointer(
                 ctx,
                 "reader-sidebar-resize",
-                viewport.left() + self.ui.sidebar_width,
+                viewport.left() + self.ui.sidebar_display_width,
             ) {
                 self.ui.sidebar_width =
                     (pointer_x - viewport.left()).clamp(SIDEBAR_MIN_WIDTH, sidebar_max);
@@ -1146,7 +1216,7 @@ impl DesktopReader {
         if assistant_visible && assistant_progress >= 0.999 {
             let sidebar_reservation =
                 if !self.is_focus_mode() && self.ui.sidebar_pinned && sidebar_progress > 0.001 {
-                    self.ui.sidebar_width
+                    self.ui.sidebar_display_width
                 } else {
                     0.0
                 };
@@ -2197,7 +2267,7 @@ impl DesktopReader {
         let screen = ctx.content_rect();
         let floating = !self.ui.sidebar_pinned && sidebar_progress > 0.001;
         let left = if floating {
-            screen.left() + self.ui.sidebar_width * sidebar_progress
+            screen.left() + self.ui.sidebar_display_width * sidebar_progress
         } else {
             page_rect.left()
         };
@@ -2540,7 +2610,7 @@ impl DesktopReader {
         crate::app::window_chrome::dim_header(
             ctx,
             0.31 * progress,
-            screen.left() + self.ui.sidebar_width * progress,
+            screen.left() + self.ui.sidebar_display_width * progress,
         );
         egui::Area::new("reader-sidebar-scrim".into())
             .fade_in(false)
@@ -2572,17 +2642,17 @@ impl DesktopReader {
             .fade_in(false)
             .order(egui::Order::Foreground)
             .fixed_pos(Pos2::new(
-                screen.left() - self.ui.sidebar_width * (1.0 - progress),
+                screen.left() - self.ui.sidebar_display_width * (1.0 - progress),
                 screen.top(),
             ))
             .constrain(false)
-            .default_size(Vec2::new(self.ui.sidebar_width, screen.height()))
+            .default_size(Vec2::new(self.ui.sidebar_display_width, screen.height()))
             .show(ctx, |ui| {
                 ui.set_clip_rect(screen);
                 let frame = chrome::sidebar_frame(true);
                 let inset = frame.total_margin().sum();
                 frame.show(ui, |ui| {
-                    ui.set_width((self.ui.sidebar_width - inset.x).max(1.0));
+                    ui.set_width((self.ui.sidebar_display_width - inset.x).max(1.0));
                     ui.set_height((screen.height() - inset.y).max(1.0));
                     self.sidebar(ui);
                 });
@@ -3148,7 +3218,7 @@ impl DesktopReader {
                 })
         });
         if let Some(position) = outside_body_click {
-            let x = position.x - page_rect.left();
+            let x = position.x - page_rect.left() - self.preview_offset_x(page_rect.width());
             let y = position.y - page_rect.top();
             // Clicking another reference switches the popup; only ordinary
             // body clicks dismiss it. Keep popup scrolling/selection untouched.
@@ -4634,7 +4704,10 @@ impl DesktopReader {
                 0.0
             };
             Pos2::new(
-                page_rect.left() + rect.x + rect.width * 0.5,
+                page_rect.left()
+                    + self.preview_offset_x(page_rect.width())
+                    + rect.x
+                    + rect.width * 0.5,
                 page_rect.top() + page_top + rect.y + rect.height + 8.0,
             )
         });
@@ -4717,7 +4790,7 @@ impl DesktopReader {
         });
         if let Some(position) = hover_position.filter(|position| response.rect.contains(*position))
         {
-            let x = position.x - response.rect.min.x;
+            let x = position.x - response.rect.min.x - self.preview_offset_x(response.rect.width());
             let y = position.y - response.rect.min.y;
             match self.classic_footnotes_at_canvas(x, y) {
                 Ok(Some(footnotes)) => {
@@ -4766,6 +4839,9 @@ impl DesktopReader {
     }
 
     fn pointer_interaction(&mut self, response: &egui::Response) {
+        // The old body is translated while its new line breaks are prepared.
+        // Hit testing continues to use the currently installed source geometry.
+        let offset_x = self.preview_offset_x(response.rect.width());
         if response.hovered() && response.ctx.input(|input| input.pointer.any_pressed()) {
             self.ui.assistant_keyboard_focus = false;
             if self.assistant_is_docked() {
@@ -4774,13 +4850,13 @@ impl DesktopReader {
         }
         if let Some(position) = response.hover_pos() {
             if let Some((url, bounds)) = self.website_at_canvas(
-                position.x - response.rect.min.x,
+                position.x - response.rect.min.x - offset_x,
                 position.y - response.rect.min.y,
             ) {
                 response.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                 super::footnote_layout::website_tooltip(
                     response,
-                    bounds.translate(response.rect.min.to_vec2()),
+                    bounds.translate(response.rect.min.to_vec2() + Vec2::new(offset_x, 0.0)),
                     &url,
                 );
                 if response.clicked() {
@@ -4798,7 +4874,7 @@ impl DesktopReader {
         {
             if self
                 .footnote_reference_at_canvas(
-                    position.x - response.rect.min.x,
+                    position.x - response.rect.min.x - offset_x,
                     position.y - response.rect.min.y,
                 )
                 .is_some()
@@ -4813,7 +4889,7 @@ impl DesktopReader {
             }
             return;
         };
-        let x = position.x - response.rect.min.x;
+        let x = position.x - response.rect.min.x - offset_x;
         let y = position.y - response.rect.min.y;
         self.image_long_press_interaction(response, x, y);
         if !self.is_focus_mode() && response.drag_started() {
@@ -5152,6 +5228,7 @@ impl DesktopReader {
     }
 
     fn selected_image_overlay(&self, ctx: &egui::Context, page_rect: Rect) {
+        let offset = Vec2::new(self.preview_offset_x(page_rect.width()), 0.0);
         if self.is_focus_mode()
             && self.is_scroll_mode()
             && self
@@ -5170,7 +5247,7 @@ impl DesktopReader {
                 for (position, bounds) in self.active_focus_image_bounds() {
                     if let Some(top) = layout.content_y_for_position(position, 0.0) {
                         let bounds = bounds.translate(Vec2::new(
-                            page_rect.left(),
+                            page_rect.left() + offset.x,
                             page_rect.top() + top + self.scroll_content_padding(viewport.size.y)
                                 - viewport.offset_y,
                         ));
@@ -5203,7 +5280,7 @@ impl DesktopReader {
                 return;
             };
             selected.bounds.translate(Vec2::new(
-                page_rect.left(),
+                page_rect.left() + offset.x,
                 page_rect.top() + page_top + self.scroll_content_padding(viewport.size.y)
                     - viewport.offset_y,
             ))
@@ -5211,7 +5288,7 @@ impl DesktopReader {
             if self.is_scroll_mode() {
                 return;
             }
-            selected.bounds.translate(page_rect.min.to_vec2())
+            selected.bounds.translate(page_rect.min.to_vec2() + offset)
         };
         if !bounds.intersects(page_rect) {
             return;
@@ -5885,10 +5962,6 @@ fn centered_assistant_text_edit(
         },
     );
     (output.inner, input_rect)
-}
-
-fn page_texture_destination(page_rect: Rect, texture_size: Vec2) -> Rect {
-    Rect::from_min_size(page_rect.min, texture_size)
 }
 
 fn compact_input_frame() -> egui::Frame {
@@ -6855,7 +6928,6 @@ mod reference_suggestion_label_tests {
         }
     }
 
-
     #[test]
     fn chat_progress_expands_to_content_with_compact_rows() {
         let ctx = egui::Context::default();
@@ -7436,9 +7508,8 @@ mod reference_suggestion_label_tests {
                 added_at: 0,
                 cached_toc: None,
             };
-            let mut opening = crate::shelf::OpeningShell::new(
-                book.clone(), Instant::now(), mode, sidebar,
-            );
+            let mut opening =
+                crate::shelf::OpeningShell::new(book.clone(), Instant::now(), mode, sidebar);
             opening.pdf_toolbar.available = true;
             let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
             reader.reading_mode = mode;
@@ -7447,7 +7518,12 @@ mod reference_suggestion_label_tests {
             reader.pdf_ocr.available = true;
             reader.adopt_opening_chrome(mode, sidebar, sidebar);
             let ctx = egui::Context::default();
-            crate::ui::configure(&ctx, &Default::default(), AppLanguage::English, runtime.handle());
+            crate::ui::configure(
+                &ctx,
+                &Default::default(),
+                AppLanguage::English,
+                runtime.handle(),
+            );
             let mut covers = crate::shelf::covers::CoverCache::default();
             let mut loading_icons = Vec::new();
             for stage in 0..4 {
@@ -7456,41 +7532,77 @@ mod reference_suggestion_label_tests {
                     // GPU presentation, not merely after parsing finishes.
                     reader.mark_open_presented(&ctx);
                 }
-                let mut output = ctx.run_ui(egui::RawInput {
-                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
-                    ..Default::default()
-                }, |root| {
-                    window_chrome::begin_frame(root.ctx());
-                    if stage < 2 {
-                        opening.ui(root, &mut covers, AppLanguage::English, &Default::default(), false);
-                    } else {
-                        reader.ui(root, None, false);
-                    }
-                });
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            Pos2::ZERO,
+                            Vec2::new(1200.0, 800.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |root| {
+                        window_chrome::begin_frame(root.ctx());
+                        if stage < 2 {
+                            opening.ui(
+                                root,
+                                &mut covers,
+                                AppLanguage::English,
+                                &Default::default(),
+                                false,
+                            );
+                        } else {
+                            reader.ui(root, None, false);
+                        }
+                    },
+                );
                 output.textures_delta.clear();
-                let mut icons: Vec<_> = output.shapes.iter().filter_map(|shape| {
-                    let egui::Shape::Rect(rect) = &shape.shape else { return None; };
-                    rect.brush.as_ref()?;
-                    let center = rect.rect.center();
-                    if (center.y - 22.0).abs() > 1.0 { return None; }
-                    Some((center.x, rect.fill.a()))
-                }).collect();
+                let mut icons: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| {
+                        let egui::Shape::Rect(rect) = &shape.shape else {
+                            return None;
+                        };
+                        rect.brush.as_ref()?;
+                        let center = rect.rect.center();
+                        if (center.y - 22.0).abs() > 1.0 {
+                            return None;
+                        }
+                        Some((center.x, rect.fill.a()))
+                    })
+                    .collect();
                 icons.sort_by(|left, right| left.0.total_cmp(&right.0));
                 if stage < 2 {
-                    assert!(icons.len() >= if mode == ReadingMode::Classic { 9 } else { 5 },
-                        "toolbar and sidebar icons must paint on the first loading frame: {icons:?}");
-                    assert!(icons.iter().all(|(_, alpha)| (126..=129).contains(alpha)),
-                        "all loading icons share one half-opacity fade, stage={stage}: {icons:?}");
-                    if stage == 0 { loading_icons = icons; }
-                    else { assert_eq!(loading_icons, icons, "loading opacity must not change on the next frame"); }
+                    assert!(
+                        icons.len() >= if mode == ReadingMode::Classic { 9 } else { 5 },
+                        "toolbar and sidebar icons must paint on the first loading frame: {icons:?}"
+                    );
+                    assert!(
+                        icons.iter().all(|(_, alpha)| (126..=129).contains(alpha)),
+                        "all loading icons share one half-opacity fade, stage={stage}: {icons:?}"
+                    );
+                    if stage == 0 {
+                        loading_icons = icons;
+                    } else {
+                        assert_eq!(
+                            loading_icons, icons,
+                            "loading opacity must not change on the next frame"
+                        );
+                    }
                 } else if stage == 2 {
                     assert!(!icons.is_empty());
-                    assert!(icons.iter().all(|(_, alpha)| (126..=129).contains(alpha)),
-                        "prepared reader must stay dim until its body is presented: {icons:?}");
+                    assert!(
+                        icons.iter().all(|(_, alpha)| (126..=129).contains(alpha)),
+                        "prepared reader must stay dim until its body is presented: {icons:?}"
+                    );
                 } else if stage == 3 {
                     for (center, _) in &loading_icons {
-                        assert!(icons.iter().any(|(x, alpha)| (x - center).abs() < 1.0 && *alpha == 255),
-                            "ready icon must restore full opacity at x={center}, mode={mode:?}, format={format:?}: {icons:?}");
+                        assert!(
+                            icons
+                                .iter()
+                                .any(|(x, alpha)| (x - center).abs() < 1.0 && *alpha == 255),
+                            "ready icon must restore full opacity at x={center}, mode={mode:?}, format={format:?}: {icons:?}"
+                        );
                     }
                 }
                 output.textures_delta.clear();
@@ -7870,8 +7982,10 @@ mod reference_suggestion_label_tests {
                         })
                         .unwrap();
                     assert!(
-                        (left_toggle.left() - reader.ui.sidebar_width - f32::from(SIDEBAR_PADDING))
-                            .abs()
+                        (left_toggle.left()
+                            - reader.ui.sidebar_display_width
+                            - f32::from(SIDEBAR_PADDING))
+                        .abs()
                             < 0.01,
                         "left toggle stays outside its sidebar"
                     );
@@ -9827,13 +9941,18 @@ mod reference_suggestion_label_tests {
     }
 
     #[test]
-    fn stale_page_texture_keeps_its_size_and_starts_at_the_moving_canvas() {
+    fn stale_page_texture_keeps_its_size_and_follows_the_body_alignment() {
         let page_rect = Rect::from_min_size(Pos2::new(256.0, 48.0), Vec2::new(944.0, 700.0));
         let previous_texture_size = Vec2::new(1_200.0, 700.0);
 
-        let destination = page_texture_destination(page_rect, previous_texture_size);
+        let texture = ReaderPageTexture {
+            id: TextureId::User(1),
+            size: previous_texture_size,
+            content_left: 200.0,
+        };
+        let destination = texture.destination(page_rect, 72.0);
 
-        assert!((destination.left() - page_rect.left()).abs() < 0.01);
+        assert!((destination.left() - (page_rect.left() - 128.0)).abs() < 0.01);
         assert!((destination.top() - page_rect.top()).abs() < 0.01);
         assert!((destination.width() - previous_texture_size.x).abs() < 0.01);
         assert!((destination.height() - previous_texture_size.y).abs() < 0.01);
@@ -9853,6 +9972,70 @@ mod reference_suggestion_label_tests {
             constrained_panel_widths(720.0, SIDEBAR_MAX_WIDTH, ASSISTANT_MAX_WIDTH, false, true,),
             (SIDEBAR_MAX_WIDTH, 520.0)
         );
+    }
+
+    #[test]
+    fn narrowing_and_widening_the_window_restores_the_preferred_sidebar_width() {
+        let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+        reader.reading_mode = crate::preferences::ReadingMode::Classic;
+        reader.ui.sidebar_open = true;
+        reader.ui.sidebar_pinned = true;
+        reader.ui.sidebar_motion = super::super::Motion::settled(1.0);
+        reader.ui.sidebar_width = 300.0;
+        let ctx = egui::Context::default();
+        let mut widths = Vec::new();
+        for width in [1200.0, 340.0, 1200.0] {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(width, 700.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    reader.show_side_panels(ui);
+                },
+            );
+            output.textures_delta.clear();
+            widths.push(reader.ui.sidebar_display_width);
+            assert_eq!(reader.ui.sidebar_width, 300.0);
+        }
+        assert_eq!(widths[0], 300.0);
+        assert!(widths[1] < 300.0);
+        assert_eq!(widths[2], 300.0);
+    }
+
+    #[test]
+    fn retained_body_tracks_the_new_center_without_rescaling_glyphs() {
+        let style = rebook_layout::ReaderStyle {
+            spread: rebook_layout::SpreadMode::Single,
+            ..Default::default()
+        };
+        let texture = ReaderPageTexture {
+            id: TextureId::User(1),
+            size: Vec2::new(1200.0, 700.0),
+            content_left: reading_content_left(1200.0, &style),
+        };
+        for width in [1200.0, 1280.0, 1400.0, 1280.0, 1200.0] {
+            let canvas = Rect::from_min_size(Pos2::new(256.0, 48.0), Vec2::new(width, 700.0));
+            let left = reading_content_left(width, &style);
+            let image = texture.destination(canvas, left);
+            assert_eq!(image.size(), texture.size);
+            assert!((image.left() + texture.content_left - canvas.left() - left).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn double_column_preview_has_no_breakpoint_jumps_during_a_drag() {
+        let style = rebook_layout::ReaderStyle::default();
+        assert_eq!(style.spread, SpreadMode::Double);
+        let mut previous = resize_preview_left(700.0, 1200.0, &style);
+        for width in (702..=1400).step_by(2) {
+            let next = resize_preview_left(width as f32, 1200.0, &style);
+            assert!(
+                (0.0..=1.01).contains(&(next - previous)),
+                "preview jumped at width={width}"
+            );
+            previous = next;
+        }
     }
 
     #[test]

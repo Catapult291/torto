@@ -2366,6 +2366,7 @@ struct ScrollViewportState {
 }
 
 struct FocusReflowAnchor {
+    viewport: ScrollViewportState,
     section_index: usize,
     reading_unit_index: usize,
     range: SourceRange,
@@ -2398,6 +2399,33 @@ fn reflow_anchor_offset(
 }
 
 impl DesktopReader {
+    fn retain_viewport_reflow_anchor(&mut self, size: egui::Vec2) {
+        let viewport = self.reader.viewport();
+        if self.semantic_layout.pending_viewport.is_none()
+            && self.semantic_layout.viewport_anchor.is_none()
+            && (logical_dimension(f64::from(size.x)) != viewport.width
+                || logical_dimension(f64::from(size.y)) != viewport.height)
+        {
+            // Keep the presented text position while drawing the old layout
+            // into the larger viewport and later adopting the new layout.
+            self.semantic_layout.viewport_anchor =
+                self.capture_focus_reflow_anchor(FocusReflowKind::DocumentLayout);
+        }
+    }
+
+    fn viewport_preview_offset(&self, height: f32, content_height: f32) -> Option<f32> {
+        let anchor = self.semantic_layout.viewport_anchor.as_ref()?;
+        let viewport = anchor.viewport;
+        Some(
+            (viewport.offset_y + self.scroll_content_padding(height)
+                - self.scroll_content_padding(viewport.size.y))
+            .clamp(
+                0.0,
+                (focus_scroll_content_height(content_height, height) - height).max(0.0),
+            ),
+        )
+    }
+
     pub(crate) fn cancel_open_and_return(&mut self) {
         self.request_exit();
     }
@@ -2472,6 +2500,7 @@ impl DesktopReader {
             .collect();
         if let Some((start, end)) = image_caption_scroll_bounds(unit, viewport.size.y) {
             return Some(FocusReflowAnchor {
+                viewport,
                 section_index: layout.section_index,
                 reading_unit_index: layout.reading_unit_index,
                 range,
@@ -2524,6 +2553,7 @@ impl DesktopReader {
         let baseline = layout.source_baseline(&range);
         let anchor_y = baseline.or_else(|| layout.source_top(&range))?;
         Some(FocusReflowAnchor {
+            viewport,
             section_index: layout.section_index,
             reading_unit_index: layout.reading_unit_index,
             range,
@@ -3314,6 +3344,7 @@ impl DesktopReader {
         self.ui.focus_footnotes_visible = false;
         self.ui.focus_footnote_scroll_delta = 0.0;
         self.focus_toc_override = None;
+        self.semantic_layout.viewport_anchor = None;
         self.focus_unit_index = index;
         self.focus_overflow_origin = None;
         self.focus_anchor = self
@@ -3502,6 +3533,7 @@ impl DesktopReader {
         }
         if self.is_focus_mode()
             && height_changed
+            && self.semantic_layout.viewport_anchor.is_none()
             && let Some(previous) = previous_viewport
             && let Some(unit) = self.focus_units.get(self.focus_unit_index)
         {
@@ -4313,6 +4345,7 @@ struct ReaderUiState {
     sidebar_open: bool,
     sidebar_pinned: bool,
     sidebar_width: f32,
+    sidebar_display_width: f32,
     sidebar_tab: SidebarTab,
     toolbar_hovered: bool,
     toolbar_hide_at: Option<Instant>,
@@ -4347,6 +4380,7 @@ impl ReaderUiState {
         self.sidebar_open = sidebar.open;
         self.sidebar_pinned = sidebar.pinned;
         self.sidebar_width = sidebar.width;
+        self.sidebar_display_width = sidebar.width;
         self.sidebar_motion = Motion::settled(if sidebar.open { 1.0 } else { 0.0 });
     }
 
@@ -4594,6 +4628,7 @@ impl DesktopReader {
                 sidebar_open: reading_mode == ReadingMode::Classic,
                 sidebar_pinned: reading_mode == ReadingMode::Classic,
                 sidebar_width: egui_view::SIDEBAR_WIDTH,
+                sidebar_display_width: egui_view::SIDEBAR_WIDTH,
                 sidebar_tab: SidebarTab::Toc,
                 toolbar_hovered: false,
                 toolbar_hide_at: None,
@@ -5055,15 +5090,30 @@ mod tests {
     ) -> String {
         let mut titles = Vec::new();
         let desktop = super::open_reader_staged(
-            path, crate::fonts::embedded_reader_fonts(), Some(metadata), None, store,
-            LayoutViewport::new(1000, 700).unwrap(), None,
-            |_, _, title, _, viewport| { titles.push(title); Some(viewport) },
-        ).unwrap();
+            path,
+            crate::fonts::embedded_reader_fonts(),
+            Some(metadata),
+            None,
+            store,
+            LayoutViewport::new(1000, 700).unwrap(),
+            None,
+            |_, _, title, _, viewport| {
+                titles.push(title);
+                Some(viewport)
+            },
+        )
+        .unwrap();
         assert_eq!(titles.len(), 2);
-        assert_eq!(titles[0], None, "navigation should not guess a title from the document URL");
+        assert_eq!(
+            titles[0], None,
+            "navigation should not guess a title from the document URL"
+        );
         let final_title = desktop.current_chapter_title().to_owned();
-        assert_eq!(titles[1].as_deref(), Some(final_title.as_str()),
-            "the loading shell and visible reader must use the same restored chapter");
+        assert_eq!(
+            titles[1].as_deref(),
+            Some(final_title.as_str()),
+            "the loading shell and visible reader must use the same restored chapter"
+        );
         final_title
     }
 
@@ -5073,34 +5123,62 @@ mod tests {
         let root = std::env::temp_dir().join(format!("torto-title-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
         let path = root.join("book.epub");
-        let package = format!(r#"<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="id">{}</dc:identifier><dc:title>Book</dc:title></metadata><manifest><item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml"/><item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/></manifest><spine toc="ncx"><itemref idref="chapter"/></spine></package>"#, uuid::Uuid::new_v4());
+        let package = format!(
+            r#"<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="id">{}</dc:identifier><dc:title>Book</dc:title></metadata><manifest><item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml"/><item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/></manifest><spine toc="ncx"><itemref idref="chapter"/></spine></package>"#,
+            uuid::Uuid::new_v4()
+        );
         let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
         for (name, text) in [
             ("mimetype", "application/epub+zip"),
-            ("META-INF/container.xml", r#"<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0"><rootfiles><rootfile full-path="content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#),
+            (
+                "META-INF/container.xml",
+                r#"<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0"><rootfiles><rootfile full-path="content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#,
+            ),
             ("content.opf", package.as_str()),
-            ("toc.ncx", r#"<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1"><navMap><navPoint id="chapter"><navLabel><text>Chapter</text></navLabel><content src="chapter.xhtml"/><navPoint id="first"><navLabel><text>First subsection</text></navLabel><content src="chapter.xhtml#first"/></navPoint><navPoint id="second"><navLabel><text>Second subsection</text></navLabel><content src="chapter.xhtml#second"/></navPoint></navPoint></navMap></ncx>"#),
-            ("chapter.xhtml", r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><h1>Chapter</h1><h2 id="first">First subsection</h2><p>First paragraph.</p><h2 id="second">Second subsection</h2><p>Resume paragraph in second subsection.</p></body></html>"#),
+            (
+                "toc.ncx",
+                r#"<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1"><navMap><navPoint id="chapter"><navLabel><text>Chapter</text></navLabel><content src="chapter.xhtml"/><navPoint id="first"><navLabel><text>First subsection</text></navLabel><content src="chapter.xhtml#first"/></navPoint><navPoint id="second"><navLabel><text>Second subsection</text></navLabel><content src="chapter.xhtml#second"/></navPoint></navPoint></navMap></ncx>"#,
+            ),
+            (
+                "chapter.xhtml",
+                r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><h1>Chapter</h1><h2 id="first">First subsection</h2><p>First paragraph.</p><h2 id="second">Second subsection</h2><p>Resume paragraph in second subsection.</p></body></html>"#,
+            ),
         ] {
-            writer.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
             writer.write_all(text.as_bytes()).unwrap();
         }
         std::fs::write(&path, writer.finish().unwrap().into_inner()).unwrap();
         let source = rebook_formats::open_file(&path).unwrap().source();
         let section = source.parse_section(0).unwrap();
-        let range = section.blocks.iter().find_map(|block| match block {
-            Block::Text(text) if crate::plugins::text_block_text(text).starts_with("Resume paragraph") => text.source.clone(),
-            _ => None,
-        }).unwrap();
+        let range = section
+            .blocks
+            .iter()
+            .find_map(|block| match block {
+                Block::Text(text)
+                    if crate::plugins::text_block_text(text).starts_with("Resume paragraph") =>
+                {
+                    text.source.clone()
+                }
+                _ => None,
+            })
+            .unwrap();
         let book_id = source.book().id.as_str().to_owned();
         let mut locator = rebook_publication::LocatorV1::at_start(
-            source.book().id.clone(), source.book().sections[0].href.clone(),
+            source.book().id.clone(),
+            source.book().sections[0].href.clone(),
         );
         assert!(locator.href.fragment().is_none());
         locator.source = Some(range);
-        let metadata = super::BookDisplayMetadata { id: book_id.clone(), title: "Book".into(), authors: vec![] };
+        let metadata = super::BookDisplayMetadata {
+            id: book_id.clone(),
+            title: "Book".into(),
+            authors: vec![],
+        };
         drop(source);
-        let store = crate::sync::SyncStore::open_at(root.join("sync.sqlite3"), "title-test").unwrap();
+        let store =
+            crate::sync::SyncStore::open_at(root.join("sync.sqlite3"), "title-test").unwrap();
         store.save_progress(&book_id, &locator).unwrap();
         assert_eq!(staged_title(&path, metadata, store), "Second subsection");
         std::fs::remove_dir_all(root).unwrap();
@@ -5111,11 +5189,16 @@ mod tests {
     fn local_staged_header_matches_restored_reading_position() {
         let path = std::path::PathBuf::from(std::env::var("TORTO_TEST_HEADER_BOOK").unwrap());
         let library = crate::library::LocalLibrary::load_default().unwrap();
-        let book = library.books().iter().find(|book| book.path == path).unwrap();
+        let book = library
+            .books()
+            .iter()
+            .find(|book| book.path == path)
+            .unwrap();
         let settings = crate::sync::SyncSettings::load_default().unwrap();
         let original_store = crate::sync::SyncStore::open_default(settings.device_id).unwrap();
         let root = std::env::temp_dir().join(format!("torto-local-title-{}", uuid::Uuid::new_v4()));
-        let store = crate::sync::SyncStore::open_at(root.join("sync.sqlite3"), "title-audit").unwrap();
+        let store =
+            crate::sync::SyncStore::open_at(root.join("sync.sqlite3"), "title-audit").unwrap();
         if let Some(progress) = original_store.load_progress(&book.id).unwrap() {
             store.save_progress(&book.id, &progress.locator).unwrap();
         }
@@ -7068,6 +7151,7 @@ mod tests {
             sidebar_open: false,
             sidebar_pinned: false,
             sidebar_width: super::egui_view::SIDEBAR_WIDTH,
+            sidebar_display_width: super::egui_view::SIDEBAR_WIDTH,
             sidebar_tab: SidebarTab::Toc,
             toolbar_hovered: false,
             toolbar_hide_at: None,
@@ -7116,6 +7200,7 @@ mod tests {
             sidebar_open: false,
             sidebar_pinned: false,
             sidebar_width: super::egui_view::SIDEBAR_WIDTH,
+            sidebar_display_width: super::egui_view::SIDEBAR_WIDTH,
             sidebar_tab: SidebarTab::Toc,
             toolbar_hovered: false,
             toolbar_hide_at: None,

@@ -4,6 +4,11 @@ use super::{DesktopReader, ReaderOverlay};
 
 impl DesktopReader {
     pub(in crate::reader) fn request_frame_repaint(&self, ctx: &egui::Context) {
+        if let Some(deadline) = self.semantic_layout.viewport_reflow_at
+            && deadline > Instant::now()
+        {
+            crate::ui::request_repaint_in(ctx, deadline.saturating_duration_since(Instant::now()));
+        }
         if self
             .ui
             .focus_scroll_motion

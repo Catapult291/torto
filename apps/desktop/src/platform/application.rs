@@ -706,8 +706,8 @@ impl ApplicationHandler<UserEvent> for Application {
                     );
                 }
                 state.gpu.resize(size);
-                // Rendering first presents the retained UI over the themed
-                // background, before laying out content at the new size.
+                // Keep Windows' synchronous resize presentation, but compose
+                // current chrome and the retained body in a single frame.
                 Self::render_window_state(state, &mut self.app, &self.egui_ctx);
             }
             WindowEvent::ScaleFactorChanged { .. } => {

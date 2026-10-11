@@ -85,6 +85,178 @@ mod tests {
     use rebook_layout::LayoutViewport;
 
     #[test]
+    #[ignore = "requires a native GPU; checks pixels exposed before resize reflow finishes"]
+    fn vertical_resize_preview_paints_exposed_text_without_moving_existing_pixels() {
+        let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+        let installed = reader.reader.viewport();
+        let layout = reader.current_scroll_layout().unwrap();
+        reader.rebuild_focus_units(&layout);
+        reader.select_focus_unit(0);
+        let old_size = egui::vec2(800.0, 240.0);
+        reader.scroll_viewport = Some(ScrollViewportState {
+            size: old_size,
+            offset_y: reader.scroll_content_padding(old_size.y),
+        });
+        let mut plan = ReaderFramePlan {
+            rect: egui::Rect::from_min_size(egui::Pos2::ZERO, old_size),
+            scene_id: reader.scene_id,
+            scene_revision: reader.scene_revision,
+            background: peniko::Color::from_rgb8(248, 247, 243),
+            content_left: 0.0,
+            preview_left: 0.0,
+            reflow_pending: false,
+            live_resize_preview: true,
+        };
+        let mut old_audit = crate::platform::LayerAudit::new([800, 240]);
+        old_audit.layered(&reader.layered_scene().unwrap(), plan, 1.0);
+        let before = old_audit.pixels();
+
+        let new_size = egui::vec2(800.0, 620.0);
+        reader.retain_viewport_reflow_anchor(new_size);
+        reader.request_viewport_reflow(LayoutViewport::new(800, 620).unwrap());
+        reader.scroll_viewport = Some(ScrollViewportState {
+            size: new_size,
+            offset_y: reader
+                .viewport_preview_offset(new_size.y, layout.content_height)
+                .unwrap(),
+        });
+        reader.bump_scene_revision();
+        plan.rect = egui::Rect::from_min_size(egui::Pos2::ZERO, new_size);
+        plan.scene_revision = reader.scene_revision;
+        plan.reflow_pending = true;
+        let mut new_audit = crate::platform::LayerAudit::new([800, 620]);
+        new_audit.layered(&reader.layered_scene().unwrap(), plan, 1.0);
+        let after = new_audit.pixels();
+        assert_eq!(
+            reader.reader.viewport(),
+            installed,
+            "no new layout was installed"
+        );
+        assert!(
+            before.iter().zip(&after).all(|(a, b)| a.abs_diff(*b) <= 1),
+            "the original visible pixels must remain stationary"
+        );
+        let ink = after[before.len()..]
+            .chunks_exact(4)
+            .filter(|p| p[0] < 100 && p[1] < 100 && p[2] < 100)
+            .count();
+        assert!(
+            ink > 100,
+            "the newly exposed area must already contain text: {ink}"
+        );
+        println!("RESIZE_PREVIEW exposed_ink_pixels={ink} installed={installed:?}");
+    }
+
+    #[test]
+    #[ignore = "requires a native GPU; checks clipping while width and height change together"]
+    fn diagonal_resize_preview_translates_before_clipping_the_new_canvas() {
+        let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+        reader
+            .reader
+            .resize(LayoutViewport::new(1600, 600).unwrap())
+            .unwrap();
+        let installed = reader.reader.viewport();
+        let layout = reader.current_scroll_layout().unwrap();
+        reader.rebuild_focus_units(&layout);
+        reader.select_focus_unit(0);
+        reader.scroll_viewport = Some(ScrollViewportState {
+            size: egui::vec2(1600.0, 240.0),
+            offset_y: reader.scroll_content_padding(240.0),
+        });
+        reader.retain_viewport_reflow_anchor(egui::vec2(1200.0, 620.0));
+        let offset_y = reader
+            .viewport_preview_offset(620.0, layout.content_height)
+            .unwrap();
+        reader.scroll_viewport = Some(ScrollViewportState {
+            size: egui::vec2(1600.0, 620.0),
+            offset_y,
+        });
+        let mut plan = ReaderFramePlan {
+            rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 620.0)),
+            scene_id: reader.scene_id,
+            scene_revision: reader.scene_revision,
+            background: peniko::Color::from_rgb8(248, 247, 243),
+            content_left: reader.preview_content_left(1600.0),
+            preview_left: reader.preview_content_left(1600.0),
+            reflow_pending: true,
+            live_resize_preview: true,
+        };
+        let mut source_audit = crate::platform::LayerAudit::new([1600, 620]);
+        source_audit.layered(&reader.layered_scene().unwrap(), plan, 1.0);
+        let source_pixels = source_audit.pixels();
+        for width in [900_u32, 2000] {
+            reader.request_viewport_reflow(LayoutViewport::new(width, 620).unwrap());
+            reader.scroll_viewport = Some(ScrollViewportState {
+                size: egui::vec2(width as f32, 620.0),
+                offset_y,
+            });
+            let shift = reader.preview_offset_x(width as f32);
+            assert!(
+                shift.abs() > 10.0 && shift.fract() == 0.0,
+                "fixture must exercise horizontal translation: {shift}"
+            );
+            plan.rect =
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width as f32, 620.0));
+            plan.content_left = reader.preview_content_left(width as f32);
+            plan.preview_left = plan.content_left;
+            let mut audit = crate::platform::LayerAudit::new([width, 620]);
+            audit.layered(&reader.layered_scene().unwrap(), plan, 1.0);
+            let pixels = audit.pixels();
+            let mut right_ink = 0;
+            let mut compared = 0;
+            let mut changed = 0;
+            let mut missing_ink = 0;
+            for y in 0..620_usize {
+                for x in 0..width as usize {
+                    let source_x = x as i32 - shift as i32;
+                    if !(0..1600).contains(&source_x) {
+                        continue;
+                    }
+                    let expected = &source_pixels[(y * 1600 + source_x as usize) * 4..][..4];
+                    let actual = &pixels[(y * width as usize + x) * 4..][..4];
+                    compared += 1;
+                    // Different atlas packing can change a few antialiased
+                    // edge samples. Use the existing layer-audit parity budget
+                    // and separately reject lost dark text pixels.
+                    if actual.iter().zip(expected).any(|(a, b)| a.abs_diff(*b) > 8) {
+                        changed += 1;
+                    }
+                    if expected[..3].iter().all(|v| *v < 100)
+                        && actual[..3].iter().all(|v| *v > 200)
+                    {
+                        missing_ink += 1;
+                    }
+                    if shift < 0.0
+                        && x >= (width as f32 + shift) as usize
+                        && actual[..3].iter().all(|value| *value < 100)
+                    {
+                        right_ink += 1;
+                    }
+                }
+            }
+            if shift < 0.0 {
+                assert!(
+                    right_ink > 100,
+                    "the formerly blank right strip must contain text"
+                );
+            }
+            let fraction = changed as f64 / compared as f64;
+            println!(
+                "DIAGONAL_PARITY width={width} changed_fraction={fraction:.6} missing_ink={missing_ink}"
+            );
+            assert!(fraction < 0.005, "preview geometry changed: {fraction:.6}");
+            assert!(
+                missing_ink <= compared / 10000 + 8,
+                "preview lost text instead of merely changing antialiasing: {missing_ink}"
+            );
+            assert_eq!(reader.reader.viewport(), installed);
+            println!(
+                "DIAGONAL_PREVIEW width={width} height=620 shift={shift} right_ink={right_ink}"
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "requires TORTO_HIGHLIGHT_BOOK local EPUB and native GPU; checks cross-page highlight pixels"]
     fn local_cross_page_highlight_has_no_seam() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -162,6 +334,10 @@ mod tests {
             scene_id: 1,
             scene_revision: 1,
             background: peniko::Color::from_rgb8(212, 210, 206),
+            content_left: 0.0,
+            preview_left: 0.0,
+            reflow_pending: false,
+            live_resize_preview: false,
         };
         let mut audit = crate::platform::LayerAudit::new([1400, 400]);
         // Keep the former page-mask composition as a diagnostic reference.
@@ -292,6 +468,10 @@ mod tests {
             scene_id: reader.scene_id,
             scene_revision: reader.scene_revision,
             background: peniko::Color::from_rgb8(248, 247, 243),
+            content_left: 0.0,
+            preview_left: 0.0,
+            reflow_pending: false,
+            live_resize_preview: false,
         };
         let mut audit = crate::platform::LayerAudit::new([1216, 789]);
         let mut direct_times = Vec::new();
@@ -384,15 +564,23 @@ impl DesktopReader {
             let viewport = self.scroll_viewport?;
             let layout = self.current_scroll_layout().ok()?;
             let padding = self.scroll_content_padding(viewport.size.y);
+            let preview_x = f64::from(self.preview_offset_x(viewport.size.x));
+            // Translate the document before clipping to the current viewport.
+            // Moving a viewport-sized image afterwards discards the right edge
+            // while narrowing and leaves a blank strip until reflow completes.
             let window = Rect::new(
+                -preview_x,
                 0.0,
-                0.0,
-                f64::from(viewport.size.x),
+                f64::from(viewport.size.x) - preview_x,
                 f64::from(viewport.size.y),
             );
             let mut backdrop = Scene::new();
             let bounds = self.paint_scroll_backdrop(&mut backdrop, viewport, padding);
-            result.dynamic(backdrop, measured_clip(window, Some(bounds)), (0.0, 0.0));
+            result.dynamic(
+                backdrop,
+                measured_clip(window, Some(bounds)),
+                (preview_x, 0.0),
+            );
             let mut text_layers = LayeredReaderScene { layers: Vec::new() };
             let mut foreground_layers = LayeredReaderScene { layers: Vec::new() };
             for (index, entry) in layout.pages.iter().enumerate() {
@@ -409,7 +597,7 @@ impl DesktopReader {
                     f64::from(entry.page.width()),
                     f64::from(origin + layout.page_heights[index]),
                 );
-                let offset = (0.0, f64::from(top - viewport.offset_y - origin));
+                let offset = (preview_x, f64::from(top - viewport.offset_y - origin));
                 result.retained(
                     (cached.generation, 0),
                     LayerContent::Images {
@@ -434,12 +622,20 @@ impl DesktopReader {
             }
             let mut overlays = Scene::new();
             let bounds = self.paint_scroll_overlays(&mut overlays, &layout, viewport, padding);
-            result.dynamic(overlays, measured_clip(window, Some(bounds)), (0.0, 0.0));
+            result.dynamic(
+                overlays,
+                measured_clip(window, Some(bounds)),
+                (preview_x, 0.0),
+            );
             result.layers.extend(text_layers.layers);
             result.layers.extend(foreground_layers.layers);
             let mut bridges = Scene::new();
             let bounds = self.paint_scroll_bridges(&mut bridges, &layout, viewport, padding);
-            result.dynamic(bridges, measured_clip(window, Some(bounds)), (0.0, 0.0));
+            result.dynamic(
+                bridges,
+                measured_clip(window, Some(bounds)),
+                (preview_x, 0.0),
+            );
         } else {
             let cached = self.page_scene_layers();
             let spread = self.reader.current_spread().ok()?;

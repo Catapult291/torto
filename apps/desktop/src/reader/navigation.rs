@@ -208,6 +208,7 @@ impl DesktopReader {
         self.focus_toc_override = None;
         if snapshot_reanchors_focus(effects) {
             self.focus_reflow_anchor = None;
+            self.semantic_layout.viewport_anchor = None;
         }
         let previous_section = self.snapshot.location.section_index;
         let target_position = rebook_reader::ReaderPosition {

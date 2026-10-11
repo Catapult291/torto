@@ -9,6 +9,7 @@ struct Check {
     started: Instant,
     expects_book: bool,
     exercise_minimize: bool,
+    exercise_resize: bool,
     state: Mutex<State>,
 }
 #[derive(Default)]
@@ -20,6 +21,9 @@ struct State {
     gpu_error: Option<String>,
     minimized_at: Option<Instant>,
     restored: bool,
+    resize_step: usize,
+    resize_at: Option<Instant>,
+    presentation_checks: u64,
 }
 
 impl State {
@@ -60,6 +64,7 @@ pub(crate) fn start(
             started: Instant::now(),
             expects_book,
             exercise_minimize,
+            exercise_resize: std::env::var_os("TORTO_SMOKE_RESIZE").is_some(),
             state: Mutex::new(State::default()),
         })
         .map_err(|_| "smoke check already initialized")?;
@@ -82,9 +87,60 @@ pub(crate) fn window_tick(
     ctx: &egui::Context,
     window: &winit::window::Window,
 ) -> Result<(), String> {
-    let Some(check) = CHECK.get().filter(|check| check.exercise_minimize) else {
+    let Some(check) = CHECK.get() else {
         return Ok(());
     };
+    if check.exercise_resize {
+        let step = {
+            let mut state = check.state.lock().unwrap();
+            if state.frames >= 2
+                && state.resize_step < 14
+                && state
+                    .resize_at
+                    .is_none_or(|at| at.elapsed() >= Duration::from_millis(100))
+            {
+                let step = state.resize_step;
+                state.resize_step += 1;
+                state.resize_at = Some(Instant::now());
+                Some(step)
+            } else {
+                None
+            }
+        };
+        if let Some(step) = step {
+            stage(&format!("resize-step-{step}"));
+            match step {
+                8 => window.set_maximized(true),
+                9 => window.set_maximized(false),
+                10 => ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true)),
+                11 => ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false)),
+                _ => {
+                    let sizes = [
+                        (1200, 800),
+                        (1250, 820),
+                        (1300, 840),
+                        (1250, 820),
+                        (1100, 760),
+                        (1000, 700),
+                        (1050, 720),
+                        (1200, 800),
+                        (1200, 800),
+                        (1200, 800),
+                        (1200, 800),
+                        (1200, 800),
+                        (900, 650),
+                        (1200, 800),
+                    ];
+                    let (width, height) = sizes[step];
+                    let _ = window.request_inner_size(winit::dpi::LogicalSize::new(width, height));
+                }
+            }
+            window.request_redraw();
+        }
+    }
+    if !check.exercise_minimize {
+        return Ok(());
+    }
     let action = {
         let mut state = check.state.lock().unwrap();
         if state.minimized_at.is_none() && state.frames >= 2 {
@@ -142,6 +198,25 @@ pub(crate) fn gpu_error(error: String) {
     if let Some(check) = CHECK.get() {
         check.state.lock().unwrap().gpu_error = Some(error);
     }
+}
+
+/// Validate the actual native extent and acquired texture at presentation time,
+/// including maximize/restore commands issued by egui within a rendered frame.
+pub(crate) fn validate_presentation(
+    native: [u32; 2],
+    surface: [u32; 2],
+    texture: [u32; 2],
+) -> Result<(), String> {
+    let Some(check) = CHECK.get() else {
+        return Ok(());
+    };
+    if native != surface || native != texture {
+        return Err(format!(
+            "stale window frame: native={native:?}, surface={surface:?}, texture={texture:?}"
+        ));
+    }
+    check.state.lock().unwrap().presentation_checks += 1;
+    Ok(())
 }
 
 pub(crate) fn presented(reader_ready: bool, error: Option<&str>) -> Result<(), String> {
@@ -266,12 +341,18 @@ pub(crate) fn finish(error: Option<&str>) -> Result<(), String> {
             (check.exercise_minimize && !state.restored)
                 .then_some("minimize/restore check did not complete")
         })
+        .or_else(|| {
+            (check.exercise_resize && state.resize_step != 14)
+                .then_some("resize/maximize/restore check did not complete")
+        })
         .or_else(|| (!state.completed).then_some("exited before startup check completed"));
     let report = serde_json::json!({
         "success": error.is_none(), "error": error, "pid": std::process::id(),
         "arch": std::env::consts::ARCH, "os": std::env::consts::OS,
         "book": check.expects_book, "frames": state.frames,
         "minimize_check": check.exercise_minimize, "minimize_restored": state.restored,
+        "resize_check": check.exercise_resize, "resize_steps": state.resize_step,
+        "presentation_checks": state.presentation_checks,
         "elapsed_ms": check.started.elapsed().as_millis(),
     });
     std::fs::write(

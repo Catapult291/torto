@@ -246,6 +246,12 @@ impl DesktopReader {
         scene.append(&text, None);
         scene.append(&foreground, None);
         self.paint_scroll_bridges(&mut scene, &layout, viewport, content_padding);
+        let preview_x = f64::from(self.preview_offset_x(viewport.size.x));
+        if preview_x != 0.0 {
+            let mut positioned = Scene::new();
+            positioned.append(&scene, Some(Affine::translate((preview_x, 0.0))));
+            scene = positioned;
+        }
         ReaderScene::new(scene, images.into())
     }
 

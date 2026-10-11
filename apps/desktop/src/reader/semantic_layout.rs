@@ -14,6 +14,7 @@ mod batching;
 mod preparation;
 
 const SETTLE: Duration = Duration::from_millis(200);
+const VIEWPORT_SETTLE: Duration = Duration::from_millis(120);
 type Key = (usize, usize, Option<usize>);
 type Demand = Vec<(usize, Vec<SourceRange>)>;
 #[derive(Clone)]
@@ -59,6 +60,8 @@ struct Group {
 #[derive(Default)]
 pub(super) struct SemanticLayoutState {
     pub(super) pending_viewport: Option<rebook_layout::LayoutViewport>,
+    pub(super) viewport_reflow_at: Option<Instant>,
+    pub(super) viewport_anchor: Option<super::FocusReflowAnchor>,
     expert_translation: bool,
     semantic_config: Option<(
         crate::plugins::semantic_layout::SemanticLayoutSettings,
@@ -956,6 +959,16 @@ impl DesktopReader {
     }
 
     pub(super) fn request_viewport_reflow(&mut self, viewport: rebook_layout::LayoutViewport) {
+        let previous = self
+            .semantic_layout
+            .pending_viewport
+            .unwrap_or(self.reader.viewport());
+        // Large jumps (maximize/restore) and DPI changes bypass the drag settle
+        // delay. Small continuous changes retain one body until dragging pauses.
+        self.semantic_layout.viewport_reflow_at = (previous.raster_scale == viewport.raster_scale
+            && previous.width.abs_diff(viewport.width) < 160
+            && previous.height.abs_diff(viewport.height) < 160)
+            .then(|| Instant::now() + VIEWPORT_SETTLE);
         self.semantic_layout.pending_viewport = Some(viewport);
         self.refresh_semantic_layout();
     }
@@ -981,6 +994,14 @@ impl DesktopReader {
             }
         }
         if self.semantic_layout.reflow_dirty && self.semantic_layout.reflow_worker.is_none() {
+            if self
+                .semantic_layout
+                .viewport_reflow_at
+                .is_some_and(|at| at > Instant::now())
+            {
+                return;
+            }
+            self.semantic_layout.viewport_reflow_at = None;
             self.semantic_layout.reflow_dirty = false;
             let version = self.semantic_layout.reflow_version;
             let unit = self.reader.reading_unit_location().index;
@@ -1040,8 +1061,10 @@ impl DesktopReader {
                     self.semantic_layout.reflow_dirty = true;
                 } else {
                     let viewport_changed = self.semantic_layout.pending_viewport.take().is_some();
-                    let anchor =
-                        self.capture_focus_reflow_anchor(super::FocusReflowKind::DocumentLayout);
+                    self.semantic_layout.viewport_reflow_at = None;
+                    let anchor = self.semantic_layout.viewport_anchor.take().or_else(|| {
+                        self.capture_focus_reflow_anchor(super::FocusReflowKind::DocumentLayout)
+                    });
                     let old = std::mem::replace(&mut self.reader, prepared);
                     runtime.spawn_blocking(move || drop(old));
                     self.apply_snapshot(

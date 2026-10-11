@@ -219,6 +219,10 @@ fn retained_layers_preserve_masks_alpha_order_and_strip_seams() {
         scene_id: 1,
         scene_revision: 1,
         background: Color::from_rgb8(248, 247, 243),
+        content_left: 0.0,
+        preview_left: 0.0,
+        reflow_pending: false,
+        live_resize_preview: false,
     };
     let mut base = Scene::new();
     base.fill(

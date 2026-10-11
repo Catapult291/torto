@@ -691,6 +691,146 @@ fn viewport_reflow_keeps_visible_pages_coalesces_dpi_and_rejects_old_geometry() 
 }
 
 #[test]
+fn small_resizes_settle_once_and_large_or_dpi_changes_are_immediate() {
+    let (mut reader, _, _) = fixture();
+    let original = reader.reader.viewport();
+    let first = LayoutViewport::new(original.width + 10, original.height)
+        .unwrap()
+        .with_raster_scale(original.raster_scale);
+    reader.request_viewport_reflow(first);
+    let deadline = reader.semantic_layout.viewport_reflow_at.unwrap();
+    assert!(deadline > Instant::now());
+    let second = LayoutViewport::new(first.width + 10, first.height)
+        .unwrap()
+        .with_raster_scale(first.raster_scale);
+    reader.request_viewport_reflow(second);
+    assert_eq!(reader.semantic_layout.pending_viewport, Some(second));
+    assert!(reader.semantic_layout.viewport_reflow_at.unwrap() >= deadline);
+    assert_eq!(reader.reader.viewport(), original);
+    let maximized = LayoutViewport::new(second.width + 800, second.height + 300)
+        .unwrap()
+        .with_raster_scale(second.raster_scale);
+    reader.request_viewport_reflow(maximized);
+    assert!(reader.semantic_layout.viewport_reflow_at.is_none());
+    reader.request_viewport_reflow(maximized.with_raster_scale(2.5));
+    assert!(reader.semantic_layout.viewport_reflow_at.is_none());
+}
+
+#[test]
+fn resized_body_keeps_the_presented_baseline_and_does_not_recenter_a_frame_later() {
+    fn frame(reader: &mut DesktopReader, ctx: &egui::Context, size: egui::Vec2) {
+        let mut plan = None;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                ..Default::default()
+            },
+            |ui| {
+                plan = Some(reader.ui(ui, None, false));
+            },
+        );
+        output.textures_delta.clear();
+        let plan = plan.unwrap();
+        assert!(plan.live_resize_preview);
+        let texture = crate::reader::egui_view::ReaderPageTexture {
+            id: egui::TextureId::User(1),
+            size: plan.rect.size(),
+            content_left: plan.content_left,
+        };
+        assert_eq!(
+            texture.destination(plan.rect, plan.preview_left),
+            plan.rect,
+            "the freshly rendered preview must cover the entire new canvas"
+        );
+    }
+    fn adopt(reader: &mut DesktopReader, runtime: &tokio::runtime::Runtime) {
+        let viewport = reader.semantic_layout.pending_viewport.unwrap();
+        let prepared = reader
+            .reader
+            .prepare_resize_request(viewport, reader.progress_source_range())
+            .prepare()
+            .unwrap();
+        let unit = reader.reader.reading_unit_location().index;
+        assert!(reader.adopt_semantic_reflow(
+            runtime,
+            reader.semantic_layout.reflow_version,
+            unit,
+            reader.reader.style(),
+            Ok(prepared),
+        ));
+    }
+    fn baseline(reader: &mut DesktopReader, target: &SourceRange) -> f32 {
+        let viewport = reader.scroll_viewport.unwrap();
+        reader
+            .current_scroll_layout()
+            .unwrap()
+            .source_baseline(target)
+            .unwrap()
+            + reader.scroll_content_padding(viewport.size.y)
+            - viewport.offset_y
+    }
+    for resized in [
+        egui::vec2(1200.0, 620.0),
+        egui::vec2(1000.0, 960.0),
+        egui::vec2(1600.0, 900.0),
+    ] {
+        let (mut reader, _, target) = fixture();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let ctx = egui::Context::default();
+        let original = egui::vec2(1200.0, 800.0);
+        frame(&mut reader, &ctx, original);
+        adopt(&mut reader, &runtime);
+        frame(&mut reader, &ctx, original);
+        let layout = reader.current_scroll_layout().unwrap();
+        let index = reader
+            .focus_units
+            .iter()
+            .position(|unit| {
+                unit.paint_ranges
+                    .iter()
+                    .any(|range| range.start == target.start)
+            })
+            .unwrap();
+        reader.select_focus_unit(index);
+        let height = reader.scroll_viewport.unwrap().size.y;
+        reader.focus_target_offset =
+            Some(layout.source_baseline(&target).unwrap() + height * 0.5 - 120.0);
+        reader.ui.focus_scroll_motion = None;
+        frame(&mut reader, &ctx, original);
+        let before = baseline(&mut reader, &target);
+        let old_viewport = reader.reader.viewport();
+        for _ in 0..2 {
+            frame(&mut reader, &ctx, resized);
+            assert_eq!(
+                reader.reader.viewport(),
+                old_viewport,
+                "drag previews must reuse the installed layout"
+            );
+            assert!(
+                (baseline(&mut reader, &target) - before).abs() < 0.1,
+                "live preview must keep the baseline stable before reflow completes"
+            );
+        }
+        assert!(reader.semantic_layout.viewport_anchor.is_some());
+        adopt(&mut reader, &runtime);
+        assert!(reader.semantic_layout.viewport_anchor.is_none());
+        frame(&mut reader, &ctx, resized);
+        let offset = reader.scroll_viewport.unwrap().offset_y;
+        for _ in 0..3 {
+            assert!(
+                (baseline(&mut reader, &target) - before).abs() < 0.1,
+                "reflow must preserve the baseline of the retained body ({resized:?})"
+            );
+            frame(&mut reader, &ctx, resized);
+            assert!(
+                (reader.scroll_viewport.unwrap().offset_y - offset).abs() < 0.1,
+                "the restored offset must not get a second height correction"
+            );
+        }
+    }
+}
+
+#[test]
 fn initial_viewport_matches_first_reader_canvas() {
     let (mut reader, _, _) = fixture();
     let ctx = egui::Context::default();
