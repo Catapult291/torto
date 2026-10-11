@@ -308,3 +308,129 @@ fn painting_uses_only_visible_ready_blobs_and_preserves_geometry_and_hits() {
     assert!(!page.image_at(50.0, 150.0).unwrap().pixels.is_empty());
     assert_eq!(page.raster_allocations().count(), 0);
 }
+
+#[test]
+fn deferred_formulas_paint_after_loading_with_stable_blob_identity() {
+    let (source, _) = fixture("viewport-generated-formulas", 0);
+    let mut formula = ImageBlock {
+        href: PublicationUrl::parse("formula.png").unwrap(),
+        alt: String::new(),
+        style: ImageStyle::default(),
+        source: None,
+        formula_image: true,
+        formula: Some(rebook_publication::ImageFormula {
+            latex: r"\frac{x+1}{2}".into(),
+            equation_number: Some("2.4".into()),
+        }),
+        text_layer: None,
+    };
+    for numbered in [false, true] {
+        formula.formula.as_mut().unwrap().equation_number = numbered.then(|| "2.4".into());
+        let mut engine = LayoutEngine::new();
+        engine.set_deferred_images(true);
+        let style = ReaderStyle {
+            typesetting: rebook_layout::ReaderTypesetting::unified(),
+            ..Default::default()
+        };
+        let layout = engine
+            .layout_blocks(
+                source.as_ref(),
+                &[Block::Image(formula.clone())],
+                LayoutViewport::new(400, 600).unwrap(),
+                &style,
+            )
+            .unwrap();
+        let page = DisplayListCompiler.compile(&layout.pages[0]);
+        let request = page.deferred_rasters().next().unwrap().0;
+        let bounds = page.image_bounds().unwrap();
+        assert!(
+            page.paint_image_layer_in(&mut VelloScene::new(&mut vello::Scene::new()), 0.0, None)
+                .is_empty()
+        );
+        request.load(source.as_ref()).unwrap();
+        let mut scene = vello::Scene::new();
+        let images = page.paint_image_layer_in(&mut VelloScene::new(&mut scene), 0.0, Some(bounds));
+        assert_eq!(images.len(), 1, "loaded formula must enter the paint scene");
+        assert!(images[0].data.as_ref().chunks_exact(4).any(|p| p[3] != 0));
+        let repaint =
+            page.paint_image_layer_in(&mut VelloScene::new(&mut scene), 0.0, Some(bounds));
+        assert_eq!(images[0].data.id(), repaint[0].data.id());
+        assert_eq!(page.image_bounds(), Some(bounds));
+    }
+}
+
+#[test]
+#[ignore = "requires TORTO_IMAGE_BOOK; offline local book image paint regression"]
+fn local_book_deferred_images_enter_the_paint_scene() {
+    let path = std::path::PathBuf::from(std::env::var_os("TORTO_IMAGE_BOOK").unwrap());
+    let store = crate::sync::SyncStore::open_at(
+        std::env::temp_dir().join(format!(
+            "torto-image-paint-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        )),
+        "image-paint-regression",
+    )
+    .unwrap();
+    let mut desktop = super::super::open_reader_in_viewport(
+        &path,
+        crate::fonts::embedded_reader_fonts(),
+        None,
+        None,
+        store,
+        LayoutViewport::new(1216, 789).unwrap(),
+    )
+    .unwrap();
+    desktop.progress_store = None;
+    let label = std::env::var("TORTO_IMAGE_TOC").unwrap();
+    let target = desktop
+        .reader
+        .toc_items()
+        .iter()
+        .find(|item| item.label.contains(&label))
+        .unwrap()
+        .target
+        .clone()
+        .unwrap();
+    desktop.reader.go_to_href(&target).unwrap();
+    let pages = desktop.reader.current_reading_unit_pages().unwrap();
+    let output = std::env::var_os("TORTO_IMAGE_OUTPUT").map(std::path::PathBuf::from);
+    if let Some(output) = &output {
+        std::fs::create_dir_all(output).unwrap();
+    }
+    let mut count = 0;
+    for entry in pages {
+        let requests = entry.page.deferred_rasters().collect::<Vec<_>>();
+        if requests.is_empty() {
+            continue;
+        }
+        for (request, _) in &requests {
+            request.load(desktop.source.as_ref()).unwrap();
+        }
+        let images = entry.page.paint_image_layer_in(
+            &mut VelloScene::new(&mut vello::Scene::new()),
+            0.0,
+            None,
+        );
+        assert_eq!(images.len(), requests.len());
+        for image in images {
+            assert_eq!(
+                image.data.len(),
+                image.width as usize * image.height as usize * 4
+            );
+            assert!(image.data.as_ref().chunks_exact(4).any(|p| p[3] != 0));
+            if let Some(output) = &output {
+                image::save_buffer(
+                    output.join(format!("paint-image-{count}.png")),
+                    image.data.as_ref(),
+                    image.width,
+                    image.height,
+                    image::ColorType::Rgba8,
+                )
+                .unwrap();
+            }
+            count += 1;
+        }
+    }
+    assert!(count > 0, "target subsection must contain deferred images");
+    println!("LOCAL_IMAGE_PAINT toc={label} images={count}");
+}

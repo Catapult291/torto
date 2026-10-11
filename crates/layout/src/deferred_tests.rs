@@ -102,7 +102,18 @@ fn source_formula_images_defer_pixels_in_both_presentation_modes() {
         assert!(placed.image.pixels.is_empty());
         let request = placed.image.deferred.as_ref().unwrap();
         request.load(&source).unwrap();
-        assert!(!request.ready_for_test().unwrap().pixels.is_empty());
+        let ready = request.ready_for_test().unwrap();
+        assert!(!ready.pixels.is_empty());
+        let blob = ready
+            .blob
+            .as_ref()
+            .expect("loaded formulas need a paint blob");
+        assert_eq!(blob.as_ref(), ready.pixels.as_ref());
+        assert_eq!(
+            blob.id(),
+            request.ready_for_test().unwrap().blob.unwrap().id(),
+            "repainting must reuse the cached image identity"
+        );
         retire_publication_rasters(source.book.id.as_str(), false);
     }
 }
@@ -195,7 +206,8 @@ fn formulas_reserve_exact_geometry_and_rasterize_only_when_requested() {
         let first = lazy[0].image.deferred.as_ref().unwrap();
         let offscreen = lazy[1].image.deferred.as_ref().unwrap();
         first.load(&source).unwrap();
-        assert!(first.ready_for_test().is_some());
+        let ready = first.ready_for_test().unwrap();
+        assert_eq!(ready.blob.as_ref().unwrap().as_ref(), ready.pixels.as_ref());
         assert!(offscreen.ready_for_test().is_none());
         retire_publication_rasters(source.book.id.as_str(), false);
     }

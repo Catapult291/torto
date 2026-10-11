@@ -570,11 +570,17 @@ impl Cache {
         self.stats.images = self.entries.len();
     }
 
-    fn insert(&mut self, key: u64, raster: RasterImage, budget: usize) -> RasterImage {
+    fn insert(&mut self, key: u64, mut raster: RasterImage, budget: usize) -> RasterImage {
         // Foreground layout and prefetch share the same Blob ID even if both
         // finished decoding at once.
         if let Some((existing, _)) = self.entries.get(&key) {
             return existing.clone();
+        }
+        // Generated formulas and composites provide pixels without a Blob.
+        // Publish one shared paint identity with the cache entry, just as for
+        // decoded images; a ready raster must also be drawable by the renderer.
+        if raster.blob.is_none() {
+            raster.blob = Some(peniko::Blob::new(Arc::new(raster.pixels.clone())));
         }
         if raster.pixels.len() <= budget {
             while self.stats.bytes + raster.pixels.len() > budget {
