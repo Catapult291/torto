@@ -1,11 +1,15 @@
 #![allow(unsafe_code)]
-use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows_sys::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
 // Win32 behavior for a client-drawn caption, retaining standard window styles.
 
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Dwm::{
+    DWMNCRP_DISABLED, DWMNCRP_ENABLED, DWMWA_NCRENDERING_POLICY, DWMWA_WINDOW_CORNER_PREFERENCE,
+    DWMWCP_DONOTROUND, DWMWCP_ROUND, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
+};
 use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
 use windows_sys::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, ScreenToClient,
@@ -72,6 +76,7 @@ impl WindowFrame {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
             );
         }
+        apply_dwm_frame(hwnd as HWND, false);
         Ok(Self { hwnd, state })
     }
     pub fn save_placement(&self) -> io::Result<WindowPlacement> {
@@ -130,6 +135,7 @@ impl WindowFrame {
         }
         self.state.pressed.store(0, Ordering::Relaxed);
         self.state.hovered.store(0, Ordering::Relaxed);
+        apply_dwm_frame(self.hwnd as HWND, fullscreen);
         unsafe {
             ReleaseCapture();
             SetWindowPos(
@@ -151,6 +157,49 @@ impl WindowFrame {
     }
     pub fn pressed_button(&self) -> Option<usize> {
         button_index(self.state.pressed.load(Ordering::Relaxed))
+    }
+}
+
+fn apply_dwm_frame(hwnd: HWND, fullscreen: bool) {
+    // Winit's client-drawn window can disable non-client rendering. Extending
+    // the frame alone cannot restore a shadow while that policy is disabled.
+    let policy = if fullscreen {
+        DWMNCRP_DISABLED
+    } else {
+        DWMNCRP_ENABLED
+    };
+    // The empty non-client area from WM_NCCALCSIZE can prevent DWM's automatic
+    // rounding heuristic. Opt the whole HWND in, including the two bottom corners.
+    // Our Windows fullscreen is a borderless window rather than native fullscreen,
+    // so explicitly keep its corners square and restore rounding when leaving it.
+    let preference = if fullscreen {
+        DWMWCP_DONOTROUND
+    } else {
+        DWMWCP_ROUND
+    };
+    // A single composited edge keeps the native border/shadow after we remove
+    // the system caption. This extends into existing client pixels: it does not
+    // reserve space or move the shelf/reader. Fullscreen needs a flush edge.
+    let margins = MARGINS {
+        cyBottomHeight: i32::from(!fullscreen),
+        ..Default::default()
+    };
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_NCRENDERING_POLICY as u32,
+            (&policy as *const i32).cast(),
+            std::mem::size_of_val(&policy) as u32,
+        );
+        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+        // Windows 10 does not support this attribute; failure must not prevent
+        // the window from opening. DWM retains control over maximized/Snap shapes.
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+            (&preference as *const i32).cast(),
+            std::mem::size_of_val(&preference) as u32,
+        );
     }
 }
 
@@ -236,6 +285,12 @@ unsafe extern "system" fn procedure(
         .lock()
         .map(|value| value.clone())
         .unwrap_or_default();
+    // The graphics surface is initialized while the HWND is hidden and can
+    // change DWM policy. Reapply when exposing it, as well as after composition
+    // changes, without doing this work on every redraw or resize.
+    if message == WM_DWMCOMPOSITIONCHANGED || (message == WM_SHOWWINDOW && wparam != 0) {
+        apply_dwm_frame(hwnd, layout.fullscreen);
+    }
     if message == WM_NCCALCSIZE {
         if wparam != 0 {
             let params = unsafe { &mut *(lparam as *mut NCCALCSIZE_PARAMS) };
@@ -396,6 +451,33 @@ unsafe extern "system" fn procedure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::Graphics::Dwm::{DWMWA_NCRENDERING_ENABLED, DwmGetWindowAttribute};
+
+    fn non_client_rendering(hwnd: HWND) -> Option<bool> {
+        let mut enabled = 0_i32;
+        let result = unsafe {
+            DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_NCRENDERING_ENABLED as u32,
+                (&mut enabled as *mut i32).cast(),
+                std::mem::size_of_val(&enabled) as u32,
+            )
+        };
+        (result >= 0).then_some(enabled != 0)
+    }
+
+    fn corner_preference(hwnd: HWND) -> Option<i32> {
+        let mut preference = -1_i32;
+        let result = unsafe {
+            DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+                (&mut preference as *mut i32).cast(),
+                std::mem::size_of_val(&preference) as u32,
+            )
+        };
+        (result >= 0).then_some(preference)
+    }
     struct HiddenWindow(HWND);
     impl Drop for HiddenWindow {
         fn drop(&mut self) {
@@ -426,6 +508,14 @@ mod tests {
         assert!(!hwnd.is_null());
         let _window = HiddenWindow(hwnd);
         let frame = WindowFrame::install(hwnd as isize).unwrap();
+        let supports_dwm = non_client_rendering(hwnd).is_some();
+        if supports_dwm {
+            assert_eq!(non_client_rendering(hwnd), Some(true));
+        }
+        let supports_corners = corner_preference(hwnd).is_some();
+        if supports_corners {
+            assert_eq!(corner_preference(hwnd), Some(DWMWCP_ROUND));
+        }
         let mut client = RECT::default();
         let mut outer = RECT::default();
         unsafe {
@@ -445,6 +535,12 @@ mod tests {
         let mut placement = frame.save_placement().unwrap();
         placement.0.showCmd = SW_HIDE as u32; // Keep this integration test invisible.
         frame.set_fullscreen(true);
+        if supports_dwm {
+            assert_eq!(non_client_rendering(hwnd), Some(false));
+        }
+        if supports_corners {
+            assert_eq!(corner_preference(hwnd), Some(DWMWCP_DONOTROUND));
+        }
         unsafe {
             SetWindowPos(
                 hwnd,
@@ -457,6 +553,12 @@ mod tests {
             );
         }
         frame.set_fullscreen(false);
+        if supports_dwm {
+            assert_eq!(non_client_rendering(hwnd), Some(true));
+        }
+        if supports_corners {
+            assert_eq!(corner_preference(hwnd), Some(DWMWCP_ROUND));
+        }
         frame.restore_placement(&placement);
         let restored = frame.save_placement().unwrap();
         let expected = placement.0.rcNormalPosition;
