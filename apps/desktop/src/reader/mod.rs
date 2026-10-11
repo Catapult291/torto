@@ -3806,6 +3806,8 @@ struct ChatStreamingState {
 }
 
 struct ChatUiState {
+    paste_task: TaskSlot<usize>,
+    popup_footer_height: f32,
     web_search_enabled: Option<bool>,
     session_id: u64,
     input: String,
@@ -3839,6 +3841,8 @@ struct ChatUiState {
 impl Default for ChatUiState {
     fn default() -> Self {
         Self {
+            paste_task: TaskSlot::default(),
+            popup_footer_height: 0.0,
             web_search_enabled: None,
             session_id: NEXT_CHAT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             input: String::new(),
@@ -3870,6 +3874,12 @@ impl ChatUiState {
             || self.streaming.is_some()
             || !self.pending_annotation_actions.is_empty()
     }
+}
+
+pub(crate) struct ChatPasteMessage {
+    pub session_id: u64,
+    pub id: u64,
+    pub result: Result<Vec<crate::plugins::chat_media::PendingChatImage>, String>,
 }
 
 #[derive(Clone)]

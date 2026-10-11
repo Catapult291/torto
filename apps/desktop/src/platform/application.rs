@@ -230,31 +230,6 @@ fn native_open_settings_shortcut_matches(
     )
 }
 
-/// Hand a clipboard image to the chat composer, which egui cannot see:
-/// egui-winit answers the paste shortcut by pushing `Event::Paste` for text
-/// only, so a copied screenshot produces no event and the key never reaches the
-/// composer. Both shapes of clipboard image are taken: pixels, and the image
-/// files a screenshot tool leaves on the clipboard. Returns whether the
-/// shortcut was claimed.
-fn claim_pasted_chat_image(
-    event: &WindowEvent,
-    modifiers: ModifiersState,
-    app: &mut DesktopApp,
-    ctx: &egui::Context,
-) -> bool {
-    if !is_paste_shortcut(event, modifiers) || !app.chat_composer_accepts_paste(ctx) {
-        return false;
-    }
-    let images = crate::platform::images_without_text();
-    if images.is_empty() {
-        return false;
-    }
-    for image in images {
-        app.attach_pasted_chat_image(image);
-    }
-    true
-}
-
 /// The paste shortcut as egui-winit defines it: Ctrl+V (Cmd+V on macOS),
 /// Shift+Insert on Windows, and the dedicated Paste key.
 fn is_paste_shortcut(event: &WindowEvent, modifiers: ModifiersState) -> bool {
@@ -592,6 +567,7 @@ impl ApplicationHandler<UserEvent> for Application {
             UserEvent::ReaderSearch(message) => self.app.complete_reader_search(message),
             UserEvent::ReaderChatStream(message) => self.app.update_reader_chat_stream(message),
             UserEvent::ReaderChat(message) => self.app.complete_reader_chat(message),
+            UserEvent::ReaderChatPaste(message) => self.app.complete_chat_paste(message),
             UserEvent::ReaderTranslation(message) => self.app.complete_reader_translation(message),
             UserEvent::ReaderTocTranslation(message) => {
                 self.app.complete_reader_toc_translation(message);
@@ -676,11 +652,13 @@ impl ApplicationHandler<UserEvent> for Application {
         if let WindowEvent::ModifiersChanged(modifiers) = &event {
             self.modifiers = modifiers.state();
         }
-        if claim_pasted_chat_image(&event, self.modifiers, &mut self.app, &self.egui_ctx) {
-            // The composer claimed the shortcut, so egui must not also read the
-            // clipboard; the new attachment needs a frame to appear.
+        if is_paste_shortcut(&event, self.modifiers)
+            && self.app.chat_composer_accepts_paste(&self.egui_ctx)
+        {
+            self.app.paste_chat_images(&self.runtime, &self.proxy);
             state.window.request_redraw();
-            return;
+            // Keep egui's ordinary text paste. The worker only accepts a
+            // clipboard without text, and wakes the event loop on completion.
         }
         let response = state.egui_state.on_window_event(&state.window, &event);
         // RedrawRequested is already being serviced below. egui-winit marks

@@ -1364,51 +1364,70 @@ impl DesktopReader {
         ctx.memory(|memory| memory.has_focus(id) || memory.focused().is_none())
     }
 
-    /// Attach clipboard pixels to the next message. Reading the clipboard and
-    /// encoding the attachment both happen here, so a rejection is reported in
-    /// the composer instead of failing the turn later.
-    pub(crate) fn attach_pasted_chat_image(&mut self, paste: crate::platform::ClipboardImage) {
-        // The paste may have arrived with the keyboard elsewhere; hand it back
-        // so the attachment and any rejection are both visible.
-        self.chat.move_cursor_to_end = true;
-        let crate::platform::ClipboardImage {
-            width,
-            height,
-            rgba,
-        } = paste;
-        if self.chat.pending_images.len() >= crate::plugins::chat_media::MAX_IMAGES_PER_MESSAGE {
-            let message = self
-                .language
-                .text(
-                    "一条消息最多附带 8 张图片，请先发送或移除已有图片。",
-                    "A message carries 8 images at most; send or remove one first.",
-                )
-                .to_owned();
-            self.chat.error = Some(message);
+    /// Coalesce paste shortcuts while a bounded batch is being prepared.
+    pub(crate) fn paste_chat_images(
+        &mut self,
+        runtime: &tokio::runtime::Runtime,
+        proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
+    ) {
+        if self.chat.paste_task.is_pending() {
             return;
         }
-        let ordinal = self.chat.pending_images.len() + 1;
-        match crate::plugins::chat_media::PendingChatImage::from_clipboard(
-            ordinal, width, height, rgba,
-        ) {
-            Ok(image) => {
-                self.chat.pending_images.push(image);
-                self.chat.error = None;
+        let ordinal = self.chat.pending_images.len();
+        self.chat.paste_task.begin(ordinal);
+        let request = self.chat.paste_task.take_pending().unwrap();
+        let session_id = self.chat.session_id;
+        let proxy = proxy.clone();
+        let worker = runtime.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let images = crate::platform::images_without_text();
+                crate::plugins::chat_media::validate_image_count(ordinal + images.len())?;
+                images
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, image)| {
+                        crate::plugins::chat_media::PendingChatImage::from_clipboard(
+                            ordinal + index + 1,
+                            image.width,
+                            image.height,
+                            image.rgba,
+                        )
+                    })
+                    .collect()
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+            let _ = proxy.send_event(UserEvent::ReaderChatPaste(super::ChatPasteMessage {
+                session_id,
+                id: request.id,
+                result,
+            }));
+        });
+        self.chat.paste_task.attach_worker(worker);
+    }
+
+    pub(crate) fn complete_chat_paste(&mut self, message: super::ChatPasteMessage) {
+        let Some(chat) = self.chat_state_mut_by_session(message.session_id) else {
+            return;
+        };
+        if chat.paste_task.complete(message.id).is_none() {
+            return;
+        }
+        match message.result {
+            Ok(images) if !images.is_empty() => {
+                if let Err(error) = crate::plugins::chat_media::validate_image_count(
+                    chat.pending_images.len() + images.len(),
+                ) {
+                    chat.error = Some(error);
+                    return;
+                }
+                chat.pending_images.extend(images);
+                chat.move_cursor_to_end = true;
+                chat.error = None;
             }
-            Err(reason) => {
-                crate::diagnostics::log(
-                    "chat.paste_image.rejected",
-                    &[crate::diagnostics::Field::Detail("reason", &reason)],
-                );
-                let message = self
-                    .language
-                    .text(
-                        "无法附加剪贴板图片，请改用尺寸更小的截图后重试。",
-                        "Could not attach the clipboard image; try a smaller screenshot.",
-                    )
-                    .to_owned();
-                self.chat.error = Some(message);
-            }
+            Ok(_) => {}
+            Err(error) => chat.error = Some(error),
         }
     }
 
@@ -1490,6 +1509,9 @@ impl DesktopReader {
     }
 
     pub(super) fn send_chat(&mut self) {
+        if self.chat.paste_task.is_pending() {
+            return;
+        }
         let raw = self.chat.input.trim().to_owned();
         if (raw.is_empty()
             && self.chat.references.is_empty()
@@ -1530,19 +1552,24 @@ impl DesktopReader {
                 prompt,
                 kind,
             } => {
-                let references = std::mem::take(&mut self.chat.references);
+                let references = self.chat.references.clone();
                 let prompt = build_chat_prompt_with_references(
                     &prompt,
                     &references,
                     self.language.resolved() == crate::preferences::AppLanguage::English,
                 );
-                self.chat.input.clear();
-                self.chat.cursor_char_index = 0;
-                self.chat.suggestion_index = 0;
                 self.queue_chat_with_kind(prompt, Some(display), kind);
+                if self.chat.task.is_pending() {
+                    self.chat.input.clear();
+                    self.chat.references.clear();
+                    self.chat.cursor_char_index = 0;
+                    self.chat.suggestion_index = 0;
+                } else {
+                    self.chat.input = raw.clone();
+                }
             }
             ChatCommandResolution::NotCommand | ChatCommandResolution::Unknown => {
-                let references = std::mem::take(&mut self.chat.references);
+                let references = self.chat.references.clone();
                 let display = if raw.is_empty() {
                     references
                         .iter()
@@ -1557,10 +1584,15 @@ impl DesktopReader {
                     &references,
                     self.language.resolved() == crate::preferences::AppLanguage::English,
                 );
-                self.chat.input.clear();
-                self.chat.cursor_char_index = 0;
-                self.chat.suggestion_index = 0;
                 self.queue_chat(prompt, (!references.is_empty()).then_some(display));
+                if self.chat.task.is_pending() {
+                    self.chat.input.clear();
+                    self.chat.references.clear();
+                    self.chat.cursor_char_index = 0;
+                    self.chat.suggestion_index = 0;
+                } else {
+                    self.chat.input = raw;
+                }
             }
         }
     }
@@ -1829,6 +1861,9 @@ impl DesktopReader {
         display_content: Option<String>,
         kind: ChatRequestKind,
     ) {
+        if self.chat.paste_task.is_pending() {
+            return;
+        }
         if let Err(error) = self.plugin_settings.chat_endpoint() {
             crate::diagnostics::log(
                 "chat.queue.rejected",
@@ -1889,6 +1924,14 @@ impl DesktopReader {
                 }
             }
         }
+        let book_image_count = selection.as_ref().map_or(0, |s| s.images.len());
+        if let Err(error) = crate::plugins::chat_media::validate_image_count(
+            book_image_count + self.chat.pending_images.len(),
+        ) {
+            self.chat.error = Some(error);
+            self.chat.input = display_content.clone().unwrap_or_else(|| question.clone());
+            return;
+        }
         let pasted_images: Vec<_> = std::mem::take(&mut self.chat.pending_images)
             .into_iter()
             .map(crate::plugins::chat_media::PendingChatImage::into_image)
@@ -1935,7 +1978,7 @@ impl DesktopReader {
         };
         let question = if book_images {
             format!(
-                "{question}\n\n以下图片来自本次选中的书籍内容，按原文顺序附上。请结合图片和以下文字回答：\n{}",
+                "{question}\n\n前 {book_image_count} 张图片来自本次选中的书籍内容，按原文顺序附上；其余图片由用户粘贴。请结合图片和以下文字回答：\n{}",
                 selection
                     .as_ref()
                     .map(|s| s.text.chars().take(20_000).collect::<String>())
@@ -2235,6 +2278,7 @@ impl DesktopReader {
 
     pub(super) fn clear_chat(&mut self) {
         if !self.chat.task.is_pending() {
+            self.chat.paste_task.cancel();
             self.chat.messages.clear();
             self.chat.pending_annotation_actions.clear();
             self.chat.error = None;
@@ -2847,6 +2891,117 @@ fn translated_toc_labels(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn pasted_image() -> crate::plugins::chat_media::PendingChatImage {
+        crate::plugins::chat_media::PendingChatImage::from_clipboard(1, 1, 1, vec![7; 4]).unwrap()
+    }
+
+    #[test]
+    fn cleared_chat_rejects_old_paste_without_clearing_new_request() {
+        let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+        let session_id = reader.chat.session_id;
+        let old = reader.chat.paste_task.begin(0);
+        reader.chat.paste_task.take_pending();
+        reader.clear_chat();
+        let current = reader.chat.paste_task.begin(0);
+        reader.chat.paste_task.take_pending();
+        reader.complete_chat_paste(super::super::ChatPasteMessage {
+            session_id,
+            id: old,
+            result: Ok(vec![pasted_image()]),
+        });
+        assert!(reader.chat.pending_images.is_empty());
+        assert!(reader.chat.paste_task.is_pending());
+        reader.complete_chat_paste(super::super::ChatPasteMessage {
+            session_id,
+            id: current,
+            result: Ok(vec![pasted_image()]),
+        });
+        assert_eq!(reader.chat.pending_images.len(), 1);
+        assert!(!reader.chat.paste_task.is_pending());
+    }
+
+    #[test]
+    fn closed_book_paste_cannot_attach_to_another_reader() {
+        let (old, _, _) = crate::reader::semantic_layout::tests::fixture();
+        let (mut current, _, _) = crate::reader::semantic_layout::tests::fixture();
+        current.complete_chat_paste(super::super::ChatPasteMessage {
+            session_id: old.chat.session_id,
+            id: 1,
+            result: Ok(vec![pasted_image()]),
+        });
+        assert!(current.chat.pending_images.is_empty());
+    }
+
+    #[test]
+    fn sending_waits_for_paste_without_consuming_the_draft() {
+        let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+        reader.chat.input = "explain this".into();
+        reader.chat.pending_images.push(pasted_image());
+        reader.chat.paste_task.begin(1);
+        reader.send_chat();
+        assert_eq!(reader.chat.input, "explain this");
+        assert_eq!(reader.chat.pending_images.len(), 1);
+        assert!(reader.chat.messages.is_empty());
+        assert!(!reader.chat.task.is_pending());
+    }
+
+    #[test]
+    fn combined_book_and_paste_limit_preserves_draft_on_rejection() {
+        struct ImageSource {
+            book: Book,
+            section: Section,
+        }
+        impl BookSource for ImageSource {
+            fn book(&self) -> &Book {
+                &self.book
+            }
+            fn parse_section(&self, _: usize) -> Result<Section, PublicationError> {
+                Ok(self.section.clone())
+            }
+            fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
+                Ok(Resource {
+                    href: href.clone(),
+                    media_type: "image/png".into(),
+                    bytes: Arc::from(&b"captured but not decoded until sending"[..]),
+                })
+            }
+        }
+        let (mut reader, mut section, _) = crate::reader::semantic_layout::tests::fixture();
+        reader.plugin_settings.providers[0].base_url = "http://127.0.0.1:9/v1".into();
+        assert!(reader.plugin_settings.chat_endpoint().is_ok());
+        let Block::Image(image) = section.blocks.last().unwrap() else {
+            panic!()
+        };
+        let image = image.clone();
+        section.blocks = (0..8)
+            .map(|index| {
+                let mut image = image.clone();
+                image.href = PublicationUrl::parse(&format!("image-{index}.png")).unwrap();
+                Block::Image(image)
+            })
+            .collect();
+        reader.selection = Some(rebook_reader::ReaderSelection {
+            ranges: vec![image.source.clone().unwrap()],
+            text: "selected figures".into(),
+            rects: Vec::new(),
+        });
+        reader.reading_mode = crate::preferences::ReadingMode::Classic;
+        reader.source = Arc::new(ImageSource {
+            book: reader.source.book().clone(),
+            section,
+        });
+        reader.chat.input = "explain these images".into();
+        reader.chat.pending_images.push(pasted_image());
+        reader.send_chat();
+        assert_eq!(reader.chat.input, "explain these images");
+        assert_eq!(reader.chat.pending_images.len(), 1);
+        assert!(reader.chat.messages.is_empty());
+        assert!(!reader.chat.task.is_pending());
+        assert!(
+            reader.chat.error.as_ref().unwrap().contains('8'),
+            "{:?}", reader.chat.error
+        );
+    }
     use crate::plugins::BlockTranslation;
     use rebook_publication::{
         BlockStyle, Book, Inline, LinkRole, Metadata, NoteBlock, NoteBlockKind, PublicationError,

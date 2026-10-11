@@ -2597,7 +2597,10 @@ impl DesktopReader {
         let has_conversation = self.current_chat_has_data() || self.chat.error.is_some();
         let (content_height, frame_margin) = if has_conversation {
             (
-                (viewport.height() * 0.58).clamp(280.0, 520.0),
+                (viewport.height() * 0.58)
+                    .clamp(280.0, 520.0)
+                    .max(self.chat.popup_footer_height + 96.0)
+                    .min((viewport.height() - 50.0).max(96.0)),
                 egui::Margin {
                     left: 12,
                     right: 12,
@@ -2606,7 +2609,10 @@ impl DesktopReader {
                 },
             )
         } else {
-            (ASSISTANT_INPUT_HEIGHT, egui::Margin::symmetric(10, 6))
+            (
+                self.chat.popup_footer_height.max(ASSISTANT_INPUT_HEIGHT),
+                egui::Margin::symmetric(10, 6),
+            )
         };
         let height = content_height + f32::from(frame_margin.top) + f32::from(frame_margin.bottom);
         let y = (anchor_y - height / 2.0).clamp(
@@ -3374,17 +3380,22 @@ impl DesktopReader {
     fn focus_assistant_dialog(&mut self, ui: &mut egui::Ui, has_conversation: bool) {
         let busy = self.chat.task.is_pending();
         if has_conversation {
-            let error_height = if self.chat.error.is_some() { 54.0 } else { 0.0 };
-            let conversation_height = (ui.available_height()
-                - ASSISTANT_INPUT_HEIGHT
-                - ui.spacing().item_spacing.y
-                - error_height)
-                .max(96.0);
+            let reserve = self
+                .chat
+                .popup_footer_height
+                .max(ASSISTANT_INPUT_HEIGHT + ui.spacing().item_spacing.y);
+            let conversation_height = (ui.available_height() - reserve).max(0.0);
             self.assistant_conversation(ui, conversation_height, busy);
-            self.assistant_error(ui);
-            self.assistant_annotation_confirmation(ui);
         }
+        let footer_top = ui.cursor().min.y;
+        self.assistant_error(ui);
+        self.assistant_annotation_confirmation(ui);
         self.assistant_composer_with_options(ui, false, false, true);
+        let measured = ui.cursor().min.y - footer_top;
+        if (measured - self.chat.popup_footer_height).abs() > 0.5 {
+            self.chat.popup_footer_height = measured;
+            ui.ctx().request_discard("chat popup footer changed");
+        }
     }
 
     fn focused_unit_screen_center_y(&self, page_rect: Rect) -> Option<f32> {
@@ -3871,7 +3882,7 @@ impl DesktopReader {
         } else {
             ASSISTANT_COMPOSER_RESERVED_HEIGHT + ASSISTANT_BOTTOM_PADDING
         };
-        let conversation_height = (ui.available_height() - footer_reserve).max(96.0);
+        let conversation_height = (ui.available_height() - footer_reserve).max(0.0);
         self.assistant_conversation(ui, conversation_height, busy);
         let footer_top = ui.cursor().min.y;
         self.assistant_error(ui);
@@ -3880,9 +3891,8 @@ impl DesktopReader {
         let measured = ui.cursor().min.y - footer_top + ASSISTANT_BOTTOM_PADDING;
         if (measured - self.chat.footer_height).abs() > 0.5 {
             self.chat.footer_height = measured;
-            // The transcript was sized against the height measured last frame,
-            // so the panel needs one more frame to take the new one.
-            ui.ctx().request_repaint();
+            // Reflow before painting, then stop once the footer height settles.
+            ui.ctx().request_discard("chat footer changed");
         }
     }
 
@@ -4271,6 +4281,9 @@ impl DesktopReader {
             }
             pending_image_action =
                 chat_pending_image_chips(ui, &mut self.chat.pending_images, self.language);
+            if self.chat.paste_task.is_pending() {
+                ui.label(self.language.text("正在准备图片…", "Preparing images…"));
+            }
             ui.horizontal(|ui| {
                 let input_width = (ui.available_width() - 76.0).max(48.0);
                 let hint_text = self.language.text(
@@ -6566,6 +6579,12 @@ fn show_image_preview_area(
     interaction
 }
 
+#[derive(Clone, Copy)]
+struct ChatProgressDisclosure {
+    open: bool,
+    response_started: bool,
+}
+
 fn show_chat_progress(
     ui: &mut egui::Ui,
     key: (u64, usize),
@@ -6576,8 +6595,20 @@ fn show_chat_progress(
     language: AppLanguage,
 ) {
     let id = ui.make_persistent_id(("chat-progress", key));
-    let manual = ui.ctx().data_mut(|data| data.get_temp::<bool>(id));
-    let open = manual.unwrap_or(busy && !answering);
+    let response_started = answering || !busy;
+    let mut disclosure = ui
+        .ctx()
+        .data_mut(|data| data.get_temp::<ChatProgressDisclosure>(id))
+        .unwrap_or(ChatProgressDisclosure {
+            open: !response_started,
+            response_started,
+        });
+    // Collapse once when the answer begins, including a manually opened list.
+    // Later chunks and completion must preserve the user's subsequent toggles.
+    if response_started && !disclosure.response_started {
+        disclosure.open = false;
+        disclosure.response_started = true;
+    }
     let label = if busy && !answering {
         language.text("正在思考", "Thinking").to_owned()
     } else {
@@ -6590,7 +6621,7 @@ fn show_chat_progress(
         .horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             let arrow = ui.add(
-                icon(if open {
+                icon(if disclosure.open {
                     Icon::ChevronDown
                 } else {
                     Icon::ChevronRight
@@ -6611,25 +6642,27 @@ fn show_chat_progress(
         })
         .inner;
     if clicked {
-        ui.ctx().data_mut(|data| data.insert_temp(id, !open));
+        disclosure.open = !disclosure.open;
     }
-    if open {
-        egui::ScrollArea::vertical()
-            .id_salt(id)
-            .max_height(180.0)
-            .show(ui, |ui| {
-                for entry in entries {
-                    ui.add(
-                        egui::Label::new(RichText::new(entry).color(palette().muted))
-                            .wrap()
-                            .selectable(true),
-                    );
-                    ui.add_space(4.0);
-                }
-                if busy && !answering {
-                    ui.add(crate::ui::LoadingSpinner::new());
-                }
-            });
+    ui.ctx().data_mut(|data| data.insert_temp(id, disclosure));
+    if disclosure.open {
+        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            for entry in entries
+                .iter()
+                .map(|entry| entry.trim())
+                .filter(|entry| !entry.is_empty())
+            {
+                ui.add(
+                    egui::Label::new(RichText::new(entry).color(palette().muted))
+                        .wrap()
+                        .selectable(true),
+                );
+            }
+            if busy && !answering {
+                ui.add(crate::ui::LoadingSpinner::new());
+            }
+        });
     }
 }
 
@@ -6748,6 +6781,229 @@ fn page_wheel_input_allowed(pointer_over_page: bool, blocked: bool) -> bool {
 #[cfg(test)]
 mod reference_suggestion_label_tests {
     use super::*;
+
+    #[test]
+    fn focus_popup_composer_stays_inside_allocated_height() {
+        let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+        reader.reading_mode = crate::preferences::ReadingMode::Focus;
+        reader.ui.assistant_panel = Some(AssistantPanel::Chat);
+        reader.ui.assistant_presentation = super::super::AssistantPresentation::Popup;
+        let ctx = egui::Context::default();
+        for width in [120.0_f32, 300.0, 420.0] {
+            for has_conversation in [false, true] {
+                for count in [0, 1, 8, 1, 0] {
+                    reader.chat.pending_images = (1..=count)
+                        .map(|ordinal| {
+                            crate::plugins::chat_media::PendingChatImage::from_clipboard(
+                                ordinal,
+                                320,
+                                180,
+                                vec![7; 320 * 180 * 4],
+                            )
+                            .unwrap()
+                        })
+                        .collect();
+                    let mut overflow = 0.0;
+                    for frame in 0..3 {
+                        let mut output = ctx.run_ui(Default::default(), |root| {
+                            egui::CentralPanel::default().show(root, |ui| {
+                                let height = if has_conversation {
+                                    280.0_f32.max(reader.chat.popup_footer_height + 96.0)
+                                } else {
+                                    reader.chat.popup_footer_height.max(ASSISTANT_INPUT_HEIGHT)
+                                };
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(width, height),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        let allotted_bottom = ui.max_rect().bottom();
+                                        reader.focus_assistant_dialog(ui, has_conversation);
+                                        overflow = ui.min_rect().bottom() - allotted_bottom;
+                                    },
+                                );
+                            });
+                        });
+                        output.textures_delta.clear();
+                        assert!(
+                            overflow <= 0.5,
+                            "width={width}, images={count}, history={has_conversation}, overflow={overflow}"
+                        );
+                        if frame == 2 {
+                            assert_eq!(
+                                output.platform_output.num_completed_passes, 1,
+                                "settled footer must not keep requesting layout passes"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+
+    #[test]
+    fn chat_progress_expands_to_content_with_compact_rows() {
+        let ctx = egui::Context::default();
+        let mut entries: Vec<_> = (0..12).map(|i| format!("Tool call {i}\n\n")).collect();
+        entries[5] = "Tool call 5: a longer search query that wraps onto multiple lines".into();
+        entries.insert(4, "\n\n".into());
+        let mut height = 0.0;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(200.0, 800.0))),
+                ..Default::default()
+            },
+            |root| {
+                egui::CentralPanel::default().show(root, |ui| {
+                    let top = ui.cursor().top();
+                    show_chat_progress(ui, (1, 0), &entries, true, false, 0, AppLanguage::English);
+                    height = ui.cursor().top() - top;
+                });
+            },
+        );
+        output.textures_delta.clear();
+        let rows: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text().starts_with("Tool call ") => {
+                    Some(Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rows.len(),
+            12,
+            "all tool rows must be visible without nested scrolling"
+        );
+        for pair in rows.windows(2) {
+            let gap = pair[1].top() - pair[0].bottom();
+            assert!((0.0..=3.0).contains(&gap), "tool row gap is {gap}");
+        }
+        assert!(
+            rows[5].height() > rows[0].height(),
+            "long queries must wrap"
+        );
+        assert!(
+            height > 180.0,
+            "tool list must grow beyond the old scroll limit: {height}"
+        );
+        assert!(height >= rows.last().unwrap().bottom() - rows[0].top());
+    }
+
+    #[test]
+    fn chat_progress_collapses_once_when_answer_starts_and_can_be_reopened() {
+        let ctx = egui::Context::default();
+        let entries = vec!["Tool call 0".to_owned()];
+        let mut header = Rect::NOTHING;
+        let mut render = |busy, answering, events| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |root| {
+                    egui::CentralPanel::default().show(root, |ui| {
+                        show_chat_progress(
+                            ui,
+                            (1, 0),
+                            &entries,
+                            busy,
+                            answering,
+                            49,
+                            AppLanguage::English,
+                        );
+                    });
+                },
+            );
+            output.textures_delta.clear();
+            let mut tool_visible = false;
+            for shape in &output.shapes {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    if text.galley.text() == "Tool call 0" {
+                        tool_visible = true;
+                    }
+                    if text.galley.text() == "Thinking"
+                        || text.galley.text().starts_with("Thought for")
+                    {
+                        header = Rect::from_min_size(text.pos, text.galley.size());
+                    }
+                }
+            }
+            (tool_visible, header.center())
+        };
+        let (visible, pos) = render(true, false, vec![]);
+        assert!(visible);
+        // Close and reopen during thinking so a manual expansion cannot mask
+        // the transition to answering.
+        for expected_open in [false, true] {
+            render(
+                true,
+                false,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            assert_eq!(
+                render(
+                    true,
+                    false,
+                    vec![egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                )
+                .0,
+                expected_open
+            );
+        }
+        let (visible, pos) = render(true, true, vec![]);
+        assert!(!visible, "answering must collapse the tool list");
+        // Click the real disclosure header while the answer is still streaming.
+        render(
+            true,
+            true,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(
+            render(
+                true,
+                true,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE
+                },]
+            )
+            .0
+        );
+        assert!(
+            render(true, true, vec![]).0,
+            "later answer chunks must preserve manual expansion"
+        );
+        assert!(
+            render(false, true, vec![]).0,
+            "completion must preserve manual expansion"
+        );
+    }
 
     #[test]
     fn idle_classic_footnote_hover_keeps_scroll_and_stops_repainting() {
@@ -7109,8 +7365,9 @@ mod reference_suggestion_label_tests {
                                     panel,
                                     egui::Layout::top_down(egui::Align::Min),
                                     |ui| {
+                                        let allotted_bottom = ui.max_rect().bottom();
                                         reader.assistant(ui);
-                                        ui.max_rect().bottom() - ui.min_rect().bottom()
+                                        allotted_bottom - ui.min_rect().bottom()
                                     },
                                 )
                                 .inner;

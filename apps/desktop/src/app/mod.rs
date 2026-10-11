@@ -90,9 +90,19 @@ impl DesktopApp {
             .is_some_and(|reader| reader.chat_composer_accepts_paste(ctx))
     }
 
-    pub(crate) fn attach_pasted_chat_image(&mut self, paste: crate::platform::ClipboardImage) {
+    pub(crate) fn paste_chat_images(
+        &mut self,
+        runtime: &tokio::runtime::Runtime,
+        proxy: &winit::event_loop::EventLoopProxy<crate::platform::UserEvent>,
+    ) {
         if let Some(reader) = self.reader.as_mut() {
-            reader.attach_pasted_chat_image(paste);
+            reader.paste_chat_images(runtime, proxy);
+        }
+    }
+
+    pub(crate) fn complete_chat_paste(&mut self, message: crate::reader::ChatPasteMessage) {
+        if let Some(reader) = self.reader.as_mut() {
+            reader.complete_chat_paste(message);
         }
     }
 

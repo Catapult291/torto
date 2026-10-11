@@ -349,6 +349,10 @@ impl FootnoteRenderer {
         style.typography.minimum_font_size = size;
         // Leave room for glyph side bearings and antialiasing at the SVG edge.
         style.horizontal_margin = 2.0;
+        // The popup owns its padding; focus-mode page constraints must not
+        // enlarge the text inset or reduce the popup's available line width.
+        style.minimum_horizontal_margin = 0.0;
+        style.minimum_content_width = 0.0;
         style.top_margin = 0.0;
         style.bottom_margin = 0.0;
         style.spread = SpreadMode::Single;
@@ -657,6 +661,51 @@ mod tests {
         Book, Metadata, PublicationError, PublicationId, PublicationUrl, Resource, Section,
     };
     struct Source(Book);
+    #[test]
+    fn popup_markers_ignore_focus_reader_minimum_margins() {
+        let source = Source(Book {
+            id: PublicationId::new("popup-focus-margins").unwrap(),
+            metadata: Metadata::default(),
+            cover: None,
+            sections: vec![],
+            table_of_contents: vec![],
+        });
+        let mut renderer = FootnoteRenderer::default();
+        let classic = ReaderStyle::default();
+        let focus = ReaderStyle {
+            minimum_horizontal_margin: 24.0,
+            minimum_content_width: 400.0,
+            ..classic.clone()
+        };
+        for width in [140.0, 300.0] {
+            let mut layouts = Vec::new();
+            for style in [&classic, &focus] {
+                let slot = renderer.marker_width(&source, "[2]", style, 14.0).unwrap();
+                layouts.push(
+                    renderer
+                        .layout_aligned_marked(
+                            &source,
+                            "Mandelbrot, 1952; Bell et al., 1990",
+                            "[2]",
+                            style,
+                            14.0,
+                            egui::Color32::BLACK,
+                            egui::Color32::BLUE,
+                            width,
+                            slot,
+                        )
+                        .unwrap(),
+                );
+            }
+            assert!(
+                layouts[0].svg == layouts[1].svg,
+                "focus mode must not add popup indentation at width {width}: {:?} vs {:?}",
+                layouts[0].line_starts,
+                layouts[1].line_starts
+            );
+        }
+    }
+
     #[test]
     fn aligned_markers_share_first_body_edge_and_full_width_continuations() {
         let source = Source(Book {

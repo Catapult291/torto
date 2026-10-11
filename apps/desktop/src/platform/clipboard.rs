@@ -2,8 +2,8 @@
 //!
 //! egui-winit turns the paste shortcut into `egui::Event::Paste` only when the
 //! clipboard holds text, so an image-only clipboard (a screenshot) produces no
-//! event at all and the composer can never see it. The event loop reads the
-//! pixels here, before the shortcut is handed to egui.
+//! event at all and the composer can never see it. A blocking worker reads the
+//! pixels here while egui continues handling ordinary text paste.
 
 use std::path::Path;
 
@@ -71,7 +71,7 @@ fn read_image_file(path: &Path) -> Option<ClipboardImage> {
         .with_guessed_format()
         .ok()?;
     // Attachments are scaled down to 2048 points when they are encoded, so a
-    // larger decode would only waste memory on the event loop.
+    // larger decode would only waste memory on the worker.
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(64 * 1024 * 1024);
     limits.max_image_width = Some(8192);

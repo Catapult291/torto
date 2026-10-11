@@ -54,18 +54,15 @@ impl ChatImage {
     /// Wrap straight RGBA8 clipboard pixels as an attachment. The pixels are
     /// encoded and measured now, so an image the sender would refuse is
     /// rejected while the composer can still show the reason.
-    fn from_rgba_image(label: String, pixels: &image::RgbaImage) -> Result<Self, String> {
-        let mut bytes = Cursor::new(Vec::new());
-        pixels
-            .write_to(&mut bytes, image::ImageFormat::Png)
-            .map_err(|e| e.to_string())?;
-        let image = Self {
+    fn from_rgba_image(label: String, pixels: image::RgbaImage) -> Result<Self, String> {
+        // Resize before encoding and reuse the same PNG for the request.
+        let bytes = encode_pixels(image::DynamicImage::ImageRgba8(pixels))?;
+        let url = image_data_url(&bytes);
+        Ok(Self {
             label,
-            bytes: bytes.into_inner().into(),
-            encoded: Arc::new(OnceLock::new()),
-        };
-        image.data_url()?;
-        Ok(image)
+            bytes: bytes.into(),
+            encoded: Arc::new(OnceLock::from(Ok(url))),
+        })
     }
 }
 
@@ -90,7 +87,7 @@ impl PendingChatImage {
         let thumbnail = thumbnail_color_image(&pixels);
         Ok(Self {
             id: NEXT_PENDING_IMAGE_ID.fetch_add(1, Ordering::Relaxed),
-            image: ChatImage::from_rgba_image(format!("clipboard image {ordinal}"), &pixels)?,
+            image: ChatImage::from_rgba_image(format!("clipboard image {ordinal}"), pixels)?,
             thumbnail,
             texture: None,
         })
@@ -271,6 +268,7 @@ fn collect_images<'a>(
 }
 
 pub fn message_content(text: &str, images: &[ChatImage]) -> Result<Value, String> {
+    validate_image_count(images.len())?;
     if images.is_empty() {
         return Ok(json!(text));
     }
@@ -280,6 +278,14 @@ pub fn message_content(text: &str, images: &[ChatImage]) -> Result<Value, String
         parts.push(json!({"type":"image_url", "image_url":{"url":image.data_url()?}}));
     }
     Ok(json!(parts))
+}
+
+pub(crate) fn validate_image_count(count: usize) -> Result<(), String> {
+    if count > MAX_IMAGES_PER_MESSAGE {
+        Err("一条消息最多附带 8 张图片（书籍图片和粘贴图片合计），请减少选区或移除附件。".into())
+    } else {
+        Ok(())
+    }
 }
 
 fn encode_image(bytes: &[u8]) -> Result<String, String> {
@@ -313,6 +319,10 @@ fn encode_image(bytes: &[u8]) -> Result<String, String> {
                 .map_err(|e| e.to_string())?
         }
     };
+    Ok(image_data_url(&encode_pixels(image)?))
+}
+
+fn encode_pixels(image: image::DynamicImage) -> Result<Vec<u8>, String> {
     let image = if image.width().max(image.height()) > MAX_DIMENSION {
         rebook_layout::image_processing::resize(
             image,
@@ -330,15 +340,28 @@ fn encode_image(bytes: &[u8]) -> Result<String, String> {
     if bytes.get_ref().len() > MAX_BYTES / MAX_IMAGES {
         return Err("图片压缩后仍过大，请缩小选取范围或图片尺寸。".into());
     }
-    Ok(format!(
+    Ok(bytes.into_inner())
+}
+
+fn image_data_url(bytes: &[u8]) -> String {
+    format!(
         "data:image/png;base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(bytes.into_inner())
-    ))
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn combined_message_image_limit_is_enforced() {
+        let images = vec![attachment(); MAX_IMAGES_PER_MESSAGE + 1];
+        assert!(
+            message_content("book images plus clipboard images", &images).is_err(),
+            "the final message must reject more than 8 images after combining sources"
+        );
+    }
 
     fn attachment() -> ChatImage {
         let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 128]));

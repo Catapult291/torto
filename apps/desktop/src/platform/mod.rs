@@ -7,7 +7,7 @@ pub(crate) use reader_layers::tests::LayerAudit;
 mod repaint;
 
 pub(crate) use application::run;
-pub(crate) use clipboard::{ClipboardImage, images_without_text};
+pub(crate) use clipboard::images_without_text;
 
 pub(crate) enum UserEvent {
     RepaintAfter(std::time::Duration),
@@ -31,6 +31,7 @@ pub(crate) enum UserEvent {
     ReaderSearch(crate::reader::SearchTaskMessage),
     ReaderChatStream(crate::reader::ChatStreamMessage),
     ReaderChat(crate::reader::ChatTaskMessage),
+    ReaderChatPaste(crate::reader::ChatPasteMessage),
     ReaderTranslation(crate::reader::TranslationTaskMessage),
     ReaderTocTranslation(crate::reader::TocTranslationTaskMessage),
     ReaderPdfToc(crate::reader::PdfTocTaskMessage),
