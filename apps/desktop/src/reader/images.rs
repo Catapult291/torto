@@ -108,6 +108,15 @@ impl Default for ImageLoader {
                                         timings.duration(TimingStage::ImagePixels).as_secs_f32()
                                             * 1000.0,
                                     ),
+                                    Field::F32(
+                                        "formula_raster_ms",
+                                        timings.duration(TimingStage::FormulaRaster).as_secs_f32()
+                                            * 1000.0,
+                                    ),
+                                    Field::F32(
+                                        "worker_ms",
+                                        started.elapsed().as_secs_f32() * 1000.0,
+                                    ),
                                     Field::Bool("cancelled", !job.needed.load(Ordering::Acquire)),
                                 ],
                             );

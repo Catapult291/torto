@@ -185,6 +185,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scroll_hit_testing_waits_for_placeholder_materialization() {
+        use crate::reader::{ScrollSectionLayout, ScrollViewportState};
+        use rebook_reader::{ReaderPosition, ReaderSectionPage};
+        use std::sync::Arc;
+        let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+        reader.reading_mode = crate::preferences::ReadingMode::Classic;
+        let position = ReaderPosition {
+            section_index: 1,
+            segment_index: 0,
+            page_index: 0,
+        };
+        let page = reader.reader.current_spread().unwrap().primary;
+        reader.scroll_viewport = Some(ScrollViewportState {
+            offset_y: 0.0,
+            size: egui::vec2(400.0, 600.0),
+        });
+        for placeholder in [true, false] {
+            reader.scroll_section = Some(Arc::new(ScrollSectionLayout::new(
+                0,
+                0,
+                vec![ReaderSectionPage {
+                    position,
+                    page: page.clone(),
+                    placeholder,
+                    visible_top: None,
+                    visible_bottom: None,
+                }],
+                true,
+            )));
+            assert_eq!(
+                reader.scroll_page_coordinates(20.0, 20.0).is_some(),
+                !placeholder
+            );
+        }
+    }
+
+    #[test]
     fn opening_header_waits_for_presented_body_then_uses_existing_hide_timer() {
         let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
         let classic = crate::reader::chrome::SidebarState {

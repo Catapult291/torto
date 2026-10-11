@@ -1345,6 +1345,16 @@ pub trait BookSource: Send + Sync {
     ) -> Result<Option<FixedPageDimensions>, PublicationError> {
         Ok(None)
     }
+
+    /// Dimensions of a source-owned raster, without generating its pixels.
+    /// Such resources must be immutable for the publication ID and revision;
+    /// this lets interactive readers schedule materialization after layout.
+    fn raster_resource_dimensions(
+        &self,
+        _href: &PublicationUrl,
+    ) -> Result<Option<[u32; 2]>, PublicationError> {
+        Ok(None)
+    }
 }
 
 /// Source position shared by DOM, semantic blocks, and layout fragments.

@@ -16,6 +16,8 @@ pub enum TimingStage {
     ImageDecode,
     ImagePixels,
     Layout,
+    FormulaLayout,
+    FormulaRaster,
     GlyphShape,
     Hyphenation,
     LineBreak,

@@ -12,6 +12,7 @@ use text_layout::{Layout, PositionedLayoutItem};
 
 mod caption_labels;
 mod formula_images;
+mod formula_raster;
 mod headings;
 mod hyphen_cache;
 mod note_spacing;
@@ -1311,12 +1312,11 @@ impl LayoutEngine {
         source: &dyn BookSource,
         image: &ImageBlock,
     ) -> Result<RasterImage, LayoutError> {
-        // Exact overlays and formula conversion inspect pixels before painting.
+        // Exact text overlays inspect pixels before painting. Formula geometry
+        // only needs intrinsic dimensions; its original preview can load on use.
         if self.deferred_images
             && source.book().metadata.layout != RenditionLayout::PrePaginated
             && image.text_layer.is_none()
-            && !image.formula_image
-            && image.formula.is_none()
         {
             raster_cache::prepare(source, image, self.raster_target, self.raster_generation)
         } else {
@@ -2153,6 +2153,8 @@ impl LayoutEngine {
             &rasters,
             source_spans,
             true,
+            self.deferred_images
+                .then_some((source, self.raster_generation)),
         ))
     }
 
@@ -2421,6 +2423,7 @@ impl LayoutEngine {
         let equal_column_width = content_width / column_count as f32;
         let (column_widths, measured_cells) = if unified {
             self.adaptive_table_column_widths(
+                source,
                 &grid_cells,
                 &rasters,
                 column_count,
@@ -2452,7 +2455,15 @@ impl LayoutEngine {
             let mut text = if let Some(measured) = measured {
                 Self::reflow_table_cell(measured, &block, text_width, 8.0)
             } else {
-                self.shape_table_cell(&block, reader_style, text_width, 8.0, rasters)
+                self.shape_table_cell(
+                    &block,
+                    reader_style,
+                    text_width,
+                    8.0,
+                    rasters,
+                    self.deferred_images
+                        .then_some((source, self.raster_generation)),
+                )
             };
             if unified {
                 // Ignore empty publisher wrappers at cell edges while retaining
@@ -2510,6 +2521,7 @@ impl LayoutEngine {
     )]
     fn adaptive_table_column_widths(
         &mut self,
+        source: &dyn BookSource,
         grid_cells: &[(usize, usize, usize, usize, &TableCell)],
         inline_rasters: &[Vec<Option<RasterImage>>],
         column_count: usize,
@@ -2527,7 +2539,15 @@ impl LayoutEngine {
         for ((_, _, column, column_span, cell), rasters) in grid_cells.iter().zip(inline_rasters) {
             let block = table_cell_text_block(cell);
             let block = resolve_text_block(&block, reader_style, TextContext::Table).into_owned();
-            let unwrapped = self.shape_table_cell(&block, reader_style, 16_384.0, 8.0, rasters);
+            let unwrapped = self.shape_table_cell(
+                &block,
+                reader_style,
+                16_384.0,
+                8.0,
+                rasters,
+                self.deferred_images
+                    .then_some((source, self.raster_generation)),
+            );
             let inline_slack = reader_style.typography.font_size * table_metrics.font_scale * 0.5;
             let preferred = (unwrapped.layout.full_width().ceil()
                 + table_metrics.cell_padding * 2.0
@@ -2545,10 +2565,18 @@ impl LayoutEngine {
                 text_only
                     .content
                     .retain(|inline| !matches!(inline, Inline::Image(_)));
-                self.shape_table_cell(&text_only, reader_style, 16_384.0, 8.0, &[])
-                    .layout
-                    .calculate_content_widths()
-                    .min
+                self.shape_table_cell(
+                    &text_only,
+                    reader_style,
+                    16_384.0,
+                    8.0,
+                    &[],
+                    self.deferred_images
+                        .then_some((source, self.raster_generation)),
+                )
+                .layout
+                .calculate_content_widths()
+                .min
             } else {
                 unwrapped.layout.calculate_content_widths().min
             };
@@ -2613,6 +2641,7 @@ impl LayoutEngine {
             inline_rasters,
             Vec::new(),
             true,
+            None,
         )
     }
 
@@ -2623,6 +2652,7 @@ impl LayoutEngine {
         content_width: f32,
         minimum_width: f32,
         inline_rasters: &[Option<RasterImage>],
+        formula_context: Option<(&dyn BookSource, u64)>,
     ) -> PreparedText {
         if let Some(empty) =
             Self::empty_table_cell(block, reader_style, content_width, minimum_width)
@@ -2637,6 +2667,7 @@ impl LayoutEngine {
             inline_rasters,
             Vec::new(),
             reader_style.typesetting.mode != TypesettingMode::Unified,
+            formula_context,
         )
     }
 
@@ -2650,6 +2681,7 @@ impl LayoutEngine {
         inline_rasters: &[Option<RasterImage>],
         mut source_spans: Vec<TextSourceSpan>,
         optimize_line_breaks: bool,
+        formula_context: Option<(&dyn BookSource, u64)>,
     ) -> PreparedText {
         let (start_offset, available_width, first_line_indent) =
             resolve_text_measure(block, content_width, minimum_width);
@@ -2673,6 +2705,7 @@ impl LayoutEngine {
                 inline_rasters,
                 Vec::new(),
                 optimize_line_breaks,
+                formula_context,
             ))
         } else {
             None
@@ -2691,6 +2724,7 @@ impl LayoutEngine {
                     || reader_style.website_icons,
                 inline_rasters,
                 &mut source_spans,
+                formula_context,
             );
         let sentence_reference = sentence_reference.filter(|reference| {
             let end = text.find('\n').unwrap_or(text.len());
@@ -4655,6 +4689,7 @@ fn prepare_inline_content(
     website_icons: bool,
     inline_rasters: &[Option<RasterImage>],
     source_spans: &mut [TextSourceSpan],
+    formula_context: Option<(&dyn BookSource, u64)>,
 ) -> (
     String,
     Vec<StyledRange>,
@@ -4911,16 +4946,19 @@ fn prepare_inline_content(
                 } else {
                     0.0
                 };
-                if let Ok(image) = rasterize_formula(
+                if let Ok((image, metrics)) = formula_raster::prepare(
                     run,
                     typography,
                     fallback_color,
                     (available_width - 2.0 * pad_x).max(1.0),
                     svg_options,
+                    formula_context,
                 )
-                .and_then(|image| {
+                .and_then(|prepared| {
+                    let metrics = prepared.vertical_metrics(prepared.height);
+                    let image = prepared.into_tuple();
                     if !display_padding {
-                        return Ok(image);
+                        return Ok((image, metrics));
                     }
                     let height = image.2 + pad_y * 2.0;
                     formula_images::padded_display_row(
@@ -4932,6 +4970,7 @@ fn prepare_inline_content(
                         pad_y,
                         false,
                     )
+                    .map(|image| (image, metrics))
                     .ok_or_else(|| "Formula padding failed".to_owned())
                 }) {
                     let (box_height, offset_y) = if display_padding {
@@ -4939,8 +4978,7 @@ fn prepare_inline_content(
                         // prose baseline adjustments would move it down again.
                         (image.2, 0.0)
                     } else {
-                        formula_images::math_vertical_metrics(run, typography, image.2)
-                            .unwrap_or((image.2, 0.0))
+                        metrics
                     };
                     inline_images.push(PreparedInlineImage {
                         formula_presentation: run.original.as_ref().map(|_| FormulaPresentation {
@@ -5029,6 +5067,7 @@ fn prepare_inline_content(
                         image.clone(),
                         id,
                         text.len(),
+                        formula_context,
                     )
                 {
                     rendered.index = text.len();
@@ -5210,72 +5249,6 @@ fn list_marker_prefix(kind: TextBlockKind) -> String {
         TextBlockKind::ListItem { ordered: false, .. } => "•\u{00a0}".to_owned(),
         _ => String::new(),
     }
-}
-
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "formula dimensions are clamped to bounded reader viewport pixels"
-)]
-fn rasterize_formula(
-    run: &MathRun,
-    typography: &ReaderTypography,
-    color: Rgba,
-    available_width: f32,
-    svg_options: &resvg::usvg::Options<'_>,
-) -> Result<(RasterImage, f32, f32), String> {
-    use resvg::tiny_skia::Pixmap;
-    use resvg::usvg::{Transform, Tree};
-
-    const RASTER_SCALE: f32 = 2.0;
-    const PADDING: f32 = 1.5;
-    let semantic_scale = if run.display { 1.12 } else { 1.0 };
-    let font_size = (typography.font_size * run.size_scale.clamp(0.5, 3.0) * semantic_scale)
-        .max(typography.minimum_font_size);
-    let text_color = format!("#{:02x}{:02x}{:02x}", color.red, color.green, color.blue);
-    let rendered = rebook_math::math::render_math(&run.latex, font_size, &text_color, run.display)?;
-    let source_width = (rendered.width + PADDING * 2.0).max(1.0);
-    let source_height = (rendered.ascent + rendered.descent + PADDING * 2.0).max(1.0);
-    let width_scale = (available_width / source_width).min(1.0);
-    let display_width = (source_width * width_scale).max(1.0);
-    let display_height = (source_height * width_scale).max(1.0);
-    let view_y = -rendered.ascent - PADDING;
-    let svg = format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="{} {} {} {}" width="{}" height="{}">{}</svg>"#,
-        -PADDING,
-        view_y,
-        source_width,
-        source_height,
-        source_width,
-        source_height,
-        rendered.svg_fragment
-    );
-    let tree = Tree::from_data(svg.as_bytes(), svg_options).map_err(|error| error.to_string())?;
-    let pixel_width = (display_width * RASTER_SCALE).ceil().max(1.0) as u32;
-    let pixel_height = (display_height * RASTER_SCALE).ceil().max(1.0) as u32;
-    let mut pixmap = Pixmap::new(pixel_width, pixel_height)
-        .ok_or_else(|| format!("failed to allocate formula raster {pixel_width}x{pixel_height}"))?;
-    resvg::render(
-        &tree,
-        Transform::from_scale(
-            pixel_width as f32 / source_width,
-            pixel_height as f32 / source_height,
-        ),
-        &mut pixmap.as_mut(),
-    );
-    Ok((
-        RasterImage {
-            deferred: None,
-            origin: None,
-            blob: None,
-            width: pixel_width,
-            height: pixel_height,
-            pixels: pixmap.data().to_vec().into(),
-        },
-        display_width,
-        display_height,
-    ))
 }
 
 struct Paginator {
@@ -6544,6 +6517,7 @@ mod tests {
                 true,
                 &[],
                 &mut [],
+                None,
             );
             assert_eq!(citations.len(), 12);
             for (index, citation) in citations.iter().enumerate() {
@@ -6633,6 +6607,7 @@ mod tests {
             false,
             &[],
             &mut [],
+            None,
         );
         assert_eq!(
             spans
@@ -6661,6 +6636,7 @@ mod tests {
             false,
             &[],
             &mut [],
+            None,
         );
         assert!(
             disabled_spans
@@ -6894,6 +6870,7 @@ mod tests {
             false,
             &[Some(raster), None],
             &mut [],
+            None,
         );
 
         assert_eq!(text, "Chapter title");
@@ -6952,6 +6929,7 @@ mod tests {
             false,
             &[Some(raster)],
             &mut [],
+            None,
         );
 
         let [image] = images.as_slice() else {

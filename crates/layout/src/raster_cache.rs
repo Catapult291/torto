@@ -78,11 +78,58 @@ pub struct DeferredRaster {
     owner: (String, bool),
     generation: u64,
     block: ImageBlock,
+    generated: Option<Arc<dyn RasterTask>>,
+    source_owned: bool,
     target: [u32; 2],
     dimensions: [u32; 2],
 }
 
+pub(super) trait RasterTask: std::fmt::Debug + Send + Sync {
+    fn render(&self) -> Result<RasterImage, LayoutError>;
+}
+
 impl DeferredRaster {
+    pub(super) fn with_generated(
+        &self,
+        identity: u64,
+        dimensions: [u32; 2],
+        task: Arc<dyn RasterTask>,
+    ) -> RasterImage {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        "generated-composite-v1".hash(&mut hash);
+        self.owner.hash(&mut hash);
+        identity.hash(&mut hash);
+        dimensions.hash(&mut hash);
+        let key = hash.finish();
+        let mut request = self.clone();
+        request.key = key;
+        request.resource_key = key;
+        request.dimensions = dimensions;
+        request.target = dimensions;
+        request.generated = Some(task);
+        RasterImage {
+            deferred: Some(request),
+            origin: None,
+            blob: None,
+            width: dimensions[0],
+            height: dimensions[1],
+            pixels: Arc::from([]),
+        }
+    }
+
+    pub(super) fn render_generated(&self) -> Result<RasterImage, LayoutError> {
+        if let Some(image) = self.ready() {
+            return Ok(image);
+        }
+        self.generated
+            .as_ref()
+            .ok_or_else(|| {
+                PublicationError::InvalidPublication(
+                    "Composite requires prepared formula pixels".into(),
+                )
+            })?
+            .render()
+    }
     /// Keep visible resources resident without retaining pixels in chapter IR.
     /// Returns false on contention; the caller must never wait on the UI.
     pub fn protect_visible(source: &dyn BookSource, requests: impl Iterator<Item = Self>) -> bool {
@@ -138,6 +185,11 @@ impl DeferredRaster {
     }
 
     pub fn estimated_bytes(&self) -> usize {
+        if self.source_owned {
+            return (self.dimensions[0] as usize)
+                .saturating_mul(self.dimensions[1] as usize)
+                .saturating_mul(4);
+        }
         let scale = (f64::from(self.target[0]) / f64::from(self.dimensions[0]))
             .min(f64::from(self.target[1]) / f64::from(self.dimensions[1]))
             .min(1.0);
@@ -225,29 +277,59 @@ impl DeferredRaster {
                 .copied()
                 .unwrap_or_default()
         };
-        let resource = {
-            let _timing = timing::stage(timing::TimingStage::ImageSource);
-            source.resource(&self.block.href)?
+        let image = if let Some(task) = &self.generated {
+            task.render()?
+        } else if self.source_owned {
+            let dimensions = source.raster_resource_dimensions(&self.block.href)?;
+            let (resource_key, key) = owned_keys(source, &self.block, self.dimensions, self.target);
+            if dimensions != Some(self.dimensions)
+                || key != self.key
+                || resource_key != self.resource_key
+            {
+                return Err(PublicationError::InvalidPublication(
+                    "Source raster changed during preparation".into(),
+                )
+                .into());
+            }
+            if !needed() {
+                return Ok(());
+            }
+            let image = source
+                .raster_resource(&self.block.href)?
+                .ok_or_else(|| PublicationError::ResourceNotFound(self.block.href.to_string()))?;
+            if [image.width, image.height] != self.dimensions {
+                return Err(PublicationError::InvalidPublication(
+                    "Source raster dimensions changed during rendering".into(),
+                )
+                .into());
+            }
+            raster(image.width, image.height, image.pixels, None)
+        } else {
+            let resource = {
+                let _timing = timing::stage(timing::TimingStage::ImageSource);
+                source.resource(&self.block.href)?
+            };
+            // Revalidate sources with no resource revision, before publishing pixels.
+            let (resource_key, key) =
+                encoded_keys(source, &self.block, &resource.bytes, self.target);
+            if !needed() {
+                return Ok(());
+            }
+            if key != self.key || resource_key != self.resource_key {
+                return Err(PublicationError::InvalidPublication(
+                    "Image resource changed during preparation".into(),
+                )
+                .into());
+            }
+            let decoded = {
+                let _timing = timing::stage(timing::TimingStage::ImageDecode);
+                image::load_from_memory(&resource.bytes)?
+            };
+            if !needed() {
+                return Ok(());
+            }
+            display_raster(decoded, &self.block.href, self.target)
         };
-        // Revalidate sources with no resource revision, before publishing pixels.
-        let (resource_key, key) = encoded_keys(source, &self.block, &resource.bytes, self.target);
-        if !needed() {
-            return Ok(());
-        }
-        if key != self.key || resource_key != self.resource_key {
-            return Err(PublicationError::InvalidPublication(
-                "Image resource changed during preparation".into(),
-            )
-            .into());
-        }
-        let decoded = {
-            let _timing = timing::stage(timing::TimingStage::ImageDecode);
-            image::load_from_memory(&resource.bytes)?
-        };
-        if !needed() {
-            return Ok(());
-        }
-        let image = display_raster(decoded, &self.block.href, self.target);
         let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if !needed() {
             return Ok(());
@@ -298,6 +380,23 @@ fn encoded_keys(
     (resource_key, hash.finish())
 }
 
+fn owned_keys(
+    source: &dyn BookSource,
+    block: &ImageBlock,
+    dimensions: [u32; 2],
+    target: [u32; 2],
+) -> (u64, u64) {
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    "source-owned-raster-v1".hash(&mut hash);
+    source.book().id.hash(&mut hash);
+    source.content_revision().hash(&mut hash);
+    block.href.hash(&mut hash);
+    dimensions.hash(&mut hash);
+    let resource_key = hash.finish();
+    target.hash(&mut hash);
+    (resource_key, hash.finish())
+}
+
 pub(super) fn prepare(
     source: &dyn BookSource,
     block: &ImageBlock,
@@ -305,12 +404,25 @@ pub(super) fn prepare(
     generation: u64,
 ) -> Result<RasterImage, LayoutError> {
     let _timing = timing::stage(timing::TimingStage::ImageMetadata);
-    let resource = source.resource(&block.href)?;
-    let (width, height) = image::ImageReader::new(std::io::Cursor::new(&resource.bytes))
-        .with_guessed_format()
-        .map_err(image::ImageError::IoError)?
-        .into_dimensions()?;
-    let (resource_key, key) = encoded_keys(source, block, &resource.bytes, target);
+    // Preserve formula details for original-format display and image fallback.
+    let target = if block.formula_image || block.formula.is_some() {
+        [u32::MAX; 2]
+    } else {
+        target
+    };
+    let source_dimensions = source.raster_resource_dimensions(&block.href)?;
+    let (width, height, resource_key, key) = if let Some([width, height]) = source_dimensions {
+        let (resource_key, key) = owned_keys(source, block, [width, height], target);
+        (width, height, resource_key, key)
+    } else {
+        let resource = source.resource(&block.href)?;
+        let (width, height) = image::ImageReader::new(std::io::Cursor::new(&resource.bytes))
+            .with_guessed_format()
+            .map_err(image::ImageError::IoError)?
+            .into_dimensions()?;
+        let (resource_key, key) = encoded_keys(source, block, &resource.bytes, target);
+        (width, height, resource_key, key)
+    };
     let owner = (source.book().id.to_string(), false);
     Ok(RasterImage {
         origin: Some(RasterOrigin {
@@ -324,6 +436,8 @@ pub(super) fn prepare(
             owner,
             generation,
             block: block.clone(),
+            generated: None,
+            source_owned: source_dimensions.is_some(),
             target,
             dimensions: [width.max(1), height.max(1)],
         }),
@@ -332,6 +446,52 @@ pub(super) fn prepare(
         height,
         pixels: Arc::from([]),
     })
+}
+
+pub(super) fn prepare_generated(
+    source: &dyn BookSource,
+    identity: u64,
+    dimensions: [u32; 2],
+    task: Arc<dyn RasterTask>,
+    generation: u64,
+) -> RasterImage {
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    "generated-raster-v1".hash(&mut hash);
+    source.book().id.hash(&mut hash);
+    (source.book().metadata.layout == RenditionLayout::PrePaginated).hash(&mut hash);
+    identity.hash(&mut hash);
+    dimensions.hash(&mut hash);
+    let key = hash.finish();
+    RasterImage {
+        width: dimensions[0],
+        height: dimensions[1],
+        pixels: Arc::from([]),
+        blob: None,
+        origin: None,
+        deferred: Some(DeferredRaster {
+            key,
+            resource_key: key,
+            owner: (
+                source.book().id.to_string(),
+                source.book().metadata.layout == RenditionLayout::PrePaginated,
+            ),
+            generation,
+            block: ImageBlock {
+                href: PublicationUrl::parse(&format!("Generated/{key:016x}.svg"))
+                    .expect("generated resource URL"),
+                alt: String::new(),
+                style: Default::default(),
+                source: None,
+                text_layer: None,
+                formula_image: false,
+                formula: None,
+            },
+            generated: Some(task),
+            source_owned: false,
+            target: dimensions,
+            dimensions,
+        }),
+    }
 }
 
 pub fn load_original_raster(
@@ -601,6 +761,8 @@ mod tests {
                 formula: None,
                 text_layer: None,
             },
+            generated: None,
+            source_owned: false,
             target: [2, 2],
             dimensions: [2, 2],
         };

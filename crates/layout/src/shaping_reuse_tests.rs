@@ -101,7 +101,7 @@ fn table_measurement_reuse_matches_fresh_shaping_including_bidi_and_hard_breaks(
                 }));
                 assert!(table_shaping::reusable_cell(&block));
                 for width in [50.0, 115.0, 320.0] {
-                    let measured = engine.shape_table_cell(&block, &style, 16_384.0, 8.0, &[]);
+                    let measured = engine.shape_table_cell(&block, &style, 16_384.0, 8.0, &[], None);
                     let scope = timing::TimingScope::start().unwrap();
                     let actual = LayoutEngine::reflow_table_cell(measured, &block, width, 8.0);
                     let timings = scope.finish();
@@ -114,6 +114,7 @@ fn table_measurement_reuse_matches_fresh_shaping_including_bidi_and_hard_breaks(
                         &[],
                         Vec::new(),
                         false,
+                        None,
                     );
                     assert_eq!(
                         reuse_test_geometry(&actual),
@@ -146,15 +147,15 @@ fn naturally_wrapped_measurements_keep_fresh_shaping_to_avoid_round_trip_roundin
     let mut block =
         reuse_test_block("A longer cell that wraps when its measurement is too narrow.");
     block.style.align = TextAlignment::Justify;
-    let narrow = engine.shape_table_cell(&block, &style, 60.0, 8.0, &[]);
+    let narrow = engine.shape_table_cell(&block, &style, 60.0, 8.0, &[], None);
     assert!(!table_shaping::reusable_measurement(&block, &narrow));
-    let wide = engine.shape_table_cell(&block, &style, 16_384.0, 8.0, &[]);
+    let wide = engine.shape_table_cell(&block, &style, 16_384.0, 8.0, &[], None);
     assert!(table_shaping::reusable_measurement(&block, &wide));
     block.content.push(Inline::Break);
     block
         .content
         .extend(reuse_test_block("Another authored line.").content);
-    let broken = engine.shape_table_cell(&block, &style, 16_384.0, 8.0, &[]);
+    let broken = engine.shape_table_cell(&block, &style, 16_384.0, 8.0, &[], None);
     assert!(table_shaping::reusable_measurement(&block, &broken));
 }
 
@@ -167,7 +168,7 @@ fn empty_table_cells_skip_shaping_without_consuming_whitespace_or_breaks() {
     };
     let empty = reuse_test_block("");
     let scope = timing::TimingScope::start().unwrap();
-    let actual = engine.shape_table_cell(&empty, &style, 100.0, 8.0, &[]);
+    let actual = engine.shape_table_cell(&empty, &style, 100.0, 8.0, &[], None);
     let timings = scope.finish();
     assert_eq!(timings.calls(timing::TimingStage::GlyphShape), 0);
     assert_eq!(timings.calls(timing::TimingStage::LineBreak), 0);
@@ -175,7 +176,7 @@ fn empty_table_cells_skip_shaping_without_consuming_whitespace_or_breaks() {
     assert!(actual.lines.is_empty());
     assert_eq!(prepared_text_height(&actual).to_bits(), 0.0_f32.to_bits());
     let expected =
-        engine.shape_text_with_sources(&empty, &style, 100.0, 8.0, &[], Vec::new(), false);
+        engine.shape_text_with_sources(&empty, &style, 100.0, 8.0, &[], Vec::new(), false, None);
     assert!(edge_content_lines(&expected).is_empty());
     assert_eq!(
         actual.available_width.to_bits(),

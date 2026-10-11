@@ -19,8 +19,8 @@ pub(crate) fn cache_pdf_original_source(
     ))
 }
 
-/// Called on the book-opening worker. Legacy results are upgraded once and the
-/// temporary PDF source is dropped before returning the lightweight descriptor.
+/// Upgrade only the lightweight descriptor on the opening worker. Missing
+/// special-page pixels are materialized by the visible-image queue on demand.
 pub(crate) fn open_cached_pdf_ocr_original(
     path: &Path,
     book_id: &str,
@@ -33,10 +33,10 @@ pub(crate) fn open_cached_pdf_ocr_original(
     };
     let mode = load_pdf_ocr_view_mode(book_id, document.view_mode)?;
     let mut loaded = None;
-    if !original_resources_ready(&document)? {
+    if !original_descriptor_ready(&document) {
         let publication =
             rebook_formats::open_file_for_reading(path, Some(book_id)).map_err(io::Error::other)?;
-        document = cache_original_resources(book_id, publication.source().as_ref(), document)?;
+        document = cache_original_descriptor(book_id, publication.source().as_ref(), document)?;
         if mode == PdfOcrViewMode::Original {
             loaded = Some(publication.source());
         }
@@ -65,14 +65,9 @@ fn special_page_href(physical_page: usize) -> String {
     format!("OcrResources/pdf-original-page-{physical_page:05}.png")
 }
 
+#[cfg(test)]
 fn original_resources_ready(document: &StoredPdfOcrDocument) -> io::Result<bool> {
-    let Some(book) = &document.original_book else {
-        return Ok(false);
-    };
-    if book.id.as_str() != document.book_id
-        || book.metadata.layout != RenditionLayout::PrePaginated
-        || book.sections.len() != document.pages.len()
-    {
+    if !original_descriptor_ready(document) {
         return Ok(false);
     }
     let directory = book_directory(&document.book_id)?.join("resources");
@@ -93,27 +88,33 @@ fn original_resources_ready(document: &StoredPdfOcrDocument) -> io::Result<bool>
     Ok(true)
 }
 
-pub(super) fn cache_original_resources(
+fn original_descriptor_ready(document: &StoredPdfOcrDocument) -> bool {
+    let Some(book) = &document.original_book else {
+        return false;
+    };
+    book.id.as_str() == document.book_id
+        && book.metadata.layout == RenditionLayout::PrePaginated
+        && book.sections.len() == document.pages.len()
+}
+
+pub(super) fn cache_original_descriptor(
     book_id: &str,
     original: &dyn BookSource,
     document: StoredPdfOcrDocument,
 ) -> io::Result<StoredPdfOcrDocument> {
-    if original_resources_ready(&document)? {
+    if original_descriptor_ready(&document) {
         return Ok(document);
     }
     let tasks = PDF_OCR_TASKS.get_or_init(|| Mutex::new(HashMap::new()));
     let _tasks = tasks
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // Re-read under the same lock as cloud imports and OCR completion.
     let mut document = load_document(book_id)?.unwrap_or(document);
+    if original_descriptor_ready(&document) {
+        return Ok(document);
+    }
     document.original_book = Some(original.book().clone());
     document.original_toc_origin = original.table_of_contents_origin();
-    store_special_page_images(
-        &book_directory(book_id)?.join("resources"),
-        original,
-        &mut document,
-    )?;
     write_json_atomic(&document_path(book_id)?, &document)?;
     crate::sync::mark_derived_dirty(book_id, crate::sync::DerivedDataKind::Ocr)?;
     Ok(document)
@@ -335,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_results_upgrade_once_and_special_images_sync_with_the_document() {
+    fn legacy_descriptor_upgrade_defers_special_pixels_and_still_syncs() {
         let fixture = Fixture::new("legacy");
         fixture.save(true);
         let mut document = load_document(&fixture.id).unwrap().unwrap();
@@ -352,18 +353,36 @@ mod tests {
             .unwrap()
             .unwrap();
         let repaired = load_document(&fixture.id).unwrap().unwrap();
-        assert!(original_resources_ready(&repaired).unwrap());
-        fs::remove_file(&fixture.pdf).unwrap();
+        assert!(original_descriptor_ready(&repaired));
+        assert!(!original_resources_ready(&repaired).unwrap());
+        let loaded = load_pdf_ocr_source(source.clone(), false, Some(source)).unwrap();
+        let href = PublicationUrl::parse("OcrResources/pdf-original-page-00001.png").unwrap();
+        let dimensions = loaded
+            .source
+            .raster_resource_dimensions(&href)
+            .unwrap()
+            .unwrap();
         assert!(
-            load_pdf_ocr_source(source.clone(), false, Some(source))
-                .unwrap()
-                .source
-                .parse_section(0)
-                .is_ok()
+            !fixture
+                .directory
+                .join("resources/pdf-original-page-00001.png")
+                .exists()
         );
+        // This explicit pixel request must also work after the inactive
+        // original-mode generation has been retired.
+        let raster = loaded.source.raster_resource(&href).unwrap().unwrap();
+        assert_eq!(dimensions, [raster.width, raster.height]);
+        assert!(!raster.pixels.is_empty());
+        assert!(
+            !fixture
+                .directory
+                .join("resources/pdf-original-page-00001.png")
+                .exists()
+        );
+        fs::remove_file(&fixture.pdf).unwrap();
+        assert!(loaded.source.parse_section(0).is_ok());
         let exported = export_pdf_ocr_sync_data(&fixture.id).unwrap().unwrap();
-        assert_eq!(exported.resources.len(), 1);
-        assert!(exported.resources[0].1.starts_with(b"\x89PNG"));
+        assert!(exported.resources.is_empty());
         let receiver = Fixture::new("synced");
         let mut synced: StoredPdfOcrDocument = serde_json::from_slice(&exported.document).unwrap();
         synced.book_id.clone_from(&receiver.id);

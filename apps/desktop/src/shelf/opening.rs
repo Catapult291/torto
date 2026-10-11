@@ -21,6 +21,7 @@ pub(super) struct Opening {
     failed_request: Option<OpenRequest>,
     viewport: Option<LayoutViewport>,
     settings: Option<AppliedSettings>,
+    resolved_viewport: Option<(u64, LayoutViewport)>,
     // Blocking preparation cannot be aborted once running. Keep one worker
     // alive and replace only the queued request while geometry/settings change.
     worker: Option<(u64, tokio::task::JoinHandle<()>)>,
@@ -30,10 +31,40 @@ pub(super) struct Opening {
 pub(crate) type OpenTaskMessage = TaskResult<DesktopReader>;
 pub(crate) struct OpenHeaderMessage {
     pub id: u64,
+    pub viewport: LayoutViewport,
     pub mode: crate::preferences::ReadingMode,
     pub toc: Arc<[rebook_publication::TocEntry]>,
     pub title: Option<String>,
     pub pdf_toolbar: crate::reader::chrome::PdfToolbarState,
+}
+
+fn resolved_open_viewport(
+    mut viewport: LayoutViewport,
+    requested_mode: crate::preferences::ReadingMode,
+    sidebar: crate::reader::chrome::SidebarState,
+    classic: crate::reader::chrome::SidebarState,
+    effective_mode: crate::preferences::ReadingMode,
+) -> LayoutViewport {
+    // The request already excludes the provisional sidebar. Resolve the final
+    // reservation on the worker before any page is prepared, and acknowledge
+    // that geometry in the header rather than restarting the whole book open.
+    let full_width = viewport
+        .width
+        .saturating_add(sidebar.reserved_width(requested_mode).round() as u32);
+    let effective = if requested_mode == effective_mode {
+        sidebar
+    } else {
+        classic.for_mode(effective_mode)
+    };
+    viewport.width = full_width
+        .saturating_sub(
+            effective
+                .constrained(full_width as f32)
+                .reserved_width(effective_mode)
+                .round() as u32,
+        )
+        .max(1);
+    viewport
 }
 
 impl Opening {
@@ -93,6 +124,7 @@ impl Opening {
     }
 
     fn cancel_task(&mut self) {
+        self.resolved_viewport = None;
         if let Some(request) = self.task.active() {
             request
                 .cancelled
@@ -175,7 +207,11 @@ impl Opening {
             .max(1);
         self.viewport = Some(viewport);
         if let Some(mut request) = self.task.active().cloned()
-            && request.viewport != viewport
+            && self
+                .resolved_viewport
+                .filter(|(id, _)| Some(*id) == self.task.active_id())
+                .map_or(request.viewport, |(_, resolved)| resolved)
+                != viewport
         {
             request.viewport = viewport;
             self.queue_replacement(request);
@@ -220,6 +256,7 @@ impl Opening {
         shell.toc = Some(message.toc.clone());
         shell.header_title = message.title;
         shell.pdf_toolbar = message.pdf_toolbar;
+        self.resolved_viewport = Some((message.id, message.viewport));
         Some((shell.book.id.clone(), message.toc))
     }
 
@@ -251,6 +288,11 @@ impl Opening {
             return;
         };
         let id = request.id;
+        let (requested_mode, sidebar) = self.shell.as_ref().map_or(
+            (crate::preferences::ReadingMode::Focus, self.classic_sidebar),
+            |shell| (shell.mode, shell.sidebar),
+        );
+        let classic_sidebar = self.classic_sidebar;
         let proxy = proxy.clone();
         let header_proxy = proxy.clone();
         let worker = runtime.spawn(async move {
@@ -280,13 +322,21 @@ impl Opening {
                     request.store,
                     request.viewport,
                     request.initial_href.as_ref(),
-                    move |toc, mode, title, pdf_toolbar| {
+                    move |toc, mode, title, pdf_toolbar, viewport| {
                         if cancelled.load(std::sync::atomic::Ordering::Acquire) {
-                            return false;
+                            return None;
                         }
+                        let viewport = resolved_open_viewport(
+                            viewport,
+                            requested_mode,
+                            sidebar,
+                            classic_sidebar,
+                            mode,
+                        );
                         let _ = header_proxy.send_event(
                             crate::platform::UserEvent::ShelfOpenHeader(OpenHeaderMessage {
                                 id,
+                                viewport,
                                 mode,
                                 toc: toc.clone(),
                                 title,
@@ -298,7 +348,7 @@ impl Opening {
                         {
                             tracing::warn!(%error, "failed to cache library TOC");
                         }
-                        !cancelled.load(std::sync::atomic::Ordering::Acquire)
+                        (!cancelled.load(std::sync::atomic::Ordering::Acquire)).then_some(viewport)
                     },
                 )
                 .map_err(|error| error.to_string())?;
@@ -533,6 +583,64 @@ impl ShelfFeature {
 mod tests {
     use super::*;
 
+    #[test]
+    fn resolved_pdf_mode_keeps_one_worker_but_real_resizes_replace_it() {
+        use crate::preferences::ReadingMode;
+        let store = store();
+        let mut opening = Opening::default();
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 800.0),
+                )),
+                ..Default::default()
+            },
+            |ui| opening.update_viewport(ui),
+        );
+        output.textures_delta.clear();
+        request(&mut opening, "pdf", &store);
+        let first = opening.take_pending().unwrap();
+        let sidebar = opening.classic_sidebar;
+        let resolved = resolved_open_viewport(
+            first.payload.viewport,
+            ReadingMode::Focus,
+            sidebar.for_mode(ReadingMode::Focus),
+            sidebar,
+            ReadingMode::Classic,
+        );
+        assert_eq!(resolved.width, 1200 - sidebar.width.round() as u32);
+        opening.accept_header(OpenHeaderMessage {
+            id: first.id,
+            viewport: resolved,
+            mode: ReadingMode::Classic,
+            title: None,
+            toc: Arc::from([]),
+            pdf_toolbar: Default::default(),
+        });
+        for (width, should_replace) in [(1200.0, false), (1100.0, true)] {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 800.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| opening.update_viewport(ui),
+            );
+            output.textures_delta.clear();
+            assert_eq!(opening.task.active_id() != Some(first.id), should_replace);
+        }
+        assert!(
+            first
+                .payload
+                .cancelled
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+    }
+
     fn request(opening: &mut Opening, id: &str, store: &SyncStore) {
         opening.begin(
             LibraryBook {
@@ -598,6 +706,7 @@ mod tests {
         let sidebar = opening.shell.as_ref().unwrap().sidebar;
         opening.accept_header(OpenHeaderMessage {
             pdf_toolbar: Default::default(),
+            viewport: crate::reader::default_open_viewport(),
             id: active,
             title: None,
             mode: ReadingMode::Focus,
@@ -779,6 +888,7 @@ mod tests {
             opening
                 .accept_header(OpenHeaderMessage {
                     pdf_toolbar: Default::default(),
+                    viewport: crate::reader::default_open_viewport(),
                     id: first.id,
                     title: Some("Stale chapter".into()),
                     mode: crate::preferences::ReadingMode::Focus,
@@ -793,6 +903,7 @@ mod tests {
             opening
                 .accept_header(OpenHeaderMessage {
                     pdf_toolbar: Default::default(),
+                    viewport: crate::reader::default_open_viewport(),
                     id: current,
                     title: Some("Current chapter".into()),
                     mode: crate::preferences::ReadingMode::Focus,
@@ -813,6 +924,7 @@ mod tests {
             opening
                 .accept_header(OpenHeaderMessage {
                     pdf_toolbar: Default::default(),
+                    viewport: crate::reader::default_open_viewport(),
                     id: current,
                     title: None,
                     toc,

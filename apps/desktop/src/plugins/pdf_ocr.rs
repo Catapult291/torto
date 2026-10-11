@@ -34,7 +34,7 @@ mod cache;
 mod original;
 mod structure;
 pub(crate) use cache::{PdfModeSource, RetiredPdfSource};
-use original::{cache_original_resources, store_special_page_images};
+use original::store_special_page_images;
 pub(crate) use original::{cache_pdf_original_source, open_cached_pdf_ocr_original};
 
 const PDF_OCR_VERSION: u8 = 1;
@@ -271,6 +271,13 @@ impl BookSource for PdfOcrSourceController {
         self.active().raster_resource(href)
     }
 
+    fn raster_resource_dimensions(
+        &self,
+        href: &rebook_publication::PublicationUrl,
+    ) -> Result<Option<[u32; 2]>, rebook_publication::PublicationError> {
+        self.active().raster_resource_dimensions(href)
+    }
+
     fn fixed_page_dimensions(
         &self,
         section_index: usize,
@@ -384,6 +391,8 @@ impl<'a> ConfiguredPdfOcrProvider<'a> {
 
 struct OcrReflowBookSource {
     inner: Arc<dyn BookSource>,
+    original_cache: Option<Arc<PdfModeSource>>,
+    original_pages: OnceLock<Result<Arc<dyn BookSource>, String>>,
     book: Book,
     pages: Vec<StoredOcrPage>,
     page_ranges: Vec<Range<usize>>,
@@ -430,16 +439,16 @@ pub(crate) fn load_pdf_ocr_source(
             mode: PdfOcrViewMode::Original,
         });
     };
-    let document = cache_original_resources(&book_id, source.as_ref(), document)?;
+    let document = original::cache_original_descriptor(&book_id, source.as_ref(), document)?;
     let mode = load_pdf_ocr_view_mode(&book_id, document.view_mode)?;
-    let reflow = Arc::new(OcrReflowBookSource::new(
-        Arc::clone(&source),
-        document,
-        reflow_content,
-    )?);
+    let reflow = Arc::new(
+        OcrReflowBookSource::new(Arc::clone(&source), document, reflow_content)?
+            .with_original_cache(original_cache.clone()),
+    );
     let reflow_page_targets = reflow.page_targets.clone();
     let reload_original = source.clone();
     let reload_id = book_id.clone();
+    let reload_original_cache = original_cache.clone();
     let reflow_cache = Arc::new(PdfModeSource::new(
         reflow.book().clone(),
         reflow.table_of_contents_origin(),
@@ -449,6 +458,7 @@ pub(crate) fn load_pdf_ocr_source(
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| "Cached OCR document is missing".to_owned())?;
             OcrReflowBookSource::new(reload_original.clone(), document, reflow_content)
+                .map(|source| source.with_original_cache(reload_original_cache.clone()))
                 .map(|source| Arc::new(source) as Arc<dyn BookSource>)
                 .map_err(|error| error.to_string())
         },
@@ -2000,6 +2010,8 @@ impl OcrReflowBookSource {
         let html_context = rebook_formats::HtmlContext::new(&book.table_of_contents, Vec::new());
         html_context.mark_note_sections(&mut book.sections);
         Ok(Self {
+            original_cache: None,
+            original_pages: OnceLock::new(),
             inner,
             book,
             pages,
@@ -2012,6 +2024,45 @@ impl OcrReflowBookSource {
             html_context,
             normalize: reflow_content,
         })
+    }
+
+    fn with_original_cache(mut self, cache: Option<Arc<PdfModeSource>>) -> Self {
+        self.original_cache = cache;
+        self
+    }
+
+    fn original_pages(&self) -> Result<Arc<dyn BookSource>, PublicationError> {
+        self.original_pages
+            .get_or_init(|| {
+                self.original_cache
+                    .as_ref()
+                    .map_or_else(|| Ok(self.inner.clone()), |cache| cache.lease())
+            })
+            .as_ref()
+            .map(Arc::clone)
+            .map_err(|error| PublicationError::InvalidPublication(error.clone()))
+    }
+
+    fn missing_original_page(&self, href: &PublicationUrl) -> Option<usize> {
+        let url = href.resource_url();
+        let page = url
+            .path()
+            .strip_prefix("OcrResources/pdf-original-page-")?
+            .strip_suffix(".png")?
+            .parse::<usize>()
+            .ok()?;
+        let index = page.checked_sub(1)?;
+        if !self.page_roles.contains_key(&index) {
+            return None;
+        }
+        if self
+            .resources
+            .get(url.path())
+            .is_some_and(|r| r.path.is_file())
+        {
+            return None;
+        }
+        Some(index)
     }
 }
 
@@ -2263,7 +2314,14 @@ impl BookSource for OcrReflowBookSource {
             );
             if self.page_roles.contains_key(&page_index) {
                 let href = format!("OcrResources/pdf-original-page-{:05}.png", page_index + 1);
-                if self.resources.contains_key(&href) {
+                // A missing original PDF must not hide otherwise usable cached OCR text.
+                // Leasing its metadata is cheap and does not rasterize the page.
+                if self
+                    .resources
+                    .get(&href)
+                    .is_some_and(|resource| resource.path.is_file())
+                    || self.original_pages().is_ok()
+                {
                     let _ = write!(
                         body,
                         r#"<img src="{}" alt="PDF page {}" style="display:block;max-width:100%;max-height:100%;margin:0 auto" />"#,
@@ -2273,8 +2331,6 @@ impl BookSource for OcrReflowBookSource {
                     body.push_str("<br />");
                     continue;
                 }
-                // A missing derived image must not synchronously open the PDF.
-                // Keep the cached OCR text visible until resources are repaired.
             }
             let markdown = self
                 .pages
@@ -2315,6 +2371,12 @@ impl BookSource for OcrReflowBookSource {
     }
 
     fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
+        if let Some(index) = self.missing_original_page(href) {
+            let original = PublicationUrl::parse(&format!("Pages/page-{:05}.png", index + 1))?;
+            let mut resource = self.original_pages()?.resource(&original)?;
+            resource.href = href.resource_url();
+            return Ok(resource);
+        }
         let resource_url = href.resource_url();
         let path = resource_url.path();
         if let Some(resource) = self.resources.get(path) {
@@ -2336,8 +2398,25 @@ impl BookSource for OcrReflowBookSource {
 
     fn raster_resource(
         &self,
-        _href: &PublicationUrl,
+        href: &PublicationUrl,
     ) -> Result<Option<RasterResource>, PublicationError> {
+        if let Some(index) = self.missing_original_page(href) {
+            let original = PublicationUrl::parse(&format!("Pages/page-{:05}.png", index + 1))?;
+            return self.original_pages()?.raster_resource(&original);
+        }
+        Ok(None)
+    }
+
+    fn raster_resource_dimensions(
+        &self,
+        href: &PublicationUrl,
+    ) -> Result<Option<[u32; 2]>, PublicationError> {
+        if let Some(index) = self.missing_original_page(href) {
+            return self
+                .original_pages()?
+                .fixed_page_dimensions(index)
+                .map(|size| size.map(|size| [size.width, size.height]));
+        }
         Ok(None)
     }
 }

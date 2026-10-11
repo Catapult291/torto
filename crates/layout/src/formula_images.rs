@@ -1,5 +1,6 @@
 use super::*;
 use rebook_publication::{ImageFormula, InlineImageRun};
+#[cfg(test)]
 use resvg::tiny_skia::{Pixmap, Transform};
 
 pub(super) fn only_formula(block: &TextBlock) -> Option<(&InlineImageRun, Option<String>)> {
@@ -42,6 +43,7 @@ pub(super) fn inline(
     original: RasterImage,
     id: u64,
     index: usize,
+    deferred: Option<(&dyn BookSource, u64)>,
 ) -> Result<PreparedInlineImage, String> {
     if formula.equation_number.is_some() {
         return Err("Numbered formula requires a display row".into());
@@ -52,8 +54,9 @@ pub(super) fn inline(
         display: false,
         size_scale: scale,
     };
-    let (image, w, h) = rasterize_formula(&math, typography, color, width, options)?;
-    let (box_height, offset_y) = math_vertical_metrics(&math, typography, h)?;
+    let prepared = formula_raster::prepare(&math, typography, color, width, options, deferred)?;
+    let (box_height, offset_y) = prepared.vertical_metrics(prepared.height);
+    let (image, w, h) = prepared.into_tuple();
     Ok(PreparedInlineImage {
         formula_presentation: Some(FormulaPresentation {
             original,
@@ -67,24 +70,6 @@ pub(super) fn inline(
         box_height,
         offset_y,
     })
-}
-
-pub(super) fn math_vertical_metrics(
-    math: &MathRun,
-    typography: &ReaderTypography,
-    h: f32,
-) -> Result<(f32, f32), String> {
-    let size = (typography.font_size
-        * math.size_scale.clamp(0.5, 3.0)
-        * if math.display { 1.12 } else { 1.0 })
-    .max(typography.minimum_font_size);
-    let metrics = rebook_math::math::render_math(&math.latex, size, "#000000", math.display)?;
-    // rasterize_formula uses a 1.5-pixel padding on each side.
-    let ratio = h / (metrics.ascent + metrics.descent + 3.0).max(1.0);
-    let below = (metrics.descent + 1.5) * ratio;
-    let above = (h - below).max(size * 0.8);
-    let box_height = (above + below.max(size * 0.2)).max(h);
-    Ok((box_height, box_height - h + below))
 }
 
 #[cfg(test)]
@@ -735,63 +720,34 @@ pub(super) fn padded_display_row(
     let content_width = if number.is_some() { inner_width } else { bw };
     let width = content_width + pad_x * 2.0;
     let height = content_height + pad_y * 2.0;
-    let scale = 2.0;
-    let mut canvas = Pixmap::new(
-        (width * scale).ceil().max(1.0) as u32,
-        (height * scale).ceil().max(1.0) as u32,
-    )?;
-    let mut draw = |image: &RasterImage, x: f32, y: f32, w: f32, h: f32| -> Option<()> {
-        let size = resvg::tiny_skia::IntSize::from_wh(image.width, image.height)?;
-        let pixels = Pixmap::from_vec(image.pixels.to_vec(), size)?;
-        canvas.draw_pixmap(
-            0,
-            0,
-            pixels.as_ref(),
-            &resvg::tiny_skia::PixmapPaint::default(),
-            Transform::from_scale(
-                w * scale / image.width as f32,
-                h * scale / image.height as f32,
-            )
-            .post_translate(x * scale, y * scale),
-            None,
-        );
-        Some(())
-    };
-    draw(
-        &body,
-        pad_x + (content_width - bw) * 0.5,
-        pad_y
+    let mut layers = vec![formula_raster::Placement {
+        image: body,
+        x: pad_x + (content_width - bw) * 0.5,
+        y: pad_y
             + if stacked {
                 0.0
             } else {
                 (content_height - bh) * 0.5
             },
-        bw,
-        bh,
-    )?;
+        width: bw,
+        height: bh,
+    }];
     if let Some((number, w, h)) = number {
-        draw(
-            &number,
-            pad_x + content_width - w,
-            pad_y
+        layers.push(formula_raster::Placement {
+            image: number,
+            x: pad_x + content_width - w,
+            y: pad_y
                 + if stacked {
                     bh + stack_gap
                 } else {
                     (content_height - h) * 0.5
                 },
-            w,
-            h,
-        )?;
+            width: w,
+            height: h,
+        });
     }
     Some((
-        RasterImage {
-            deferred: None,
-            origin: None,
-            blob: None,
-            width: canvas.width(),
-            height: canvas.height(),
-            pixels: canvas.take().into(),
-        },
+        formula_raster::compose(width, height, layers)?,
         width,
         height,
     ))
@@ -813,16 +769,25 @@ impl LayoutEngine {
         if formula.is_none() && (number.is_none() || original_run.is_none()) {
             return Ok(false);
         }
-        // An inferred equation may lack formula metadata on its source image.
-        // Always retain exact original pixels for the formula preview.
+        // Recognized formulas need only original dimensions at layout time.
+        // An inferred equation without LaTeX still composites its original pixels.
         let mut original_image = image.clone();
         original_image.formula_image = true;
-        let original = raster_cache::load(
-            source,
-            &original_image,
-            self.raster_target,
-            self.raster_generation,
-        )?;
+        let original = if self.deferred_images && formula.is_some() {
+            raster_cache::prepare(
+                source,
+                &original_image,
+                self.raster_target,
+                self.raster_generation,
+            )?
+        } else {
+            raster_cache::load(
+                source,
+                &original_image,
+                self.raster_target,
+                self.raster_generation,
+            )?
+        };
         if let (Some(authored), Some(recognized)) =
             (number, formula.and_then(|f| f.equation_number.as_deref()))
         {
@@ -849,7 +814,7 @@ impl LayoutEngine {
             } else {
                 format!("({number})")
             };
-            rasterize_formula(
+            formula_raster::prepare(
                 &MathRun {
                     original: None,
                     latex: format!(r"\text{{{label}}}"),
@@ -860,7 +825,10 @@ impl LayoutEngine {
                 style.foreground,
                 inner_width,
                 &self.svg_options,
+                self.deferred_images
+                    .then_some((source, self.raster_generation)),
             )
+            .map(formula_raster::PreparedFormula::into_tuple)
             .ok()
         });
         // A number must never disappear when its renderer rejects the label.
@@ -879,7 +847,7 @@ impl LayoutEngine {
             })
         };
         let rendered = if let Some(formula) = formula {
-            rasterize_formula(
+            formula_raster::prepare(
                 &MathRun {
                     original: None,
                     latex: formula.latex.clone(),
@@ -890,7 +858,10 @@ impl LayoutEngine {
                 style.foreground,
                 usable,
                 &self.svg_options,
+                self.deferred_images
+                    .then_some((source, self.raster_generation)),
             )
+            .map(formula_raster::PreparedFormula::into_tuple)
         } else {
             let prepared = prepare_inline_raster(
                 original_run.expect("checked original run"),

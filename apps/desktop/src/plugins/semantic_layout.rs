@@ -600,6 +600,13 @@ impl BookSource for SemanticLayoutSource {
     ) -> Result<Option<RasterResource>, PublicationError> {
         self.inner.raster_resource(href)
     }
+    fn raster_resource_dimensions(
+        &self,
+        href: &rebook_publication::PublicationUrl,
+    ) -> Result<Option<[u32; 2]>, rebook_publication::PublicationError> {
+        self.inner.raster_resource_dimensions(href)
+    }
+
     fn fixed_page_dimensions(
         &self,
         index: usize,

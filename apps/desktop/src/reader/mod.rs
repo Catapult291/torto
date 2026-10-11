@@ -179,7 +179,7 @@ pub(crate) fn open_reader_in_viewport(
         local_store,
         viewport,
         None,
-        |_, _, _, _| true,
+        |_, _, _, _, viewport| Some(viewport),
     )
 }
 
@@ -197,7 +197,8 @@ pub(crate) fn open_reader_staged(
         ReadingMode,
         Option<String>,
         chrome::PdfToolbarState,
-    ) -> bool,
+        LayoutViewport,
+    ) -> Option<LayoutViewport>,
 ) -> Result<DesktopReader, Box<dyn std::error::Error + Send + Sync>> {
     let started = Instant::now();
     let publication_started = Instant::now();
@@ -345,7 +346,7 @@ pub(crate) fn open_reader_staged(
             chrome::toc_label_for_href(&canonical_source.book().table_of_contents, href)
         })
         .map(str::to_owned);
-    if !publish_toc(
+    let Some(viewport) = publish_toc(
         canonical_source.book().table_of_contents.clone().into(),
         reading_mode,
         initial_title,
@@ -353,11 +354,12 @@ pub(crate) fn open_reader_staged(
             available: pdf_ocr_available,
             mode: pdf_ocr_mode,
         },
-    ) {
+        viewport,
+    ) else {
         return Err(
             std::io::Error::new(std::io::ErrorKind::Interrupted, "superseded book open").into(),
         );
-    }
+    };
     let fixed_page = canonical_source.book().metadata.layout == RenditionLayout::PrePaginated;
     let rewrite_source = Arc::new(RewriteBookSource::new(canonical_source));
     let translation_source = Arc::new(if fixed_page {
@@ -499,6 +501,8 @@ pub(crate) fn open_reader_staged(
                 Field::F32("image_decode_ms", ms(TimingStage::ImageDecode)),
                 Field::F32("image_pixels_ms", ms(TimingStage::ImagePixels)),
                 Field::F32("layout_ms", ms(TimingStage::Layout)),
+                Field::F32("formula_layout_ms", ms(TimingStage::FormulaLayout)),
+                Field::F32("formula_raster_ms", ms(TimingStage::FormulaRaster)),
                 Field::F32("glyph_shape_ms", ms(TimingStage::GlyphShape)),
                 Field::F32("hyphenation_ms", ms(TimingStage::Hyphenation)),
                 Field::F32("line_break_ms", ms(TimingStage::LineBreak)),
@@ -767,6 +771,7 @@ pub(super) struct DesktopReader {
     statistics: crate::statistics::Tracker,
     reader: ReaderSession,
     images: images::ImageLoader,
+    opening_prefetch_pending: bool,
     source: Arc<dyn BookSource>,
     rewrite_source: Arc<RewriteBookSource>,
     translation_source: Arc<TranslationBookSource>,
@@ -2316,6 +2321,9 @@ impl DesktopReader {
     }
 
     pub(crate) fn mark_open_presented(&mut self, ctx: &egui::Context) {
+        if std::mem::take(&mut self.opening_prefetch_pending) {
+            self.prefetch();
+        }
         if std::mem::take(&mut self.ui.opening_toolbar_pending) {
             if !self.ui.toolbar_hovered && self.ui.overlay != ReaderOverlay::Menu {
                 self.ui.schedule_toolbar_hide(Instant::now());
@@ -3389,6 +3397,11 @@ impl DesktopReader {
         let layout = self.scroll_section.as_ref()?;
         let padding = self.scroll_content_padding(viewport.size.y);
         let (index, local_y) = layout.page_at_content_y(viewport.offset_y + y - padding)?;
+        // Hit testing an unloaded fixed page must not wait for its background
+        // raster. The normal viewport materialization path publishes it later.
+        if layout.pages[index].placeholder {
+            return None;
+        }
         Some((layout.pages[index].position, x, local_y))
     }
 
@@ -4324,7 +4337,7 @@ impl DesktopReader {
         clippy::too_many_lines,
         reason = "reader construction keeps all UI state defaults visible in one place"
     )]
-    fn new(mut reader: ReaderSession, resources: DesktopReaderResources) -> Self {
+    fn new(reader: ReaderSession, resources: DesktopReaderResources) -> Self {
         let DesktopReaderResources {
             source,
             rewrite_source,
@@ -4353,10 +4366,9 @@ impl DesktopReader {
             sync_password,
             source_path,
         } = resources;
-        let error = reader
-            .prefetch_adjacent()
-            .err()
-            .map(|error| error.to_string());
+        // Adjacent pages are speculative. Start them only after the current
+        // body has been presented, so preparation never competes with handoff.
+        let error = None;
         let snapshot = reader.snapshot();
         let expanded_toc = snapshot.active_toc_path.iter().cloned().collect();
         let scroll_target_position =
@@ -4429,6 +4441,7 @@ impl DesktopReader {
         Self {
             reader,
             images: images::ImageLoader::default(),
+            opening_prefetch_pending: true,
             completion: None,
             semantic_layout: Default::default(),
             statistics: crate::statistics::Tracker::new(&book_id),

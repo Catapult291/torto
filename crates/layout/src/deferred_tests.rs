@@ -56,6 +56,150 @@ fn image(name: &str) -> ImageBlock {
         text_layer: None,
     }
 }
+
+#[test]
+fn source_formula_images_defer_pixels_in_both_presentation_modes() {
+    let source = Source::new("deferred-source-formula-pixels");
+    let viewport = LayoutViewport::new(500, 700).unwrap();
+    for unified in [false, true] {
+        let mut style = ReaderStyle::default();
+        if unified {
+            style.typesetting = ReaderTypesetting::unified();
+        }
+        let mut block = image("formula.png");
+        block.formula_image = true;
+        block.formula = Some(rebook_publication::ImageFormula {
+            latex: r"\frac{x+1}{2}".into(),
+            equation_number: Some("1.2".into()),
+        });
+        let mut engine = LayoutEngine::new();
+        engine.set_deferred_images(true);
+        let scope = timing::TimingScope::start().unwrap();
+        let layout = engine
+            .layout_blocks(&source, &[Block::Image(block)], viewport, &style)
+            .unwrap();
+        let timings = scope.finish();
+        assert_eq!(timings.calls(timing::TimingStage::ImageDecode), 0);
+        assert_eq!(timings.calls(timing::TimingStage::FormulaRaster), 0);
+        let placed = layout
+            .pages
+            .iter()
+            .flat_map(|page| &page.items)
+            .find_map(|item| {
+                if let PageItem::Image(image) = item {
+                    Some(image)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let presentation = placed.formula_presentation.as_ref().unwrap();
+        assert!(presentation.original.pixels.is_empty());
+        assert_eq!(
+            [presentation.original.width, presentation.original.height],
+            [240, 160]
+        );
+        assert!(placed.image.pixels.is_empty());
+        let request = placed.image.deferred.as_ref().unwrap();
+        request.load(&source).unwrap();
+        assert!(!request.ready_for_test().unwrap().pixels.is_empty());
+        retire_publication_rasters(source.book.id.as_str(), false);
+    }
+}
+
+#[test]
+fn formulas_reserve_exact_geometry_and_rasterize_only_when_requested() {
+    let source = Source::new("deferred-formula-pixels");
+    let typography = ReaderTypography::default();
+    let options = resvg::usvg::Options::default();
+    for (display, original) in [
+        (false, None),
+        (true, None),
+        (
+            true,
+            Some(vec![TextRun {
+                text: "original formula".into(),
+                style: Default::default(),
+                link: None,
+            }]),
+        ),
+    ] {
+        let block = text(
+            TextBlockKind::Paragraph,
+            vec![
+                Inline::Math(MathRun {
+                    latex: r"\frac{x_1+1}{2}".into(),
+                    display,
+                    original: original.clone(),
+                    size_scale: 1.0,
+                }),
+                Inline::Math(MathRun {
+                    latex: r"y^2+z".into(),
+                    display,
+                    original,
+                    size_scale: 1.0,
+                }),
+            ],
+        );
+        let (_, _, eager, _, _, _) = prepare_inline_content(
+            &block,
+            Rgba::BLACK,
+            &typography,
+            320.0,
+            &options,
+            false,
+            true,
+            false,
+            &[],
+            &mut [],
+            None,
+        );
+        let capture = timing::TimingScope::start().unwrap();
+        let (_, _, lazy, _, _, _) = prepare_inline_content(
+            &block,
+            Rgba::BLACK,
+            &typography,
+            320.0,
+            &options,
+            false,
+            true,
+            false,
+            &[],
+            &mut [],
+            Some((&source, raster_cache::generation())),
+        );
+        assert_eq!(
+            capture.finish().calls(timing::TimingStage::FormulaRaster),
+            0
+        );
+        assert_eq!(eager.len(), 2);
+        for (eager, lazy) in eager.iter().zip(&lazy) {
+            assert_eq!(
+                (eager.width, eager.height, eager.box_height, eager.offset_y),
+                (lazy.width, lazy.height, lazy.box_height, lazy.offset_y)
+            );
+            assert!(lazy.image.pixels.is_empty());
+            let pixels = lazy
+                .image
+                .deferred
+                .as_ref()
+                .unwrap()
+                .render_generated()
+                .unwrap();
+            assert_eq!(
+                (pixels.width, pixels.height),
+                (eager.image.width, eager.image.height)
+            );
+            assert_eq!(pixels.pixels, eager.image.pixels);
+        }
+        let first = lazy[0].image.deferred.as_ref().unwrap();
+        let offscreen = lazy[1].image.deferred.as_ref().unwrap();
+        first.load(&source).unwrap();
+        assert!(first.ready_for_test().is_some());
+        assert!(offscreen.ready_for_test().is_none());
+        retire_publication_rasters(source.book.id.as_str(), false);
+    }
+}
 fn text(kind: TextBlockKind, content: Vec<Inline>) -> TextBlock {
     TextBlock {
         kind,
