@@ -85,6 +85,163 @@ mod tests {
     use rebook_layout::LayoutViewport;
 
     #[test]
+    #[ignore = "requires TORTO_HIGHLIGHT_BOOK local EPUB and native GPU; checks cross-page highlight pixels"]
+    fn local_cross_page_highlight_has_no_seam() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let store = crate::sync::SyncStore::open_at(
+            std::env::temp_dir().join(format!("highlight-audit-{}.sqlite3", uuid::Uuid::new_v4())),
+            "highlight-audit",
+        )
+        .unwrap();
+        let mut reader = crate::reader::open_reader_in_viewport(
+            &std::path::PathBuf::from(std::env::var_os("TORTO_HIGHLIGHT_BOOK").unwrap()),
+            crate::fonts::embedded_reader_fonts(),
+            None,
+            None,
+            store,
+            LayoutViewport::new(900, 240).unwrap(),
+        )
+        .unwrap();
+        reader.progress_store = None;
+        let mut style = reader.reader.style().clone();
+        style.spread = rebook_layout::SpreadMode::Scroll;
+        style.typesetting = rebook_layout::ReaderTypesetting::unified();
+        reader.reader.set_style(style).unwrap();
+        let target = reader
+            .reader
+            .toc_items()
+            .iter()
+            .find(|item| item.label.contains("2.3 N-GRAM"))
+            .unwrap()
+            .target
+            .clone()
+            .unwrap();
+        reader.reader.go_to_href(&target).unwrap();
+        reader.reading_mode = ReadingMode::Focus;
+        let layout = reader.current_scroll_layout().unwrap();
+        reader.rebuild_focus_units(&layout);
+        reader.focus_unit_index = reader
+            .focus_units
+            .iter()
+            .position(|unit| unit.text.contains("The results are shown"))
+            .unwrap();
+        let ranges = reader.focus_units[reader.focus_unit_index]
+            .paint_ranges
+            .clone();
+        let mut rects = Vec::new();
+        let mut pages = Vec::new();
+        for (index, entry) in layout.pages.iter().enumerate() {
+            let local = entry.page.source_rects(&ranges);
+            if local.is_empty() {
+                continue;
+            }
+            pages.push(index);
+            rects.extend(local.into_iter().map(|rect| {
+                rect + kurbo::Vec2::new(
+                    0.,
+                    f64::from(layout.page_tops[index] - layout.page_origins[index]),
+                )
+            }));
+        }
+        assert!(
+            pages.len() > 1,
+            "fixture must split the active paragraph across logical pages"
+        );
+        let edge = layout.page_tops[pages[1]];
+        println!("HIGHLIGHT_PAGE_EDGE {edge}, pages={pages:?}");
+        let padding = reader.scroll_content_padding(240.);
+        reader.scroll_viewport = Some(ScrollViewportState {
+            offset_y: edge + padding - 100.325,
+            size: egui::vec2(900., 240.),
+        });
+        let mut layers = reader.layered_scene().unwrap();
+        layers.layers.retain(|layer| layer.identity.is_none());
+        let plan = ReaderFramePlan {
+            rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900., 240.)),
+            scene_id: 1,
+            scene_revision: 1,
+            background: peniko::Color::from_rgb8(212, 210, 206),
+        };
+        let mut audit = crate::platform::LayerAudit::new([1400, 400]);
+        // Keep the former page-mask composition as a diagnostic reference.
+        let mut page_masked = vello::Scene::new();
+        let viewport = reader.scroll_viewport.unwrap();
+        for index in &pages {
+            let page = &layout.pages[*index].page;
+            let origin = layout.page_origins[*index];
+            let clip = kurbo::Rect::new(
+                0.,
+                f64::from(origin),
+                f64::from(page.width()),
+                f64::from(origin + layout.page_heights[*index]),
+            );
+            let mut fragment = vello::Scene::new();
+            fragment.push_clip_layer(peniko::Fill::NonZero, kurbo::Affine::IDENTITY, &clip);
+            reader.paint_page_overlays(page, &mut super::VelloScene::new(&mut fragment), 0.);
+            fragment.pop_layer();
+            page_masked.append(
+                &fragment,
+                Some(kurbo::Affine::translate((
+                    0.,
+                    f64::from(layout.page_tops[*index] + padding - viewport.offset_y - origin),
+                ))),
+            );
+        }
+        for scale in [0.925, 1., 1.25, 1.5] {
+            let scene = crate::reader::ReaderScene {
+                scene: std::sync::Arc::new(layers.flatten()),
+                images: std::sync::Arc::from([]),
+                refresh_image_atlas: false,
+            };
+            audit.direct(&scene, plan, scale);
+            let pixels = audit.pixels();
+            let pair = rects
+                .windows(2)
+                .find(|pair| {
+                    (pair[0].y1 - f64::from(edge)).abs() < 1.
+                        && (pair[1].y0 - f64::from(edge)).abs() < 1.
+                })
+                .unwrap();
+            let x = ((pair[0].x0.max(pair[1].x0) + pair[0].x1.min(pair[1].x1))
+                * 0.5
+                * f64::from(scale)) as usize;
+            let sample = |y: usize| &pixels[(y * 1400 + x) * 4..(y * 1400 + x) * 4 + 4];
+            let boundary = (100.325 * f64::from(scale)) as usize;
+            let expected = sample(boundary - 6);
+            let legacy = crate::reader::ReaderScene {
+                scene: std::sync::Arc::new(page_masked.clone()),
+                images: std::sync::Arc::from([]),
+                refresh_image_atlas: false,
+            };
+            audit.direct(&legacy, plan, scale);
+            let legacy_pixels = audit.pixels();
+            let legacy_sample =
+                &legacy_pixels[(boundary * 1400 + x) * 4..(boundary * 1400 + x) * 4 + 4];
+            println!(
+                "HIGHLIGHT_PIXELS scale={scale} page_masked={legacy_sample:?} combined={:?} interior={expected:?}",
+                sample(boundary)
+            );
+            for y in boundary - 1..=boundary + 1 {
+                assert!(
+                    sample(y)
+                        .iter()
+                        .zip(expected)
+                        .all(|(a, b)| a.abs_diff(*b) <= 1),
+                    "scale={scale} boundary={boundary} y={y}: {:?} != {expected:?}",
+                    sample(y)
+                );
+            }
+            for _ in 0..64 {
+                if !audit.layered(&layers, plan, scale).0.pending {
+                    break;
+                }
+            }
+            audit.parity(&pixels, &format!("highlight-seam-{scale}"));
+        }
+    }
+
+    #[test]
     #[ignore = "requires a local publication and native GPU; verifies real-book pixels and scrolling"]
     fn local_book_layers_match_direct_rendering_and_reuse_scrolling_tiles() {
         let path = std::path::PathBuf::from(std::env::var_os("TORTO_LAYER_BOOK").unwrap());
@@ -236,6 +393,8 @@ impl DesktopReader {
             let mut backdrop = Scene::new();
             let bounds = self.paint_scroll_backdrop(&mut backdrop, viewport, padding);
             result.dynamic(backdrop, measured_clip(window, Some(bounds)), (0.0, 0.0));
+            let mut text_layers = LayeredReaderScene { layers: Vec::new() };
+            let mut foreground_layers = LayeredReaderScene { layers: Vec::new() };
             for (index, entry) in layout.pages.iter().enumerate() {
                 let top = layout.page_tops[index] + padding;
                 let bottom = top + layout.page_heights[index];
@@ -260,12 +419,7 @@ impl DesktopReader {
                     clip,
                     offset,
                 );
-                let mut overlays = Scene::new();
-                let mut bridge = VelloScene::measuring(&mut overlays);
-                self.paint_page_overlays(&entry.page, &mut bridge, 0.0);
-                let overlay_clip = measured_clip(clip, bridge.painted_bounds());
-                result.dynamic(overlays, overlay_clip, offset);
-                result.retained(
+                text_layers.retained(
                     (cached.generation, 1),
                     LayerContent::Scene(Arc::clone(&cached.content)),
                     clip,
@@ -276,8 +430,13 @@ impl DesktopReader {
                 self.paint_page_foreground(&entry.page, &mut bridge, 0.0);
                 let border_clip = Rect::new(clip.x0, clip.y0 - 4.0, clip.x1, clip.y1 + 4.0);
                 let foreground_clip = measured_clip(border_clip, bridge.painted_bounds());
-                result.dynamic(foreground, foreground_clip, offset);
+                foreground_layers.dynamic(foreground, foreground_clip, offset);
             }
+            let mut overlays = Scene::new();
+            let bounds = self.paint_scroll_overlays(&mut overlays, &layout, viewport, padding);
+            result.dynamic(overlays, measured_clip(window, Some(bounds)), (0.0, 0.0));
+            result.layers.extend(text_layers.layers);
+            result.layers.extend(foreground_layers.layers);
             let mut bridges = Scene::new();
             let bounds = self.paint_scroll_bridges(&mut bridges, &layout, viewport, padding);
             result.dynamic(bridges, measured_clip(window, Some(bounds)), (0.0, 0.0));

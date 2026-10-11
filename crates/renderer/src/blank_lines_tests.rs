@@ -90,6 +90,20 @@ fn blank_lines_have_no_highlight_but_remain_in_copied_text() {
             }
             let active = display.source_rects(std::slice::from_ref(&source));
             assert!(!active.is_empty());
+            let clip = Rect::new(48.0, 33.0, 140.0, 60.0);
+            let path = display.source_highlight_path_in(std::slice::from_ref(&source), clip);
+            if active.iter().any(|rect| {
+                let intersection = rect.intersect(clip);
+                intersection.width() > 0.0 && intersection.height() > 0.0
+            }) {
+                assert!(!path.is_empty());
+                let bounds = path.bounding_box();
+                assert!(bounds.x0 >= clip.x0 && bounds.x1 <= clip.x1);
+                assert!(bounds.y0 >= clip.y0 - HIGHLIGHT_VERTICAL_OVERLAP);
+                assert!(bounds.y1 <= clip.y1 + HIGHLIGHT_VERTICAL_OVERLAP);
+            } else {
+                assert!(path.is_empty());
+            }
             for (i, top, bottom, range) in &blank_lines {
                 if !lines.contains(i) {
                     continue;

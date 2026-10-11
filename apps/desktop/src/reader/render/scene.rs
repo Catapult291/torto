@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use kurbo::{Affine, Rect, RoundedRect, Shape};
+use kurbo::{Affine, BezPath, Rect, RoundedRect, Shape};
 use peniko::{Color, Fill, ImageData};
 use rebook_formats::BookFormat;
 use rebook_layout::quote_accent_color;
@@ -188,6 +188,8 @@ impl DesktopReader {
         let mut scene = Scene::new();
         self.paint_scroll_backdrop(&mut scene, viewport, content_padding);
         let mut images = Vec::new();
+        let mut text = Scene::new();
+        let mut foreground = Scene::new();
         for (index, entry) in layout.pages.iter().enumerate() {
             let top = layout.page_tops[index] + content_padding;
             let bottom = top + layout.page_heights[index];
@@ -216,25 +218,125 @@ impl DesktopReader {
                 0.0,
                 Some(visible_clip),
             ));
-            self.paint_page_overlays(&entry.page, &mut VelloScene::new(&mut page_scene), 0.0);
-            page_scene.append(&layers.content, None);
             page_scene.pop_layer();
+            let transform = Affine::translate((
+                0.0,
+                f64::from(top - viewport.offset_y - layout.page_origins[index]),
+            ));
+            scene.append(&page_scene, Some(transform));
+            let mut page_text = Scene::new();
+            page_text.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
+            page_text.append(&layers.content, None);
+            page_text.pop_layer();
+            text.append(&page_text, Some(transform));
             // Borders and reference bars can extend into inter-paragraph space.
             // Keep the text clip intact while preserving foreground indicators.
             let border_clip = Rect::new(clip.x0, clip.y0 - 4.0, clip.x1, clip.y1 + 4.0);
-            page_scene.push_clip_layer(peniko::Fill::NonZero, Affine::IDENTITY, &border_clip);
-            self.paint_page_foreground(&entry.page, &mut VelloScene::new(&mut page_scene), 0.0);
-            page_scene.pop_layer();
-            scene.append(
-                &page_scene,
-                Some(Affine::translate((
-                    0.0,
-                    f64::from(top - viewport.offset_y - layout.page_origins[index]),
-                ))),
+            let mut page_foreground = Scene::new();
+            page_foreground.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &border_clip);
+            self.paint_page_foreground(
+                &entry.page,
+                &mut VelloScene::new(&mut page_foreground),
+                0.0,
             );
+            page_foreground.pop_layer();
+            foreground.append(&page_foreground, Some(transform));
         }
+        self.paint_scroll_overlays(&mut scene, &layout, viewport, content_padding);
+        scene.append(&text, None);
+        scene.append(&foreground, None);
         self.paint_scroll_bridges(&mut scene, &layout, viewport, content_padding);
         ReaderScene::new(scene, images.into())
+    }
+
+    pub(super) fn paint_scroll_overlays(
+        &self,
+        scene: &mut Scene,
+        layout: &super::super::ScrollSectionLayout,
+        viewport: super::super::ScrollViewportState,
+        padding: f32,
+    ) -> Rect {
+        let mut bounds: Option<Rect> = None;
+        // Compose one fill per mark in scroll coordinates. Per-page GPU clip
+        // masks would cut off the AA overlap and expose a seam inside a paragraph.
+        let mut paint = |ranges: &[rebook_publication::SourceRange],
+                         color: Color,
+                         exclude_tables: bool,
+                         exclude_images: bool| {
+            let mut path = BezPath::new();
+            for index in layout.geometry_pages(ranges) {
+                let top = layout.page_tops[index] + padding;
+                if top + layout.page_heights[index] <= viewport.offset_y
+                    || top >= viewport.offset_y + viewport.size.y
+                {
+                    continue;
+                }
+                let page = &layout.pages[index].page;
+                let selected;
+                let ranges = if exclude_tables || exclude_images {
+                    selected = ranges
+                        .iter()
+                        .filter(|range| {
+                            (!exclude_tables
+                                || page
+                                    .source_table_bounds(std::slice::from_ref(*range))
+                                    .is_empty())
+                                && (!exclude_images
+                                    || page
+                                        .image_source_rects(std::slice::from_ref(*range))
+                                        .is_empty())
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    selected.as_slice()
+                } else {
+                    ranges
+                };
+                let origin = layout.page_origins[index];
+                let clip = Rect::new(
+                    0.0,
+                    f64::from(origin),
+                    f64::from(page.width()),
+                    f64::from(origin + layout.page_heights[index]),
+                );
+                let mut fragment = page.source_highlight_path_in(ranges, clip);
+                fragment.apply_affine(Affine::translate((
+                    0.0,
+                    f64::from(top - viewport.offset_y - origin),
+                )));
+                path.extend(fragment.elements().iter().copied());
+            }
+            if !path.is_empty() {
+                let rect = path.bounding_box();
+                bounds = Some(bounds.map_or(rect, |previous| previous.union(rect)));
+                scene.fill(Fill::NonZero, Affine::IDENTITY, color, None, &path);
+            }
+        };
+        for highlight in &self.highlights {
+            paint(&highlight.ranges, ANNOTATION_MARK_COLOR, false, false);
+        }
+        if let Some(mark) = &self.focused_mark {
+            paint(&mark.ranges, mark.color(), false, false);
+        }
+        if let Some(selection) = &self.selection {
+            paint(&selection.ranges, TEXT_SELECTION_COLOR, false, false);
+        }
+        if self.is_focus_mode()
+            && focus_unit_activation_visible(
+                self.selection.is_some(),
+                self.focus_selection_anchor.is_some(),
+            )
+            && let Some(unit) = self.focus_units.get(self.focus_unit_index)
+            && !unit.rectangular_activation
+        {
+            paint(
+                &unit.paint_ranges,
+                TEXT_SELECTION_COLOR,
+                unit.is_table,
+                unit.is_image,
+            );
+        }
+        bounds.unwrap_or(Rect::ZERO)
     }
 
     pub(super) fn paint_scroll_backdrop(

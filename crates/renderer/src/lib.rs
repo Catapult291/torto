@@ -1027,6 +1027,19 @@ impl PageDisplayList {
         }
     }
 
+    /// Returns paint geometry restricted to a logical page's visible content.
+    /// Clip rectangles before adding the AA overlap so adjacent scroll pages
+    /// can share one fill without separately antialiasing their clip edges.
+    pub fn source_highlight_path_in(&self, ranges: &[SourceRange], clip: Rect) -> BezPath {
+        source_range_highlight_path(
+            self.source_rects(ranges)
+                .into_iter()
+                .chain(self.selected_separator_rects(ranges))
+                .map(|rect| rect.intersect(clip))
+                .filter(|rect| rect.width() > 0.0 && rect.height() > 0.0),
+        )
+    }
+
     /// Paints translucent source-backed marks below page content.
     pub fn paint_source_ranges(
         &self,
