@@ -44,6 +44,31 @@ pub(crate) trait HighlightRepository: Send + Sync {
     fn insert_highlight(&self, highlight: &StoredHighlight) -> HighlightResult<()>;
     fn update_highlight(&self, highlight: &StoredHighlight) -> HighlightResult<bool>;
     fn remove_highlight(&self, id: &str) -> HighlightResult<bool>;
+    fn range_checks(
+        &self,
+        _book_id: &str,
+    ) -> HighlightResult<std::collections::HashMap<String, String>> {
+        Ok(std::collections::HashMap::new())
+    }
+    fn save_range_checks(&self, _checks: &[(StoredHighlight, String)]) -> HighlightResult<()> {
+        Ok(())
+    }
+    fn repair_ranges_batch(
+        &self,
+        repairs: &[(StoredHighlight, Vec<SourceRange>)],
+    ) -> HighlightResult<Vec<bool>> {
+        repairs
+            .iter()
+            .map(|(expected, ranges)| self.repair_ranges(expected, ranges))
+            .collect()
+    }
+    fn repair_ranges(
+        &self,
+        _expected: &StoredHighlight,
+        _ranges: &[SourceRange],
+    ) -> HighlightResult<bool> {
+        Ok(false)
+    }
 }
 
 pub struct HighlightStore {
@@ -72,6 +97,27 @@ impl HighlightStore {
 
     pub fn update(&mut self, highlight: &StoredHighlight) -> HighlightResult<bool> {
         self.repository.update_highlight(highlight)
+    }
+
+    pub(crate) fn range_checks(
+        &self,
+        book_id: &str,
+    ) -> HighlightResult<std::collections::HashMap<String, String>> {
+        self.repository.range_checks(book_id)
+    }
+
+    pub(crate) fn save_range_checks(
+        &self,
+        checks: &[(StoredHighlight, String)],
+    ) -> HighlightResult<()> {
+        self.repository.save_range_checks(checks)
+    }
+
+    pub(crate) fn repair_ranges_batch(
+        &self,
+        repairs: &[(StoredHighlight, Vec<SourceRange>)],
+    ) -> HighlightResult<Vec<bool>> {
+        self.repository.repair_ranges_batch(repairs)
     }
 
     pub fn remove(&mut self, id: &str) -> HighlightResult<bool> {

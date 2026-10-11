@@ -577,6 +577,7 @@ impl DesktopReader {
     ) -> ReaderFramePlan {
         let ctx = root_ui.ctx().clone();
         let now = Instant::now();
+        self.prepare_nearby_footnotes(&ctx);
         self.statistics.tick(
             ctx.input(|i| i.focused)
                 && self.completion.is_none()
@@ -2672,7 +2673,16 @@ impl DesktopReader {
             &self.book_id,
             self.classic_footnotes
                 .iter()
-                .map(|note| note.popup_text())
+                .map(|note| {
+                    (
+                        note.stable_id,
+                        note.number,
+                        note.owner
+                            .as_ref()
+                            .map(rebook_publication::source_block_identity),
+                        note.stable_id.is_none().then(|| note.popup_text()),
+                    )
+                })
                 .collect::<Vec<_>>(),
         ))
     }
@@ -2718,7 +2728,15 @@ impl DesktopReader {
         pending
             .or(active)
             .or_else(|| notes.iter().min_by_key(|note| note.citation.is_some()))
-            .map(|note| note.popup_text().trim())
+            .map(|note| {
+                self.footnote_loader
+                    .text(
+                        note,
+                        self.language
+                            .text("未能读取脚注内容", "Footnote content is unavailable"),
+                    )
+                    .trim()
+            })
             .filter(|text| !text.is_empty())
     }
 
@@ -2727,6 +2745,12 @@ impl DesktopReader {
             return;
         }
         let mut footnotes = self.popup_footnotes().to_vec();
+        let unavailable = self
+            .language
+            .text("未能读取脚注内容", "Footnote content is unavailable");
+        for note in &mut footnotes {
+            note.text = self.footnote_loader.text(note, unavailable).to_owned();
+        }
         footnotes.sort_by_key(|note| note.citation.is_some());
         if footnotes.is_empty() {
             self.close_focus_footnotes();

@@ -78,6 +78,7 @@ mod focus_lists;
 mod focus_wheel;
 mod footnote_layout;
 mod footnote_navigation;
+mod footnotes;
 mod images;
 mod interaction;
 mod navigation;
@@ -382,15 +383,30 @@ pub(crate) fn open_reader_staged(
     }
     let structure_source = Arc::new(ParagraphStructureSource::new(semantic_source.clone()));
     let source: Arc<dyn BookSource> = structure_source.clone();
+    let highlights_started = Instant::now();
     let mut highlight_store = HighlightStore::from_repository(local_store.clone());
     let mut highlights = highlight_store.for_book(&book_id);
     if reader_preferences.selection_granularity == SelectionGranularity::Paragraph {
+        // File-backed reflow formats have a stable content identity. PDF-derived
+        // OCR/native caches can be rebuilt independently of the original file;
+        // keep validating their ranges until they expose a persistent revision.
+        let revision = (format != BookFormat::Pdf).then(|| {
+            format!(
+                "{}:{:?}",
+                book_id,
+                std::fs::metadata(path)
+                    .ok()
+                    .map(|m| (m.len(), m.modified().ok())),
+            )
+        });
         repair_legacy_translated_paragraph_highlights(
             rewrite_source.as_ref(),
             &mut highlights,
             &mut highlight_store,
+            revision.as_deref(),
         );
     }
+    let highlights_ms = highlights_started.elapsed().as_secs_f32() * 1_000.0;
     let mut style = ReaderStyle {
         spread: if reading_mode == ReadingMode::Focus {
             SpreadMode::Scroll
@@ -479,9 +495,18 @@ pub(crate) fn open_reader_staged(
     };
     // Prepare the complete visible reading unit on the opening worker. The UI
     // must not discover and compile its remaining segments on the first frame.
-    if reading_mode == ReadingMode::Focus || reader.style().spread == SpreadMode::Scroll {
-        reader.current_reading_unit_pages()?;
-    }
+    let scroll_section =
+        if reading_mode == ReadingMode::Focus || reader.style().spread == SpreadMode::Scroll {
+            let pages = reader.current_reading_unit_pages()?;
+            Some(Arc::new(ScrollSectionLayout::new(
+                reader.current_reading_unit_sections().start,
+                reader.reading_unit_location().index,
+                pages,
+                format == BookFormat::Pdf && pdf_ocr_mode == PdfOcrViewMode::Original,
+            )))
+        } else {
+            None
+        };
     let breakdown = timing_scope.map(rebook_layout::timing::TimingScope::finish);
     let initial_layout_ms = initial_layout_started.elapsed().as_secs_f32() * 1_000.0;
     if let Some(breakdown) = breakdown {
@@ -528,6 +553,7 @@ pub(crate) fn open_reader_staged(
             crate::diagnostics::Field::F32("publication_ms", publication_ms),
             crate::diagnostics::Field::F32("source_wrappers_ms", source_wrappers_ms),
             crate::diagnostics::Field::F32("progress_ms", progress_ms),
+            crate::diagnostics::Field::F32("highlights_ms", highlights_ms),
             crate::diagnostics::Field::Bool("resumed", resumed),
             crate::diagnostics::Field::U64("viewport_width", u64::from(viewport.width)),
             crate::diagnostics::Field::U64("viewport_height", u64::from(viewport.height)),
@@ -578,6 +604,7 @@ pub(crate) fn open_reader_staged(
             source_path: path.to_path_buf(),
         },
     );
+    desktop.scroll_section = scroll_section;
     desktop.canvas_size = Some((viewport.width, viewport.height));
     Ok(desktop)
 }
@@ -638,8 +665,35 @@ fn repair_legacy_translated_paragraph_highlights(
     source: &dyn BookSource,
     highlights: &mut [StoredHighlight],
     store: &mut HighlightStore,
+    source_revision: Option<&str>,
 ) {
-    for highlight in highlights {
+    use sha2::{Digest, Sha256};
+    let Some(book_id) = highlights.first().map(|h| h.book_id.as_str()) else {
+        return;
+    };
+    let checked = if source_revision.is_some() {
+        store.range_checks(book_id).unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+    let fingerprint = |highlight: &StoredHighlight| {
+        let bytes = serde_json::to_vec(&(
+            1,
+            env!("CARGO_PKG_VERSION"),
+            source_revision,
+            &highlight.ranges,
+            &highlight.quote,
+        ))
+        .expect("highlight ranges are serializable");
+        format!("{:x}", Sha256::digest(bytes))
+    };
+    let mut completed = Vec::new();
+    let mut repairs = Vec::new();
+    let mut indices = Vec::new();
+    for (index, highlight) in highlights.iter().enumerate() {
+        if checked.get(&highlight.id) == Some(&fingerprint(highlight)) {
+            continue;
+        }
         let [range] = highlight.ranges.as_slice() else {
             continue;
         };
@@ -654,14 +708,32 @@ fn repair_legacy_translated_paragraph_highlights(
         let Ok(section) = source.parse_section(section_index) else {
             continue;
         };
-        let Some(repaired) =
+        if let Some(repaired) =
             legacy_translated_paragraph_range(&section.blocks, range, &highlight.quote)
-        else {
-            continue;
-        };
-        highlight.ranges = vec![repaired];
-        if let Err(error) = store.update(highlight) {
-            tracing::warn!(%error, id = %highlight.id, "failed to repair legacy translated highlight");
+        {
+            indices.push(index);
+            repairs.push((highlight.clone(), vec![repaired]));
+        } else {
+            completed.push((highlight.clone(), fingerprint(highlight)));
+        }
+    }
+    // One transaction avoids a disk flush and connection per repaired record.
+    match store.repair_ranges_batch(&repairs) {
+        Ok(results) => {
+            for ((index, (_, ranges)), saved) in indices.into_iter().zip(repairs).zip(results) {
+                if !saved {
+                    continue;
+                } // Concurrent edit/deletion: retry its new record next time.
+                let highlight = &mut highlights[index];
+                highlight.ranges = ranges;
+                completed.push((highlight.clone(), fingerprint(highlight)));
+            }
+        }
+        Err(error) => tracing::warn!(%error, "failed to repair legacy translated highlights"),
+    }
+    if source_revision.is_some() {
+        if let Err(error) = store.save_range_checks(&completed) {
+            tracing::warn!(%error, "failed to save highlight compatibility checks");
         }
     }
 }
@@ -828,6 +900,7 @@ pub(super) struct DesktopReader {
     focus_units: Vec<FocusUnit>,
     focus_units_ready: bool,
     classic_footnotes: Vec<FocusFootnote>,
+    footnote_loader: footnotes::FootnoteLoader,
     citation_popup_target: Option<(SourceRange, u32)>,
     active_footnote_reference: Option<(SourceRange, u32)>,
     classic_footnote_anchor_y: Option<f32>,
@@ -903,6 +976,7 @@ struct ScrollSectionLayout {
     section_index: usize,
     reading_unit_index: usize,
     pages: Vec<ReaderSectionPage>,
+    source_pages: HashMap<(rebook_publication::SpineItemId, String), Vec<usize>>,
     page_tops: Vec<f32>,
     page_origins: Vec<f32>,
     page_heights: Vec<f32>,
@@ -1653,7 +1727,8 @@ fn focus_unit_geometry(
 ) -> Option<(egui::Rect, ReaderPosition)> {
     let mut bounds: Option<egui::Rect> = None;
     let mut position = None;
-    for (page_index, page) in layout.pages.iter().enumerate() {
+    for page_index in layout.geometry_pages(paint_ranges) {
+        let page = &layout.pages[page_index];
         for rect in page
             .page
             .source_rects(paint_ranges)
@@ -1677,7 +1752,8 @@ fn single_focus_image_rect(
     layout: &ScrollSectionLayout,
     ranges: &[SourceRange],
 ) -> Option<egui::Rect> {
-    let mut images = layout.pages.iter().enumerate().flat_map(|(index, page)| {
+    let mut images = layout.geometry_pages(ranges).into_iter().flat_map(|index| {
+        let page = &layout.pages[index];
         page.page
             .image_source_rects(ranges)
             .into_iter()
@@ -1710,7 +1786,8 @@ fn focus_unit_selection_endpoint_rect(
     take_last: bool,
 ) -> Option<ReaderSelectionRect> {
     let mut endpoint = None;
-    for page in &layout.pages {
+    for index in layout.geometry_pages(&unit.paint_ranges) {
+        let page = &layout.pages[index];
         for rect in page
             .page
             .source_rects(&unit.paint_ranges)
@@ -1744,10 +1821,10 @@ fn focus_block_activation_geometry(
     paint_ranges: &[SourceRange],
 ) -> Option<egui::Rect> {
     layout
-        .pages
-        .iter()
-        .enumerate()
-        .filter_map(|(page_index, page)| {
+        .geometry_pages(paint_ranges)
+        .into_iter()
+        .filter_map(|page_index| {
+            let page = &layout.pages[page_index];
             let rect = page.page.source_block_bounds(paint_ranges)?;
             Some(egui::Rect::from_min_max(
                 egui::pos2(rect.x0 as f32, layout.content_y(page_index, rect.y0 as f32)),
@@ -2088,6 +2165,18 @@ impl ScrollSectionLayout {
         pages: Vec<ReaderSectionPage>,
         preserve_physical_pages: bool,
     ) -> Self {
+        let mut source_pages: HashMap<(rebook_publication::SpineItemId, String), Vec<usize>> =
+            HashMap::new();
+        for (index, page) in pages.iter().enumerate() {
+            for source in page.page.geometry_sources() {
+                let entries = source_pages
+                    .entry((source.start.spine.clone(), source.start.node.clone()))
+                    .or_default();
+                if entries.last() != Some(&index) {
+                    entries.push(index);
+                }
+            }
+        }
         let mut cursor = 0.0;
         let mut page_tops = Vec::with_capacity(pages.len());
         let mut page_origins = Vec::with_capacity(pages.len());
@@ -2146,12 +2235,30 @@ impl ScrollSectionLayout {
             section_index,
             reading_unit_index,
             pages,
+            source_pages,
             page_tops,
             page_origins,
             page_heights,
             quote_bridges,
             content_height: cursor,
         }
+    }
+
+    // The index only selects candidates. The existing renderer queries still
+    // decide exact range intersections and retain their ordering and geometry.
+    fn geometry_pages(&self, ranges: &[SourceRange]) -> Vec<usize> {
+        let mut indices = Vec::new();
+        for range in ranges {
+            if let Some(pages) = self
+                .source_pages
+                .get(&(range.start.spine.clone(), range.start.node.clone()))
+            {
+                indices.extend(pages);
+            }
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        indices
     }
 
     fn page_top(&self, position: ReaderPosition) -> Option<f32> {
@@ -2574,13 +2681,7 @@ impl DesktopReader {
         Ok(layout)
     }
 
-    fn resolve_focus_footnotes(
-        &self,
-        block: &Block,
-        current_section_index: usize,
-        current_section: &Section,
-        linked_sections: &mut HashMap<usize, Section>,
-    ) -> Vec<FocusFootnote> {
+    fn resolve_focus_footnotes(&mut self, block: &Block) -> Vec<FocusFootnote> {
         let mut notes: Vec<_> = block_focus_footnotes(block)
             .into_iter()
             .enumerate()
@@ -2613,48 +2714,30 @@ impl DesktopReader {
                     target,
                     number,
                 } => {
-                    if let Some(index) = self
-                        .source
-                        .book()
-                        .sections
-                        .iter()
-                        .position(|section| section.href.path() == target.path())
-                        && (index != current_section_index
-                            || focus_footnote_text_in_section(current_section, &target, &marker)
-                                .is_none())
-                        && let std::collections::hash_map::Entry::Vacant(entry) =
-                            linked_sections.entry(index)
-                        && let Some(section) = self.reader.cached_section_content(index)
-                    {
-                        entry.insert(section);
-                    }
+                    let id = egui::Id::new((
+                        "linked-note-slot",
+                        target.path(),
+                        target.fragment(),
+                        &marker,
+                        slot,
+                    ));
+                    self.footnote_loader.register(id, target, marker);
                     Some(FocusFootnote {
                         owner: None,
-                        stable_id: Some(egui::Id::new((
-                            "linked-note-slot",
-                            target.path(),
-                            target.fragment(),
-                            slot,
-                        ))),
+                        stable_id: Some(id),
                         number,
                         citation: None,
-                        text: focus_footnote_text(
-                            self.source.as_ref(),
-                            &target,
-                            &marker,
-                            current_section_index,
-                            current_section,
-                            linked_sections,
-                        )
-                        .unwrap_or_else(|| {
-                            self.language
-                                .text("未能读取脚注内容", "Footnote content is unavailable")
-                                .to_owned()
-                        }),
+                        text: self
+                            .language
+                            .text("正在读取脚注…", "Loading footnote…")
+                            .to_owned(),
                     })
                 }
             })
             .collect();
+        if notes.is_empty() {
+            return notes;
+        }
         let numbered = rebook_layout::numbered_semantic_footnotes(block);
         fn collect_sources(block: &Block, out: &mut HashMap<u32, SourceRange>) {
             let mut text = |text: &TextBlock| {
@@ -2735,7 +2818,6 @@ impl DesktopReader {
                 std::iter::repeat_n((*index, section), section.blocks.len())
             })
             .collect::<Vec<_>>();
-        let mut linked_footnote_sections = HashMap::new();
         let reading_ranges = self
             .reader
             .current_reading_unit_source_ranges()
@@ -2747,7 +2829,7 @@ impl DesktopReader {
         let mut units: Vec<FocusUnit> = Vec::new();
         let mut active_list_root: Option<(usize, u8)> = None;
         for (block_index, block) in section.blocks.iter().enumerate() {
-            let (source_section_index, source_section) = block_sections[block_index];
+            let (source_section_index, _) = block_sections[block_index];
             if block_source_range(block).is_some_and(|range| {
                 !reading_ranges.iter().any(|visible| {
                     visible == range
@@ -2914,12 +2996,7 @@ impl DesktopReader {
                 }
                 continue;
             }
-            let footnotes = self.resolve_focus_footnotes(
-                block,
-                source_section_index,
-                source_section,
-                &mut linked_footnote_sections,
-            );
+            let footnotes = self.resolve_focus_footnotes(block);
             let clipboard_text = match block {
                 Block::Table(table) => table_block_markdown(table),
                 _ => text.clone(),
@@ -3066,7 +3143,7 @@ impl DesktopReader {
         self.sync_focus_chat_session();
         self.sync_focus_selected_image();
         self.bump_scene_revision();
-        if started.elapsed() >= Duration::from_millis(16) {
+        if cfg!(debug_assertions) || started.elapsed() >= Duration::from_millis(16) {
             crate::diagnostics::log(
                 "reader.focus.units",
                 &[
@@ -3180,6 +3257,7 @@ impl DesktopReader {
     }
 
     fn invalidate_focus_units(&mut self) {
+        self.footnote_loader.reset();
         self.focus_units.clear();
         self.focus_units_ready = false;
     }
@@ -4539,6 +4617,7 @@ impl DesktopReader {
             focus_units: Vec::new(),
             focus_units_ready: false,
             classic_footnotes: Vec::new(),
+            footnote_loader: footnotes::FootnoteLoader::default(),
             citation_popup_target: None,
             active_footnote_reference: None,
             classic_footnote_anchor_y: None,
@@ -5658,6 +5737,134 @@ mod tests {
         assert!((bridge.bottom - 71.0).abs() < f32::EPSILON);
         assert!((bridge.style.x - 26.0).abs() < f32::EPSILON);
         assert!((bridge.style.width - 4.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn highlight_checks_persist_repairs_and_recheck_changed_sources() {
+        use crate::highlights::HighlightRepository;
+        let mut section = footnote_section("chapter", "chapter.xhtml", &"a".repeat(224));
+        let Block::Text(text) = &mut section.blocks[0] else {
+            unreachable!()
+        };
+        text.kind = TextBlockKind::Paragraph;
+        let canonical = text.source.clone().unwrap();
+        let source = CountingFootnoteSource {
+            book: Book {
+                id: PublicationId::new("range-checks").unwrap(),
+                metadata: Metadata::default(),
+                cover: None,
+                sections: vec![SpineItem {
+                    id: section.id.clone(),
+                    href: section.href.clone(),
+                    media_type: "application/xhtml+xml".into(),
+                    linear: true,
+                    properties: Vec::new(),
+                }],
+                table_of_contents: Vec::new(),
+            },
+            sections: vec![section],
+            parse_count: AtomicUsize::new(0),
+        };
+        let path = std::env::temp_dir().join(format!(
+            "torto-range-checks-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let repository = crate::sync::SyncStore::open_at(path.clone(), "device").unwrap();
+        let mut store = crate::highlights::HighlightStore::from_repository(repository.clone());
+        let mut legacy = canonical.clone();
+        legacy.end.text_offset = 69;
+        let highlight = crate::highlights::StoredHighlight::with_note(
+            "range-checks".into(),
+            vec![legacy.clone()],
+            "译".repeat(69),
+            Some("keep this note".into()),
+        );
+        store.insert(&highlight).unwrap();
+        let mut highlights = store.for_book("range-checks");
+        super::repair_legacy_translated_paragraph_highlights(
+            &source,
+            &mut highlights,
+            &mut store,
+            Some("v1"),
+        );
+        assert_eq!(highlights[0].ranges, vec![canonical.clone()]);
+        assert_eq!(store.for_book("range-checks")[0], highlights[0]);
+        assert_eq!(source.parse_count.load(Ordering::Relaxed), 1);
+        super::repair_legacy_translated_paragraph_highlights(
+            &source,
+            &mut highlights,
+            &mut store,
+            Some("v1"),
+        );
+        assert_eq!(source.parse_count.load(Ordering::Relaxed), 1);
+        super::repair_legacy_translated_paragraph_highlights(
+            &source,
+            &mut highlights,
+            &mut store,
+            Some("v2"),
+        );
+        assert_eq!(source.parse_count.load(Ordering::Relaxed), 2);
+        assert!(repository.repair_ranges(&highlights[0], &[legacy]).unwrap());
+        highlights = store.for_book("range-checks");
+        super::repair_legacy_translated_paragraph_highlights(
+            &source,
+            &mut highlights,
+            &mut store,
+            Some("v2"),
+        );
+        assert_eq!(source.parse_count.load(Ordering::Relaxed), 3);
+        assert_eq!(highlights[0].ranges, vec![canonical]);
+        drop((store, repository));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn indexed_focus_geometry_matches_full_page_scan_for_compound_blocks() {
+        let (base, _, _) = super::semantic_layout::tests::fixture();
+        let html = format!(
+            "<html><body><h1>Heading</h1><p>{}</p><blockquote><p>Quoted text.</p></blockquote><table><tr><td>Cell one.</td><td>Cell two.</td></tr></table><ul><li>First item.</li><li>Second item.</li></ul></body></html>",
+            "Long paragraph across pages. ".repeat(300)
+        );
+        let section =
+            rebook_html::parse_section(&html, &base.source.book().sections[0], |_| None).unwrap();
+        let (mut reader, _, _) =
+            super::semantic_layout::tests::fixture_with_blocks(section.blocks.clone());
+        let layout = reader.current_scroll_layout().unwrap();
+        assert!(layout.pages.len() > 1);
+        for block in &section.blocks {
+            let Some(range) = super::block_source_range(block) else {
+                continue;
+            };
+            let ranges = super::focus_block_paint_ranges(block, range);
+            let actual = super::focus_unit_geometry(&layout, &ranges);
+            let mut bounds: Option<egui::Rect> = None;
+            let mut position = None;
+            for (index, page) in layout.pages.iter().enumerate() {
+                for rect in page
+                    .page
+                    .source_rects(&ranges)
+                    .into_iter()
+                    .chain(page.page.image_source_rects(&ranges))
+                    .chain(page.page.source_table_bounds(&ranges))
+                    .chain(page.page.source_quote_bounds(&ranges))
+                {
+                    let rect = egui::Rect::from_min_max(
+                        egui::pos2(rect.x0 as f32, layout.content_y(index, rect.y0 as f32)),
+                        egui::pos2(rect.x1 as f32, layout.content_y(index, rect.y1 as f32)),
+                    );
+                    bounds = Some(bounds.map_or(rect, |current| current.union(rect)));
+                    position.get_or_insert(page.position);
+                }
+            }
+            assert_eq!(actual, bounds.zip(position), "{range:?}");
+        }
+        let reused = reader.current_scroll_layout().unwrap();
+        assert!(Arc::ptr_eq(&layout, &reused));
+        reader.invalidate_page_scenes();
+        assert!(!Arc::ptr_eq(
+            &layout,
+            &reader.current_scroll_layout().unwrap()
+        ));
     }
 
     #[test]

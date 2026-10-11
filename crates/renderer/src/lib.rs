@@ -739,6 +739,29 @@ impl PageDisplayList {
             .selection_fragment(byte_range)
     }
 
+    /// Source identities participating in text, image, table and quote geometry.
+    /// Continuous readers can index candidate pages without computing rectangles.
+    /// Exact intersections must still be resolved by the geometry query methods.
+    pub fn geometry_sources(&self) -> impl Iterator<Item = &SourceRange> {
+        self.text_regions
+            .iter()
+            .map(|region| match region {
+                TextRegion::Shaped(region) => &region.source,
+                TextRegion::Fixed(region) => &region.source,
+            })
+            .chain(
+                self.inline_content_regions
+                    .iter()
+                    .map(|region| &region.source),
+            )
+            .chain(self.table_regions.iter().flat_map(|region| &region.sources))
+            .chain(self.quote_regions.iter().flat_map(|region| &region.sources))
+            .chain(self.commands.iter().filter_map(|command| match command {
+                DisplayCommand::Image(image) => image.source.as_ref(),
+                _ => None,
+            }))
+    }
+
     /// Resolves durable source ranges to page-coordinate highlight rectangles.
     pub fn source_rects(&self, ranges: &[SourceRange]) -> Vec<Rect> {
         let mut rects = self

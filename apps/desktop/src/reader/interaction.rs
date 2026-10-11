@@ -265,19 +265,14 @@ impl DesktopReader {
         let Some((position, source)) = self.footnote_source_at_canvas(x, y)? else {
             return Ok(None);
         };
-        let Ok(section) = self.source.parse_section(position.section_index) else {
+        let Some(section) = self.reader.cached_section_content(position.section_index) else {
             return Ok(None);
         };
         let Some(block_index) = focus_anchor_block_index(&section.blocks, Some(&source.start))
         else {
             return Ok(None);
         };
-        let footnotes = self.resolve_focus_footnotes(
-            &section.blocks[block_index],
-            position.section_index,
-            &section,
-            &mut std::collections::HashMap::new(),
-        );
+        let footnotes = self.resolve_focus_footnotes(&section.blocks[block_index]);
         Ok((!footnotes.is_empty()).then_some(footnotes))
     }
 

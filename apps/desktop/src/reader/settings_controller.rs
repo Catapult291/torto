@@ -5,6 +5,10 @@ use rebook_publication::RenditionLayout;
 
 use super::{DesktopReader, FollowUp, SnapshotEffects};
 
+#[cfg(test)]
+#[path = "settings_controller_tests.rs"]
+mod tests;
+
 impl DesktopReader {
     pub(in crate::reader) fn request_settings(&mut self) {
         self.cancel_text_selection();
@@ -117,6 +121,8 @@ impl DesktopReader {
             self.plugin_settings.ocr_enabled != plugin_settings.ocr_enabled;
         let pdf_ocr_reflow_changed =
             self.plugin_settings.pdf_ocr_reflow_enabled != plugin_settings.pdf_ocr_reflow_enabled;
+        let translation_mode_changed =
+            self.plugin_settings.translation_mode != plugin_settings.translation_mode;
 
         if let Err(error) = self
             .translation_source
@@ -167,6 +173,7 @@ impl DesktopReader {
             style.focus_footnote_icons
                 && style.typesetting.mode == rebook_layout::TypesettingMode::Unified,
         );
+        let previous_style = self.reader.style();
         let updated = if citation_mode_changed {
             self.reader.refresh_source_with_style(style)
         } else {
@@ -174,6 +181,11 @@ impl DesktopReader {
         };
         match updated {
             Ok(snapshot) => {
+                let content_changed = mode_changed
+                    || self.reader.style() != previous_style
+                    || citation_mode_changed
+                    || translation_backend_changed
+                    || translation_mode_changed;
                 self.plugin_settings = plugin_settings;
                 self.language = language;
                 if self.hide_cursor_in_focus_mode != settings.hide_cursor_in_focus_mode {
@@ -215,13 +227,20 @@ impl DesktopReader {
                 } else if toc_recognition_enable_changed || ocr_backend_changed {
                     self.start_pdf_metadata_extraction();
                 }
-                self.apply_snapshot(
-                    snapshot,
-                    SnapshotEffects {
-                        translation: FollowUp::Run,
-                        ..SnapshotEffects::static_content_change()
-                    },
-                );
+                if content_changed {
+                    self.apply_snapshot(
+                        snapshot,
+                        SnapshotEffects {
+                            translation: FollowUp::Run,
+                            ..SnapshotEffects::static_content_change()
+                        },
+                    );
+                } else {
+                    // Opening reapplies the global settings snapshot. Retain the
+                    // worker-prepared scroll layout and precise restored anchor
+                    // when the body source and style are already identical.
+                    self.queue_visible_section_translation();
+                }
                 self.queue_toc_translation();
                 if pdf_ocr_reflow_changed && self.pdf_ocr.available {
                     self.persist_progress();

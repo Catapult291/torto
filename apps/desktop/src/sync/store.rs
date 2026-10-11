@@ -584,6 +584,9 @@ impl SyncStore {
                 origin_device TEXT NOT NULL,
                 conflict_of TEXT
              );
+             CREATE TABLE IF NOT EXISTS annotation_range_checks(
+                annotation_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL
+             );
              CREATE INDEX IF NOT EXISTS annotations_book_id ON annotations(book_id);
              CREATE INDEX IF NOT EXISTS annotations_origin ON annotations(origin_device, book_id);
              CREATE TABLE IF NOT EXISTS book_membership(
@@ -670,6 +673,101 @@ impl HighlightRepository for SyncStore {
 
     fn update_highlight(&self, highlight: &StoredHighlight) -> HighlightResult<bool> {
         self.update_annotation_note(&highlight.id, highlight.note.clone())
+    }
+
+    fn range_checks(&self, book_id: &str) -> HighlightResult<HashMap<String, String>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT c.annotation_id, c.fingerprint FROM annotation_range_checks c
+             JOIN annotations a ON a.id = c.annotation_id
+             WHERE a.book_id = ?1 AND a.deleted_hlc IS NULL",
+        )?;
+        let rows = statement.query_map([book_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    fn save_range_checks(&self, checks: &[(StoredHighlight, String)]) -> HighlightResult<()> {
+        if checks.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        for (expected, fingerprint) in checks {
+            // A sync or edit may have replaced the annotation since it was read.
+            transaction.execute(
+                "INSERT OR REPLACE INTO annotation_range_checks(annotation_id, fingerprint)
+                 SELECT id, ?1 FROM annotations WHERE id = ?2 AND book_id = ?3
+                 AND ranges_json = ?4 AND quote = ?5 AND deleted_hlc IS NULL",
+                params![
+                    fingerprint,
+                    expected.id,
+                    expected.book_id,
+                    serde_json::to_string(&expected.ranges)?,
+                    expected.quote
+                ],
+            )?;
+        }
+        transaction.execute(
+            "DELETE FROM annotation_range_checks WHERE annotation_id NOT IN
+             (SELECT id FROM annotations WHERE deleted_hlc IS NULL)",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn repair_ranges(
+        &self,
+        expected: &StoredHighlight,
+        ranges: &[SourceRange],
+    ) -> HighlightResult<bool> {
+        Ok(self.repair_ranges_batch(&[(expected.clone(), ranges.to_vec())])?[0])
+    }
+
+    fn repair_ranges_batch(
+        &self,
+        repairs: &[(StoredHighlight, Vec<SourceRange>)],
+    ) -> HighlightResult<Vec<bool>> {
+        if repairs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let mut repaired = Vec::with_capacity(repairs.len());
+        for (expected, ranges) in repairs {
+            let Some(mut annotation) = read_annotation(&transaction, &expected.id)? else {
+                repaired.push(false);
+                continue;
+            };
+            if annotation.deleted_at.is_some()
+                || annotation.book_id != expected.book_id
+                || annotation.ranges != expected.ranges
+                || annotation.quote != expected.quote
+                || annotation.ranges == *ranges
+            {
+                repaired.push(false);
+                continue;
+            }
+            // Repair only ranges: retain concurrently edited notes and sync history.
+            if ranges.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "range repair requires a source range",
+                )
+                .into());
+            }
+            annotation.ranges.clone_from(ranges);
+            incoming_ranges_are_valid(&annotation)?;
+            annotation.updated_at = tick(&transaction, &self.device_id, None)?;
+            let counter = annotation.clock.entry(self.device_id.clone()).or_default();
+            *counter = counter.saturating_add(1);
+            annotation.origin_device.clone_from(&self.device_id);
+            write_annotation(&transaction, &annotation)?;
+            mark_reading_changed(&transaction, &self.device_id, &annotation.book_id)?;
+            repaired.push(true);
+        }
+        transaction.commit()?;
+        Ok(repaired)
     }
 
     fn remove_highlight(&self, id: &str) -> HighlightResult<bool> {
@@ -1120,6 +1218,91 @@ mod tests {
         assert_eq!(after.note.as_deref(), Some("after"));
         assert!(after.clock["device-a"] > before.clock["device-a"]);
         assert!(after.updated_at >= before.updated_at);
+        cleanup(&store);
+    }
+
+    #[test]
+    fn batch_range_repairs_commit_together_and_roll_back_invalid_input() {
+        let store = test_store("batch-range-repair");
+        let a =
+            StoredHighlight::with_note("book".into(), vec![source_range()], "first".into(), None);
+        let b =
+            StoredHighlight::with_note("book".into(), vec![source_range()], "second".into(), None);
+        store.insert_highlight(&a).unwrap();
+        store.insert_highlight(&b).unwrap();
+        let mut repaired = source_range();
+        repaired.end.text_offset = 10;
+        assert!(
+            store
+                .repair_ranges_batch(&[
+                    (a.clone(), vec![repaired.clone()]),
+                    (b.clone(), Vec::new()),
+                ])
+                .is_err()
+        );
+        assert!(
+            store
+                .highlights_for_book("book")
+                .unwrap()
+                .iter()
+                .all(|h| h.ranges == vec![source_range()])
+        );
+        assert_eq!(
+            store
+                .repair_ranges_batch(&[
+                    (a.clone(), vec![repaired.clone()]),
+                    (b, vec![repaired.clone()]),
+                ])
+                .unwrap(),
+            vec![true, true]
+        );
+        assert!(
+            store
+                .highlights_for_book("book")
+                .unwrap()
+                .iter()
+                .all(|h| h.ranges == vec![repaired.clone()])
+        );
+        assert_eq!(
+            store
+                .repair_ranges_batch(&[(a, vec![source_range()])])
+                .unwrap(),
+            vec![false]
+        );
+        cleanup(&store);
+    }
+
+    #[test]
+    fn range_repair_preserves_new_notes_and_rejects_stale_ranges_and_checks() {
+        let store = test_store("range-repair");
+        let old =
+            StoredHighlight::with_note("book".into(), vec![source_range()], "quote".into(), None);
+        store.insert_highlight(&old).unwrap();
+        store
+            .update_annotation_note(&old.id, Some("new note".into()))
+            .unwrap();
+        let before = store.annotations_for_book("book").unwrap().remove(0);
+        let mut repaired = source_range();
+        repaired.end.text_offset = 10;
+        assert!(store.repair_ranges(&old, &[repaired.clone()]).unwrap());
+        let after = store.annotations_for_book("book").unwrap().remove(0);
+        assert_eq!(after.note.as_deref(), Some("new note"));
+        assert_eq!(after.ranges, vec![repaired]);
+        assert!(after.clock["device-a"] > before.clock["device-a"]);
+        assert!(!store.repair_ranges(&old, &[source_range()]).unwrap());
+        store
+            .save_range_checks(&[(old.clone(), "stale".into())])
+            .unwrap();
+        assert!(store.range_checks("book").unwrap().is_empty());
+        let current = store.highlights_for_book("book").unwrap().remove(0);
+        store
+            .save_range_checks(&[(current.clone(), "current".into())])
+            .unwrap();
+        let reopened = SyncStore::open_at(store.path.clone(), "device-a").unwrap();
+        assert_eq!(reopened.range_checks("book").unwrap()[&old.id], "current");
+        store.delete_annotation(&old.id).unwrap();
+        assert!(!store.repair_ranges(&current, &[source_range()]).unwrap());
+        assert!(store.range_checks("book").unwrap().is_empty());
         cleanup(&store);
     }
 
