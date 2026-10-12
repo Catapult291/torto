@@ -5,7 +5,10 @@ use std::sync::Mutex;
 
 use image::ImageReader;
 use rebook_html::SectionParseHints;
-use rebook_publication::{NOTE_SECTION_PROPERTY, PublicationUrl, SpineItem, TocEntry};
+use rebook_publication::{
+    Block, Inline, LinkRole, NOTE_SECTION_PROPERTY, PublicationUrl, Section, SpineItem,
+    TextBaseline, TextBlock, TocEntry,
+};
 use roxmltree::{Document, Node};
 
 /// Only inspect the raster header; callers run while parsing a section.
@@ -86,6 +89,54 @@ impl HtmlContext {
             if self.note_sections.contains(section.href.path()) && !section.is_note_section() {
                 section.properties.push(NOTE_SECTION_PROPERTY.to_owned());
             }
+        }
+    }
+
+    /// Legacy EPUB markers can use small, top-aligned links rather than <sup>.
+    /// The publication's Notes destination supplies the missing semantic evidence.
+    pub(crate) fn mark_note_references(&self, section: &mut Section) {
+        fn text(block: &mut TextBlock, notes: &HashSet<String>) {
+            for inline in &mut block.content {
+                let Inline::Text(run) = inline else { continue };
+                let Some(target) = &run.link else { continue };
+                let marker = run
+                    .text
+                    .trim()
+                    .trim_matches(['[', ']', '(', ')', '（', '）', '【', '】', '.']);
+                if run.style.link_role == LinkRole::Normal
+                    && target.fragment().is_some()
+                    && notes.contains(target.path())
+                    && (run.style.size_scale <= 0.85
+                        || run.style.baseline == TextBaseline::Superscript)
+                    && !marker.is_empty()
+                    && marker.chars().count() <= 8
+                    && marker
+                        .chars()
+                        .all(|ch| ch.is_ascii_digit() || matches!(ch, '*' | '†' | '‡' | '§'))
+                {
+                    run.style.link_role = LinkRole::FootnoteReference;
+                }
+            }
+        }
+        fn visit(block: &mut Block, notes: &HashSet<String>) {
+            match block {
+                Block::Text(t) => text(t, notes),
+                Block::Quote(q) => q
+                    .body
+                    .iter_mut()
+                    .chain(q.attribution.iter_mut())
+                    .for_each(|t| text(t, notes)),
+                Block::Table(t) => t.text_blocks_mut().for_each(|t| text(t, notes)),
+                Block::Figure(f) => f.captions.iter_mut().for_each(|t| text(t, notes)),
+                Block::Note(n) => n.blocks.iter_mut().for_each(|b| visit(b, notes)),
+                _ => {}
+            }
+        }
+        if !self.note_sections.is_empty() {
+            section
+                .blocks
+                .iter_mut()
+                .for_each(|b| visit(b, &self.note_sections));
         }
     }
 
@@ -234,6 +285,53 @@ pub(crate) fn navigation_documents(xml: &str, base: &PublicationUrl) -> Vec<Publ
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn small_linked_markers_require_a_known_notes_destination() {
+        let context = HtmlContext::new(
+            &[TocEntry {
+                label: "Notes".into(),
+                href: Some(PublicationUrl::parse("notes.xhtml").unwrap()),
+                children: Vec::new(),
+            }],
+            Vec::new(),
+        );
+        let descriptor = SpineItem {
+            id: rebook_publication::SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let mut section = rebook_html::parse_section(
+            r##"<html><head><style>.marker {font-size:0.65em;vertical-align:top}</style></head><body><p>Claim<a class="marker" href="notes.xhtml#n3">3</a>. An index<a class="marker" href="index.xhtml#n4">4</a>. A chapter<a href="notes.xhtml#n5">5</a>. A navigation link<a class="marker" href="notes.xhtml">6</a>. A name<a class="marker" href="notes.xhtml#n7">Notes</a>.</p></body></html>"##,
+            &descriptor,
+            |_| None,
+        )
+        .unwrap();
+        let Block::Text(original) = &section.blocks[0] else {
+            panic!()
+        };
+        assert!(original.content.iter().all(|inline| !matches!(inline,
+            Inline::Text(run) if run.style.link_role == LinkRole::FootnoteReference)));
+        let sources = section.anchors.clone();
+        context.mark_note_references(&mut section);
+        let Block::Text(text) = &section.blocks[0] else {
+            panic!()
+        };
+        let marked: Vec<_> = text
+            .content
+            .iter()
+            .filter_map(|inline| match inline {
+                Inline::Text(run) if run.style.link_role == LinkRole::FootnoteReference => {
+                    Some(run.text.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(marked, ["3"]);
+        assert_eq!(section.anchors, sources);
+    }
 
     #[test]
     fn ambiguous_note_targets_and_subsection_labels_do_not_classify_whole_chapters() {

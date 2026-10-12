@@ -120,6 +120,10 @@ struct Response {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Annotation {
+    ImageText {
+        href: PublicationUrl,
+        text: rebook_publication::ImageText,
+    },
     TextFormulas {
         source: SourceRange,
         spans: Vec<text_formulas::Span>,
@@ -1009,7 +1013,8 @@ fn load_recognition_with_hash(
                 a,
                 Annotation::InlineCitations { .. }
                     | Annotation::TextFormulas { .. }
-                    | Annotation::ImageFormula { .. }
+                    | Annotation::ImageText { .. }
+                | Annotation::ImageFormula { .. }
                     | Annotation::UnreadableFormula { .. }
             )
         })
@@ -1017,6 +1022,7 @@ fn load_recognition_with_hash(
             Some(match a {
                 Annotation::InlineCitations { .. }
                 | Annotation::TextFormulas { .. }
+                | Annotation::ImageText { .. }
                 | Annotation::ImageFormula { .. }
                 | Annotation::UnreadableFormula { .. } => {
                     unreachable!()
@@ -1841,6 +1847,10 @@ fn annotation(group: &Proposal, section: &Section) -> Annotation {
 // Resolve against source ranges, never translated block indices. Bilingual
 // companion paragraphs have no source and stay attached to their original.
 fn compose(blocks: &mut Vec<Block>, annotation: &Annotation) {
+    if let Annotation::ImageText { href, text } = annotation {
+        formulas::compose_text(blocks, href, text);
+        return;
+    }
     if let Annotation::TextFormulas { source, spans } = annotation {
         text_formulas::compose(blocks, source, spans);
         return;
@@ -1894,7 +1904,8 @@ fn compose(blocks: &mut Vec<Block>, annotation: &Annotation) {
         | Annotation::QuoteInline { .. }
         | Annotation::InlineCitations { .. }
         | Annotation::TextFormulas { .. }
-        | Annotation::ImageFormula { .. }
+        | Annotation::ImageText { .. }
+                | Annotation::ImageFormula { .. }
         | Annotation::UnreadableFormula { .. } => unreachable!(),
     };
     let positions: Option<Vec<_>> = ranges
@@ -1980,7 +1991,8 @@ fn compose(blocks: &mut Vec<Block>, annotation: &Annotation) {
         | Annotation::QuoteInline { .. }
         | Annotation::InlineCitations { .. }
         | Annotation::TextFormulas { .. }
-        | Annotation::ImageFormula { .. }
+        | Annotation::ImageText { .. }
+                | Annotation::ImageFormula { .. }
         | Annotation::UnreadableFormula { .. } => unreachable!(),
     };
     blocks.splice(start..end, [replacement]);

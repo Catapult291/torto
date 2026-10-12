@@ -114,7 +114,9 @@ fn candidate_spans(block: &TextBlock) -> Vec<Citation> {
             let letters = value.chars().filter(|c| c.is_alphabetic()).count();
             // Year-only parentheses after an author remain part of the sentence.
             let square = matches!(chars[start], '[' | '［');
-            if digits == 0 || (!square && letters < 2) {
+            if (digits == 0 || (!square && letters < 2))
+                && !rebook_publication::media_references::is_citation(&value)
+            {
                 continue;
             }
             out.push(Citation {

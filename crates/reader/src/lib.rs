@@ -2083,6 +2083,19 @@ impl ReaderSession {
         Ok(self.page_at(position)?.inline_citation_at(x, y))
     }
 
+    pub fn media_reference_at_page(
+        &mut self, position: ReaderPosition, x: f32, y: f32,
+    ) -> Result<Option<rebook_renderer::MediaReferenceHit>, ReaderError> {
+        self.ensure_segment(SegmentKey { section_index: position.section_index, segment_index: position.segment_index })?;
+        Ok(self.page_at(position)?.media_reference_at(x, y))
+    }
+
+    pub fn media_reference_at_current_spread(
+        &mut self, x: f32, y: f32,
+    ) -> Result<Option<rebook_renderer::MediaReferenceHit>, ReaderError> {
+        Ok(self.current_spread_pages()?.iter().rev().find_map(|(_, page, offset)| page.media_reference_at(x - *offset, y)))
+    }
+
     pub fn website_at_page(
         &mut self,
         position: ReaderPosition,
@@ -5629,6 +5642,7 @@ mod tests {
                 id: descriptor.id.clone(),
                 href: descriptor.href.clone(),
                 blocks: vec![Block::Image(ImageBlock {
+                    ocr_text: None,
                     formula_image: false,
                     formula: None,
                     href: Self::href(index),

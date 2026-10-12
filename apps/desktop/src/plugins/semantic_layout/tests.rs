@@ -41,6 +41,7 @@ pub(super) fn text(id: &str, content: &str) -> Block {
 
 pub(super) fn image(id: &str) -> Block {
     Block::Image(ImageBlock {
+        ocr_text: None,
         formula_image: false,
         formula: None,
         href: PublicationUrl::parse("image.png").unwrap(),

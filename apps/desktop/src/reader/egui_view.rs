@@ -755,7 +755,7 @@ impl DesktopReader {
                         response
                     };
                     page_rect = response.rect;
-                    if self.image_preview.is_none() {
+                    if !self.preview_is_open() {
                         self.pointer_interaction(&response);
                         self.wheel_interaction(&response, interaction_blocked);
                     }
@@ -812,8 +812,9 @@ impl DesktopReader {
             self.selection_actions(&ctx, page_rect);
         }
         self.image_preview_overlay(&ctx);
+        self.media_preview_overlay(&ctx);
         #[cfg(target_os = "windows")]
-        if self.image_preview.is_some() {
+        if self.preview_is_open() {
             crate::app::window_chrome::block_drag(&ctx);
         }
         self.feedback(&ctx);
@@ -1048,7 +1049,7 @@ impl DesktopReader {
                     );
                 }
             }
-            if self.image_preview.is_none() && !interaction_blocked {
+            if !self.preview_is_open() && !interaction_blocked {
                 self.pointer_interaction(&response);
                 if self.is_focus_mode() {
                     self.focus_wheel_interaction(&response);
@@ -1244,6 +1245,7 @@ impl DesktopReader {
     }
 
     fn keyboard_shortcuts(&mut self, ctx: &egui::Context, interaction_blocked: bool) {
+        if self.media_preview_keyboard(ctx) { return; }
         if !self.focus_body_accepts_shortcuts(interaction_blocked)
             || !ctx.input(|input| input.focused)
         {
@@ -1434,7 +1436,7 @@ impl DesktopReader {
             || (ctx.egui_wants_keyboard_input()
                 && (!self.is_focus_mode() || visible_focus_editor || self.ui.sidebar_open))
             || self.ui.overlay_visible()
-            || self.image_preview.is_some()
+            || self.preview_is_open()
         {
             return;
         }
@@ -1453,7 +1455,7 @@ impl DesktopReader {
             || self.ui.sidebar_tab != SidebarTab::Toc
             || !toc_keyboard_navigation_enabled(self.is_focus_mode(), self.ui.sidebar_pinned)
             || self.ui.overlay_visible()
-            || self.image_preview.is_some()
+            || self.preview_is_open()
             || self.annotation_note_draft.is_some()
             || ctx.text_edit_focused()
         {
@@ -1599,7 +1601,7 @@ impl DesktopReader {
             && !interaction_blocked
             && !self.ui.overlay_visible()
             && !self.ui.sidebar_open
-            && self.image_preview.is_none()
+            && !self.preview_is_open()
             && !self.focus_assistant_popup_visible()
             && self.annotation_note_draft.is_none()
             && !ctx.text_edit_focused();
@@ -1670,7 +1672,7 @@ impl DesktopReader {
     fn operation_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) -> bool {
         if interaction_blocked
             || self.ui.overlay_visible()
-            || self.image_preview.is_some()
+            || self.preview_is_open()
             || self.annotation_note_draft.is_some()
             || ctx.text_edit_focused()
         {
@@ -1702,7 +1704,7 @@ impl DesktopReader {
     fn layout_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) -> bool {
         if interaction_blocked
             || self.ui.overlay_visible()
-            || self.image_preview.is_some()
+            || self.preview_is_open()
             || self.annotation_note_draft.is_some()
         {
             return false;
@@ -1768,7 +1770,7 @@ impl DesktopReader {
             || interaction_blocked
             || self.ui.overlay_visible()
             || self.ui.sidebar_open
-            || self.image_preview.is_some()
+            || self.preview_is_open()
             || self.annotation_note_draft.is_some()
         {
             return false;
@@ -2038,7 +2040,7 @@ impl DesktopReader {
             && !interaction_blocked
             && !self.ui.overlay_visible()
             && !self.ui.sidebar_open
-            && self.image_preview.is_none()
+            && !self.preview_is_open()
             && !self.focus_assistant_popup_visible()
             && !(self.ui.assistant_panel.is_some() && self.ui.assistant_keyboard_focus)
             && self.annotation_note_draft.is_none()
@@ -2163,7 +2165,7 @@ impl DesktopReader {
             .is_some_and(|position| response.rect.contains(position));
         let blocked = interaction_blocked
             || self.ui.overlay_visible()
-            || self.image_preview.is_some()
+            || self.preview_is_open()
             || self.pending_page_turn.is_some();
         if !page_wheel_input_allowed(pointer_over_page, blocked) {
             self.ui.wheel_accumulator = 0.0;
@@ -2819,7 +2821,7 @@ impl DesktopReader {
         };
         pending
             .or(active)
-            .or_else(|| notes.iter().min_by_key(|note| note.citation.is_some()))
+            .or_else(|| notes.first())
             .map(|note| {
                 self.footnote_loader
                     .text(
@@ -2833,7 +2835,7 @@ impl DesktopReader {
     }
 
     pub(super) fn focus_footnote_overlay(&mut self, ctx: &egui::Context, page_rect: Rect) {
-        if !self.ui.focus_footnotes_visible {
+        if self.media_preview_is_open() || !self.ui.focus_footnotes_visible {
             return;
         }
         let mut footnotes = self.popup_footnotes().to_vec();
@@ -2843,7 +2845,6 @@ impl DesktopReader {
         for note in &mut footnotes {
             note.text = self.footnote_loader.text(note, unavailable).to_owned();
         }
-        footnotes.sort_by_key(|note| note.citation.is_some());
         if footnotes.is_empty() {
             self.close_focus_footnotes();
             return;
@@ -3031,6 +3032,7 @@ impl DesktopReader {
             navigation
         });
         let mut marker_return = None;
+        let mut media_click = None;
         let return_to_marker_text = self.language.text("??????", "Return to reference");
 
         let overlay = egui::Area::new("focus-footnotes".into())
@@ -3129,7 +3131,12 @@ impl DesktopReader {
                                             if focus_popup && !active {
                                                 ui.multiply_opacity(0.45);
                                             }
-                                            active_layout.as_ref().unwrap_or(layout).paint(ui);
+                                            if let Some(key) = active_layout.as_ref().unwrap_or(layout).paint(ui) {
+                                                let note = &footnotes[index];
+                                                if let Some(origin) = note.owner.clone().or_else(|| note.citation.as_ref().map(|(s, _)| s.clone())) {
+                                                    media_click = Some((origin, key));
+                                                }
+                                            }
                                         }).response;
                                         if focus_popup {
                                             let marker_rect = Rect::from_min_size(
@@ -3197,6 +3204,7 @@ impl DesktopReader {
         self.ui
             .focus_footnote_scroll_positions
             .insert(scroll_key, next_scroll_offset);
+        if let Some((origin, key)) = media_click { self.open_media_preview(ctx, origin, key); }
         let actual_height = overlay.response.rect.height();
         ctx.data_mut(|data| data.insert_temp(height_id, actual_height));
         if (actual_height - panel_height).abs() > 0.5 {
@@ -4780,6 +4788,7 @@ impl DesktopReader {
     }
 
     fn classic_footnote_hover_interaction(&mut self, response: &egui::Response) {
+        if self.preserve_media_parent_popup() { return; }
         if self.is_focus_mode() {
             return;
         }
@@ -4882,6 +4891,11 @@ impl DesktopReader {
                 response.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
             }
         }
+        if let Some(p) = response.hover_pos() {
+            if self.media_reference_at_canvas(p.x - response.rect.left() - offset_x, p.y - response.rect.top()).is_some() {
+                response.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+        }
         self.classic_footnote_hover_interaction(response);
         let Some(position) = response.interact_pointer_pos() else {
             if !response.ctx.input(|input| input.pointer.primary_down()) {
@@ -4928,6 +4942,10 @@ impl DesktopReader {
                 self.citation_popup_target = Some(target);
                 self.ui.focus_footnotes_visible = true;
                 response.ctx.request_repaint();
+                return;
+            }
+            if let Some(hit) = self.media_reference_at_canvas(x, y) {
+                self.open_media_preview(&response.ctx, hit.source, hit.key);
                 return;
             }
             if self.try_open_image_preview(&response.ctx, x, y) {
@@ -5125,8 +5143,9 @@ impl DesktopReader {
     }
 
     pub(super) fn copy_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) {
+        if self.media_preview_copy(ctx) { return; }
         let text_edit_focused = ctx.text_edit_focused();
-        let preview = self.image_preview.is_some();
+        let preview = self.preview_is_open();
         if !preview && (text_edit_focused || interaction_blocked) {
             return;
         }
@@ -6759,7 +6778,7 @@ fn show_chat_progress(
     }
 }
 
-fn preview_fit_scale(source: Vec2, available: Vec2) -> f32 {
+pub(super) fn preview_fit_scale(source: Vec2, available: Vec2) -> f32 {
     (available.x / source.x.max(1.0)).min(available.y / source.y.max(1.0))
 }
 
@@ -10257,7 +10276,8 @@ mod reference_suggestion_label_tests {
         reader.rebuild_focus_units(&layout);
         reader.focus_unit_index = 0;
         let owner = reader.focus_units[0].range.clone();
-        // Intentionally unsorted: clipboard routing must match popup row identity.
+        // A citation precedes a footnote in the source; popup navigation and
+        // clipboard routing must retain that same order.
         reader.focus_units[0].footnotes = vec![
             super::super::FocusFootnote {
                 stable_id: Some(egui::Id::new("citation")),
@@ -10275,8 +10295,9 @@ mod reference_suggestion_label_tests {
             },
         ];
         reader.ui.focus_footnotes_visible = true;
-        reader.citation_popup_target = Some((owner.clone(), 2));
         let ctx = egui::Context::default();
+        assert_eq!(reader.active_popup_footnote_text(&ctx), Some("Citation text"));
+        reader.citation_popup_target = Some((owner.clone(), 2));
         let render = |reader: &mut DesktopReader, events| {
             let mut output = ctx.run_ui(
                 egui::RawInput {
@@ -10318,7 +10339,7 @@ mod reference_suggestion_label_tests {
         render(
             &mut reader,
             vec![egui::Event::Key {
-                key: egui::Key::ArrowUp,
+                key: egui::Key::ArrowDown,
                 physical_key: None,
                 pressed: true,
                 repeat: false,

@@ -3,9 +3,29 @@ use peniko::{Color, Fill};
 use vello::Scene;
 
 use crate::preferences::FocusStyle;
-use crate::reader::{DesktopReader, ScrollViewportState, focus_unit_contains_source_range};
+use crate::reader::{
+    DesktopReader, FOCUS_TABLE_BOTTOM_MARGIN, FocusUnit, ScrollViewportState,
+    focus_unit_contains_source_range,
+};
 
 const INACTIVE_OPACITY: f64 = 0.45;
+
+fn clear_content_rect(unit: &FocusUnit) -> egui::Rect {
+    let mut rect = unit.rect;
+    if unit.is_table {
+        // The table focus rectangle includes navigation breathing room, not
+        // painted content. Clearing it would expose the next paragraph's glyphs.
+        rect.max.y -= FOCUS_TABLE_BOTTOM_MARGIN;
+    }
+    rect.expand2(egui::vec2(8.0, 2.0))
+}
+
+fn clear_unit_rects(unit: &FocusUnit) -> impl Iterator<Item = egui::Rect> {
+    std::iter::once(clear_content_rect(unit)).chain(
+        unit.heading_rect
+            .map(|rect| rect.expand2(egui::vec2(8.0, 2.0))),
+    )
+}
 
 // Disjoint rectangles describe the complement of the clear regions. Unlike
 // even-odd holes, overlapping active/selected blocks never dim their overlap.
@@ -60,8 +80,6 @@ impl DesktopReader {
             f64::from(viewport.size.y),
         );
         let translate = |rect: egui::Rect| {
-            // Keep antialiased glyph edges and the adjacent reference icons clear.
-            let rect = rect.expand2(egui::vec2(8.0, 2.0));
             Rect::new(
                 f64::from(rect.left()),
                 f64::from(rect.top() + padding - viewport.offset_y),
@@ -72,23 +90,26 @@ impl DesktopReader {
         let clear = self
             .focus_action_units()
             .iter()
-            .map(|unit| translate(unit.rect));
+            .flat_map(clear_unit_rects)
+            .map(translate);
         let selected = self
             .selection
             .as_ref()
             .filter(|_| self.focus_selection_anchor.is_none())
             .into_iter()
             .flat_map(|selection| {
-                self.focus_units.iter().filter_map(move |unit| {
-                    let rect = translate(unit.rect);
-                    (rect.intersect(bounds).area() > 0.0
-                        && selection
+                self.focus_units
+                    .iter()
+                    .filter(move |unit| {
+                        selection
                             .ranges
                             .iter()
-                            .any(|range| focus_unit_contains_source_range(unit, range)))
-                    .then_some(rect)
-                })
-            });
+                            .any(|range| focus_unit_contains_source_range(unit, range))
+                    })
+                    .flat_map(clear_unit_rects)
+            })
+            .map(translate)
+            .filter(|rect| rect.intersect(bounds).area() > 0.0);
         let mut path = BezPath::new();
         for region in surrounding_regions(bounds, clear.chain(selected)) {
             path.extend(region.path_elements(0.1));
@@ -115,6 +136,337 @@ impl DesktopReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn html_fixture(html: &str) -> (DesktopReader, rebook_publication::Section) {
+        use rebook_publication::{PublicationUrl, SpineItem, SpineItemId};
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: vec![],
+        };
+        let section = rebook_html::parse_section(html, &descriptor, |_| None).unwrap();
+        let reader =
+            crate::reader::semantic_layout::tests::fixture_with_blocks(section.blocks.clone()).0;
+        (reader, section)
+    }
+
+    fn table_fixture() -> DesktopReader {
+        html_fixture(
+            "<html><body><p>Earlier discussion about error rates.</p>
+             <div class='pageavoid'><p class='tnum'>TABLE 3.1</p>
+             <p class='ttitle'>Character classes used in error rates.</p>
+             <table><tr><td>Correct (C)</td><td>All correct characters.</td></tr>
+             <tr><td>Incorrect-not-fixed (INF)</td><td>All incorrect characters.</td></tr>
+             <tr><td>Incorrect-fixed (IF)</td><td>Characters backspaced during entry.</td></tr>
+             <tr><td>Fix (F)</td><td>All backspaces.</td></tr></table></div>
+             <p>Consider the classification example shown in the figure. Automating these
+             classifications is straightforward because we only need the counts.</p>
+             </body></html>",
+        )
+        .0
+    }
+
+    #[test]
+    fn consecutive_headings_follow_only_the_next_semantic_unit() {
+        use rebook_publication::Block;
+        for body in [
+            "<p>Following prose.</p>",
+            "<table><tr><td>Value</td><td>42</td></tr></table>",
+            "<p><img src='image.png' alt='Following image'/></p>",
+            "<ul><li>First item.</li><li>Second item.</li></ul>",
+            "<blockquote><p>Following quotation.</p></blockquote>",
+        ] {
+            let (mut reader, section) = html_fixture(&format!(
+                "<html><body><p>Earlier paragraph.</p><h2>Topic</h2><h3>Subtopic</h3>{body}<p>Later paragraph.</p></body></html>"
+            ));
+            let layout = reader.current_scroll_layout().unwrap();
+            reader.rebuild_focus_units(&layout);
+            let ranges = section
+                .blocks
+                .iter()
+                .filter_map(|block| match block {
+                    Block::Text(text) if text.kind.is_heading() => text.source.clone(),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(ranges.len(), 2);
+            let headings = crate::reader::focus_unit_geometry(&layout, &ranges)
+                .unwrap()
+                .0;
+            assert_eq!(reader.focus_units[0].heading_rect, None);
+            assert_eq!(reader.focus_units[1].heading_rect, Some(headings), "{body}");
+            assert_eq!(reader.focus_units.last().unwrap().heading_rect, None);
+            assert!(
+                reader.focus_units[1]
+                    .paint_ranges
+                    .iter()
+                    .all(|range| !ranges.contains(range)),
+                "display association must preserve the semantic body's ranges"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a native GPU; verifies consecutive heading glyphs remain clear"]
+    fn consecutive_heading_ink_stays_clear_in_direct_and_retained_rendering() {
+        use crate::reader::ReaderFramePlan;
+        use rebook_publication::Block;
+        let (mut reader, section) = html_fixture(
+            "<html><body><p>Earlier paragraph.</p><h2>Topic</h2><h3>Subtopic</h3><p>Following prose belongs to both headings.</p><p>Later paragraph.</p></body></html>",
+        );
+        let layout = reader.current_scroll_layout().unwrap();
+        reader.rebuild_focus_units(&layout);
+        reader.focus_unit_index = 1;
+        let ranges = section
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Text(text) if text.kind.is_heading() => text.source.clone(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let headings = crate::reader::focus_unit_geometry(&layout, &ranges)
+            .unwrap()
+            .0;
+        let padding = reader.scroll_content_padding(600.0);
+        let offset_y = headings.top() + padding - 100.0;
+        reader.scroll_viewport = Some(ScrollViewportState {
+            size: egui::vec2(800.0, 600.0),
+            offset_y,
+        });
+        reader.focus_style = FocusStyle::SurroundingDim;
+        let paper = reader.reader.style().background;
+        let plan = ReaderFramePlan {
+            rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)),
+            scene_id: reader.scene_id,
+            scene_revision: reader.scene_revision,
+            background: Color::from_rgb8(paper.red, paper.green, paper.blue),
+            content_left: 0.0,
+            preview_left: 0.0,
+            reflow_pending: false,
+            live_resize_preview: false,
+        };
+        let mut audit = crate::platform::LayerAudit::new([800, 600]);
+        let units = std::mem::take(&mut reader.focus_units);
+        audit.direct(&reader.page_scene(), plan, 1.0);
+        let baseline = audit.pixels();
+        reader.focus_units = units;
+        audit.direct(&reader.page_scene(), plan, 1.0);
+        let dimmed = audit.pixels();
+        let headings = headings.translate(egui::vec2(0.0, padding - offset_y));
+        let mut checked = 0;
+        for y in headings.top().max(0.0) as usize..headings.bottom().min(600.0) as usize {
+            for x in headings.left().max(0.0) as usize..headings.right().min(800.0) as usize {
+                let before = &baseline[(y * 800 + x) * 4..][..3];
+                if !before
+                    .iter()
+                    .zip([paper.red, paper.green, paper.blue])
+                    .any(|(v, p)| v.abs_diff(p) > 40)
+                {
+                    continue;
+                }
+                let after = &dimmed[(y * 800 + x) * 4..][..3];
+                assert!(
+                    before.iter().zip(after).all(|(a, b)| a.abs_diff(*b) <= 2),
+                    "heading dimmed at {x},{y}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 100);
+        let layers = reader.layered_scene().unwrap();
+        for _ in 0..64 {
+            if !audit.layered(&layers, plan, 1.0).0.pending {
+                break;
+            }
+        }
+        audit.parity(&dimmed, "consecutive-heading-dim");
+        println!("HEADING_CLEAR checked_ink={checked}");
+    }
+
+    #[test]
+    fn table_navigation_margin_does_not_clear_the_next_paragraph() {
+        let mut reader = table_fixture();
+        let layout = reader.current_scroll_layout().unwrap();
+        reader.rebuild_focus_units(&layout);
+        let index = reader
+            .focus_units
+            .iter()
+            .position(|unit| unit.is_table)
+            .unwrap();
+        let table = &reader.focus_units[index];
+        let following = &reader.focus_units[index + 1];
+        assert!(
+            table.rect.bottom() > following.rect.top(),
+            "reproduce navigation margin overlap"
+        );
+        assert!(clear_content_rect(table).bottom() < following.rect.top());
+        assert_eq!(
+            clear_content_rect(following),
+            following.rect.expand2(egui::vec2(8.0, 2.0))
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a native GPU; checks the following line's first ink rows"]
+    fn active_table_dims_the_entire_following_line_in_direct_and_retained_rendering() {
+        assert_table_following_dim(table_fixture());
+    }
+
+    #[test]
+    #[ignore = "requires TORTO_SURROUNDINGS_BOOK and a native GPU; reads local Table 3.1 and captions"]
+    fn local_book_table_following_line_and_caption_audit() {
+        use rebook_publication::{Block, Inline};
+        let path = std::env::var("TORTO_SURROUNDINGS_BOOK").unwrap();
+        let publication = rebook_formats::open_file(path).unwrap();
+        let source = publication.source();
+        let mut figures = 0;
+        let mut tables = 0;
+        let mut parts = 0;
+        let mut bold = 0;
+        let mut italic = 0;
+        let mut target = None;
+        for index in 0..source.book().sections.len() {
+            let section = source.parse_section(index).unwrap();
+            for (index, block) in section.blocks.iter().enumerate() {
+                let captions = match block {
+                    Block::Figure(figure) => {
+                        figures += 1;
+                        figure.captions.iter().collect::<Vec<_>>()
+                    }
+                    Block::Table(table) => {
+                        tables += 1;
+                        table.before.iter().chain(&table.after).collect()
+                    }
+                    Block::Text(text)
+                        if text.kind == rebook_publication::TextBlockKind::Caption =>
+                    {
+                        vec![text]
+                    }
+                    _ => continue,
+                };
+                for caption in captions {
+                    if caption.kind != rebook_publication::TextBlockKind::Caption {
+                        continue;
+                    }
+                    parts += 1;
+                    let runs = caption
+                        .content
+                        .iter()
+                        .flat_map(Inline::text_runs)
+                        .collect::<Vec<_>>();
+                    bold += usize::from(runs.iter().any(|run| run.style.bold));
+                    italic += usize::from(
+                        runs.iter()
+                            .any(|run| run.style.italic || run.style.emphasis),
+                    );
+                    let text = runs.iter().map(|run| run.text.as_str()).collect::<String>();
+                    if text.starts_with("TABLE 3.1 ") {
+                        target = Some(section.blocks[index - 1..=index + 1].to_vec());
+                    }
+                }
+            }
+        }
+        assert!(figures > 5 && tables > 1);
+        println!(
+            "LOCAL_CAPTIONS figures={figures} tables={tables} caption_parts={parts} authored_bold_parts={bold} authored_italic_parts={italic}"
+        );
+        assert_table_following_dim(
+            crate::reader::semantic_layout::tests::fixture_with_blocks(target.expect("Table 3.1"))
+                .0,
+        );
+    }
+
+    fn assert_table_following_dim(mut reader: DesktopReader) {
+        use crate::reader::ReaderFramePlan;
+        let layout = reader.current_scroll_layout().unwrap();
+        reader.rebuild_focus_units(&layout);
+        let index = reader
+            .focus_units
+            .iter()
+            .position(|unit| unit.is_table)
+            .unwrap();
+        reader.focus_unit_index = index;
+        let padding = reader.scroll_content_padding(600.0);
+        let offset_y = reader.focus_units[index].rect.top() + padding - 80.0;
+        let following = reader.focus_units[index + 1]
+            .rect
+            .translate(egui::vec2(0.0, padding - offset_y));
+        reader.scroll_viewport = Some(ScrollViewportState {
+            size: egui::vec2(800.0, 600.0),
+            offset_y,
+        });
+        reader.focus_style = FocusStyle::SurroundingDim;
+        let paper = reader.reader.style().background;
+        let plan = ReaderFramePlan {
+            rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)),
+            scene_id: reader.scene_id,
+            scene_revision: reader.scene_revision,
+            background: Color::from_rgb8(paper.red, paper.green, paper.blue),
+            content_left: 0.0,
+            preview_left: 0.0,
+            reflow_pending: false,
+            live_resize_preview: false,
+        };
+        let mut audit = crate::platform::LayerAudit::new([800, 600]);
+        let units = std::mem::take(&mut reader.focus_units);
+        audit.direct(&reader.page_scene(), plan, 1.0);
+        let baseline = audit.pixels();
+        reader.focus_units = units;
+        audit.direct(&reader.page_scene(), plan, 1.0);
+        let dimmed = audit.pixels();
+        if let Some(path) = std::env::var_os("TORTO_SURROUNDINGS_OUTPUT") {
+            image::RgbaImage::from_raw(800, 600, dimmed.clone())
+                .unwrap()
+                .save(path)
+                .unwrap();
+        }
+        let mut first_ink_y = None;
+        let mut checked = 0;
+        for y in following.top().max(0.0) as usize..following.bottom().min(600.0) as usize {
+            if first_ink_y.is_some_and(|first| y >= first + 6) {
+                break;
+            }
+            for x in following.left().max(0.0) as usize..following.right().min(800.0) as usize {
+                let before = &baseline[(y * 800 + x) * 4..][..3];
+                if !before
+                    .iter()
+                    .zip([paper.red, paper.green, paper.blue])
+                    .any(|(v, p)| v.abs_diff(p) > 40)
+                {
+                    continue;
+                }
+                first_ink_y.get_or_insert(y);
+                let after = &dimmed[(y * 800 + x) * 4..][..3];
+                for ((before, after), paper) in
+                    before
+                        .iter()
+                        .zip(after)
+                        .zip([paper.red, paper.green, paper.blue])
+                {
+                    let expected = (f64::from(*before) * (115.0 / 255.0)
+                        + f64::from(paper) * (140.0 / 255.0))
+                        .round() as u8;
+                    assert!(
+                        after.abs_diff(expected) <= 3,
+                        "undimmed following glyph at {x},{y}"
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 30, "must check actual glyph tops: {checked}");
+        let layers = reader.layered_scene().unwrap();
+        for _ in 0..64 {
+            if !audit.layered(&layers, plan, 1.0).0.pending {
+                break;
+            }
+        }
+        audit.parity(&dimmed, "table-following-line-dim");
+        println!("TABLE_FOLLOWING_DIM first_ink_y={first_ink_y:?} checked_ink={checked}");
+    }
 
     #[test]
     fn overlapping_active_and_selected_regions_are_never_dimmed_twice() {

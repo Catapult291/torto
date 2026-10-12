@@ -17,6 +17,7 @@ impl BookSource for Source {
             href: item.href.clone(),
             anchors: vec![],
             blocks: vec![Block::Image(ImageBlock {
+                ocr_text: None,
                 formula_image: false,
                 formula: None,
                 href: item.href.clone(),

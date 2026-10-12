@@ -169,6 +169,7 @@ impl FootnoteLoader {
         let ids: Vec<_> = ids
             .into_iter()
             .filter(|id| seen.insert(*id))
+            .filter(|id| self.references.contains_key(id))
             .take(CACHE_ENTRIES)
             .collect();
         self.interests = ids.iter().copied().collect();
@@ -295,7 +296,12 @@ mod tests {
         loader.register(second, target2, "2".into());
         assert_eq!(parses.load(Ordering::Relaxed), 0);
         let ctx = egui::Context::default();
-        loader.prepare([first, first], source.clone(), &ctx);
+        // Direct citation/inline text can precede a linked note in the popup.
+        // These rows must not consume the linked-reference loading budget.
+        let ids = (0..CACHE_ENTRIES)
+            .map(|index| egui::Id::new(("citation", index)))
+            .chain([first, first]);
+        loader.prepare(ids, source.clone(), &ctx);
         let finished = loader
             .results
             .as_ref()

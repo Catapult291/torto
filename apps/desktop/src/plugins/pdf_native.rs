@@ -104,7 +104,14 @@ pub(crate) fn load(
         return Ok(None);
     }
     let Some(native) = open(&id)? else {
-        return Ok(None);
+        // An expired native generation must not silently select an unrelated
+        // OCR document. Keep the original page until native text is regenerated.
+        return Ok(Some(PdfOcrLoadedSource {
+            source: original,
+            controller: None,
+            available: false,
+            mode: PdfOcrViewMode::Original,
+        }));
     };
     let targets = native.manifest.page_targets.clone();
     let generation = native.directory().to_owned();
@@ -568,6 +575,42 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        let ocr_root = crate::smoke::project_dirs()
+            .unwrap()
+            .data_local_dir()
+            .join("pdf-ocr")
+            .join(&id);
+        fs::create_dir_all(&ocr_root).unwrap();
+        fs::write(
+            ocr_root.join("document.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1, "book_id": id, "provider": "paddle-ocr", "model": "fixture",
+                "view_mode": "reflow", "pages": [{"markdown": "OCR with a missing footnote"}],
+                "resources": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let fallback = super::super::pdf_ocr::load_pdf_ocr_source(
+            original.clone(),
+            true,
+            Some(original.clone()),
+        )
+        .unwrap();
+        let original_source: Arc<dyn BookSource> = original.clone();
+        assert!(Arc::ptr_eq(&fallback.source, &original_source));
+        assert!(!fallback.available);
+        assert!(fallback.controller.is_none());
+        assert_eq!(fallback.mode, PdfOcrViewMode::Original);
+        assert_eq!(selected(&id), TextSource::Native);
+        // Explicitly selecting OCR remains supported even with an old native cache.
+        select(&id, TextSource::Ocr).unwrap();
+        let ocr =
+            super::super::pdf_ocr::load_pdf_ocr_source(original.clone(), true, None).unwrap();
+        assert!(ocr.available);
+        assert_eq!(ocr.mode, PdfOcrViewMode::Reflow);
+        select(&id, TextSource::Native).unwrap();
+        fs::remove_dir_all(ocr_root).unwrap();
         fs::write(root.join("current.json"), &pointer).unwrap();
         assert!(import(&id, vec![("manifest.json".into(), b"invalid".to_vec())]).is_err());
         assert_eq!(fs::read(root.join("current.json")).unwrap(), pointer);

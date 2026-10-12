@@ -1737,6 +1737,7 @@ impl<'a> ReadingIrParser<'a> {
                     )
             }) {
                 self.queue_node_anchors(cell);
+                self.queue_descendant_anchors(cell);
                 let header = cell.tag_name().name().eq_ignore_ascii_case("th");
                 let mut style = self.styles.block_style(cell, BlockStyle::default());
                 style.indent = 0.0;
@@ -2109,6 +2110,7 @@ impl<'a> ReadingIrParser<'a> {
             style.margin_after = style.margin_after.max(margin_after);
         }
         Ok(Some(ImageBlock {
+            ocr_text: None,
             formula_image: false,
             formula: None,
             href,
@@ -2488,7 +2490,10 @@ fn note_entry_starts_at(
                 return true;
             }
             if !confirmed_note_section
-                || (node_fragment(anchor).is_none() && node_fragment(node).is_none())
+                || !anchor
+                    .ancestors()
+                    .take_while(|ancestor| *ancestor != node.parent().unwrap_or(node))
+                    .any(|ancestor| node_fragment(ancestor).is_some())
                 || !attribute_local(anchor, "href").is_some_and(|href| href.contains('#'))
             {
                 return false;
@@ -2503,6 +2508,25 @@ fn note_entry_starts_at(
 }
 
 fn link_is_scoped_to_note_entry_node(node: Node<'_, '_>, link: Node<'_, '_>) -> bool {
+    // A common endnote layout is one row: a marker cell followed by its text.
+    // Keep the full table as one entry, including IDs on the marker's paragraph.
+    if node.has_tag_name("table") {
+        let rows = node
+            .descendants()
+            .filter(|candidate| candidate.has_tag_name("tr"))
+            .collect::<Vec<_>>();
+        if let [row] = rows.as_slice() {
+            let cells = row
+                .children()
+                .filter(|cell| cell.has_tag_name("td") || cell.has_tag_name("th"))
+                .collect::<Vec<_>>();
+            if let [marker, body] = cells.as_slice() {
+                return marker.descendants().any(|descendant| descendant == link)
+                    && node_text(*marker).trim() == node_text(link).trim()
+                    && !node_text(*body).trim().is_empty();
+            }
+        }
+    }
     let closest_block = link.ancestors().skip(1).find(|ancestor| {
         ancestor.is_element()
             && is_block_boundary(ancestor.tag_name().name().to_ascii_lowercase().as_str())
@@ -2770,6 +2794,7 @@ fn inline_image(
     }
     Some(InlineImageRun {
         image: ImageBlock {
+            ocr_text: None,
             formula_image: false,
             formula: None,
             href: context.base.resolve(src).ok()?.resource_url(),

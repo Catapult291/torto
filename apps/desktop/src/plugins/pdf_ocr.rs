@@ -3962,6 +3962,7 @@ mod tests {
                     href: descriptor.href.clone(),
                     blocks: vec![rebook_publication::Block::Image(
                         rebook_publication::ImageBlock {
+                            ocr_text: None,
                             formula_image: false,
                             formula: None,
                             href: PublicationUrl::parse("Pages/page-00001.png")?,

@@ -483,6 +483,7 @@ pub(super) fn prepare_generated(
                 style: Default::default(),
                 source: None,
                 text_layer: None,
+                ocr_text: None,
                 formula_image: false,
                 formula: None,
             },
@@ -763,6 +764,7 @@ mod tests {
                 alt: String::new(),
                 style: ImageStyle::default(),
                 source: None,
+                ocr_text: None,
                 formula_image: false,
                 formula: None,
                 text_layer: None,
@@ -883,6 +885,7 @@ mod tests {
             alt: String::new(),
             style: ImageStyle::default(),
             source: None,
+            ocr_text: None,
             formula_image: false,
             formula: None,
             text_layer: None,
@@ -917,6 +920,7 @@ mod tests {
         let exact = load(
             &source,
             &ImageBlock {
+                ocr_text: None,
                 formula_image: true,
                 ..block.clone()
             },

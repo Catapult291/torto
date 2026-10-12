@@ -549,6 +549,7 @@ impl Builder {
             image_sources: Vec::new(),
         });
         Block::Image(ImageBlock {
+            ocr_text: None,
             formula_image: formula,
             formula: None,
             href: PublicationUrl::parse(&path).unwrap(),

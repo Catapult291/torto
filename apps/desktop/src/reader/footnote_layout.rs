@@ -66,6 +66,7 @@ pub(super) struct FootnoteLayout {
     uri: String,
     fallback: Option<Arc<egui::Galley>>,
     websites: Vec<(egui::Rect, String)>,
+    media: Vec<(egui::Rect, rebook_publication::media_references::MediaKey)>,
 }
 
 impl FootnoteLayout {
@@ -130,12 +131,13 @@ impl FootnoteLayout {
             uri: String::new(),
             fallback: Some(galley),
             websites: Vec::new(),
+            media: Vec::new(),
         })
     }
-    pub fn paint(&self, ui: &mut egui::Ui) {
+    pub fn paint(&self, ui: &mut egui::Ui) -> Option<rebook_publication::media_references::MediaKey> {
         if let Some(galley) = &self.fallback {
             ui.label(galley.clone());
-            return;
+            return None;
         }
         let (rect, _) =
             ui.allocate_exact_size(egui::vec2(self.width, self.height), egui::Sense::hover());
@@ -145,6 +147,11 @@ impl FootnoteLayout {
         egui::Image::from_bytes(self.uri.clone(), self.svg.clone())
             .maintain_aspect_ratio(false)
             .paint_at(ui, rect);
+        let mut clicked = None;
+        for (index, (bounds, key)) in self.media.iter().enumerate() {
+            let response = ui.interact(bounds.translate(rect.min.to_vec2()), ui.id().with(("media", index)), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+            if response.clicked() { clicked = Some(key.clone()); }
+        }
         for (index, (bounds, url)) in self.websites.iter().enumerate() {
             let response = ui
                 .interact(
@@ -158,6 +165,7 @@ impl FootnoteLayout {
                 ui.ctx().open_url(egui::OpenUrl::new_tab(url));
             }
         }
+        clicked
     }
 }
 
@@ -423,6 +431,14 @@ impl FootnoteRenderer {
             first.text = first.text[length..].to_owned();
             block.content.insert(0, Inline::Text(prefix));
         }
+        if reader_style.typesetting.mode == TypesettingMode::Unified {
+            let color = crate::ui::footnote_link_color();
+            for block in &mut blocks {
+                if let Block::Text(text) = block {
+                    rebook_publication::media_references::style_links(&mut text.content, rebook_publication::Rgba { red: color.r(), green: color.g(), blue: color.b(), alpha: color.a() });
+                }
+            }
+        }
         let engine = self.engine.get_or_insert_with(|| {
             LayoutEngine::with_fonts(crate::fonts::embedded_reader_fonts().iter().cloned())
         });
@@ -437,6 +453,7 @@ impl FootnoteRenderer {
             .map_err(|e| e.to_string())?;
         let mut paths = String::new();
         let mut websites = Vec::new();
+        let mut media = Vec::new();
         let mut content_width = 0.0_f32;
         let mut wrapped = false;
         let mut height = size * 1.45;
@@ -454,6 +471,9 @@ impl FootnoteRenderer {
                     continue;
                 };
                 let mut painted_websites = std::collections::HashSet::new();
+                if reader_style.typesetting.mode == TypesettingMode::Unified {
+                    media.extend(rebook_renderer::text_media_reference_rects(text).into_iter().map(|(rect, key)| (egui::Rect::from_min_max(egui::pos2(rect.x0 as f32, rect.y0 as f32 + page_y), egui::pos2(rect.x1 as f32, rect.y1 as f32 + page_y)), key)));
+                }
                 wrapped |= text.layout.len() > 1;
                 for line in text
                     .layout
@@ -620,6 +640,7 @@ impl FootnoteRenderer {
             height,
             fallback: None,
             websites,
+            media,
             svg: Arc::from(svg.into_bytes()),
             uri: format!("bytes://footnote-{:x}.svg", hash.finish()),
         });
@@ -894,6 +915,39 @@ mod tests {
             .unwrap();
         assert!(original.websites.is_empty());
         assert!(unified.content_width < original.content_width);
+    }
+
+    #[test]
+    fn popup_media_references_are_clickable_after_wrapping_and_only_in_unified_mode() {
+        let source = Source(Book { id: PublicationId::new("popup-media").unwrap(), metadata: Metadata::default(), cover: None, sections: vec![], table_of_contents: vec![] });
+        let mut renderer = FootnoteRenderer::default();
+        let mut style = ReaderStyle::default();
+        style.typesetting.mode = TypesettingMode::Unified;
+        let text = "（如图 4.4，见 Table 3.1）";
+        let layout = renderer.layout_marked(&source, text, "[1]", &style, 14.0, egui::Color32::BLACK, egui::Color32::BLUE, 120.0).unwrap();
+        assert!(layout.media.len() >= 2);
+        assert!(layout.media.iter().all(|(r, _)| r.max.y <= layout.height + 1.0 && r.max.x <= layout.width + 1.0));
+        assert_eq!(layout.media[0].1.number, "4.4");
+        let ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+        let mut position = egui::Pos2::ZERO;
+        let render = |events: Vec<egui::Event>, position: &mut egui::Pos2| {
+            let mut clicked = None;
+            let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 400.0))), events, ..Default::default() }, |ui| {
+                *position = ui.cursor().min + layout.media[0].0.center().to_vec2();
+                clicked = layout.paint(ui);
+            });
+            output.textures_delta.clear();
+            clicked
+        };
+        render(vec![], &mut position);
+        let at = position;
+        render(vec![egui::Event::PointerMoved(at), egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE }], &mut position);
+        let clicked = render(vec![egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE }], &mut position);
+        assert_eq!(clicked.unwrap().number, "4.4");
+        style.typesetting.mode = TypesettingMode::Book;
+        let original = renderer.layout_marked(&source, text, "[1]", &style, 14.0, egui::Color32::BLACK, egui::Color32::BLUE, 120.0).unwrap();
+        assert!(original.media.is_empty());
     }
 
     #[test]

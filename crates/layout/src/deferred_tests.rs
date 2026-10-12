@@ -51,6 +51,7 @@ fn image(name: &str) -> ImageBlock {
         alt: name.into(),
         style: ImageStyle::default(),
         source: None,
+        ocr_text: None,
         formula_image: false,
         formula: None,
         text_layer: None,

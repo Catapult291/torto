@@ -351,7 +351,6 @@ pub struct PluginSettings {
     #[serde(default)]
     pub ocr_reasoning_effort: ReasoningEffort,
     pub pdf_ocr_enabled: bool,
-    pub pdf_ocr_reflow_enabled: bool,
     pub pdf_ocr_provider: PdfOcrProviderKind,
     pub paddle_ocr_model: String,
     #[serde(skip)]
@@ -394,7 +393,6 @@ impl Default for PluginSettings {
             ocr_model: String::new(),
             ocr_reasoning_effort: ReasoningEffort::Default,
             pdf_ocr_enabled: false,
-            pdf_ocr_reflow_enabled: false,
             pdf_ocr_provider: PdfOcrProviderKind::PaddleOcr,
             paddle_ocr_model: "PaddleOCR-VL-1.6".into(),
             paddle_ocr_token: String::new(),
@@ -1128,10 +1126,19 @@ mod tests {
     }
 
     #[test]
+    fn legacy_pdf_ocr_reflow_toggle_is_discarded_without_enabling_ocr_requests() {
+        let mut serialized = serde_json::to_value(PluginSettings::default()).unwrap();
+        serialized["pdf_ocr_reflow_enabled"] = serde_json::json!(false);
+        let mut restored: PluginSettings = serde_json::from_value(serialized).unwrap();
+        restored.normalize();
+        assert!(!restored.pdf_ocr_enabled);
+        assert!(serde_json::to_value(restored).unwrap().get("pdf_ocr_reflow_enabled").is_none());
+    }
+
+    #[test]
     fn ocr_selection_round_trips_and_only_accepts_configured_models() {
         let mut settings = PluginSettings {
             ocr_enabled: false,
-            pdf_ocr_reflow_enabled: true,
             ..PluginSettings::default()
         };
         settings.providers[0]
@@ -1146,7 +1153,6 @@ mod tests {
         let json = serde_json::to_string(&settings).unwrap();
         let restored: PluginSettings = serde_json::from_str(&json).unwrap();
         assert!(!restored.ocr_enabled);
-        assert!(restored.pdf_ocr_reflow_enabled);
         assert_eq!(restored.ocr_provider, DEFAULT_PROVIDER_ID);
         assert_eq!(restored.ocr_model, "qwen/base");
 

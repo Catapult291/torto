@@ -37,6 +37,12 @@ pub struct PageTextHit {
     pub cluster_end: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct MediaReferenceHit {
+    pub source: SourceRange,
+    pub key: rebook_publication::media_references::MediaKey,
+}
+
 /// One durable, single-block piece of a visual text selection.
 #[derive(Debug, Clone)]
 pub struct PageSelectionFragment {
@@ -250,6 +256,19 @@ fn source_range_highlight_path(rects: impl IntoIterator<Item = Rect>) -> BezPath
 }
 
 impl PageDisplayList {
+    pub fn media_reference_at(&self, x: f32, y: f32) -> Option<MediaReferenceHit> {
+        self.text_regions.iter().rev().find_map(|region| {
+            let TextRegion::Shaped(region) = region else { return None };
+            let hit = region.hit_test(x, y, true)?;
+            let reference = region.media_references.iter().find(|r|
+                r.range.start < hit.cluster_end && r.range.end > hit.cluster_start)?;
+            Some(MediaReferenceHit {
+                source: region.source_range_for_bytes(reference.range.clone())?,
+                key: reference.key.clone(),
+            })
+        })
+    }
+
     /// Apply a local reflow correction to a paragraph, including its hit-test
     /// geometry. Other source blocks and the page's scroll geometry stay fixed.
     pub fn translate_source_text(&self, range: &SourceRange, dy: f32) -> Self {
@@ -1464,6 +1483,7 @@ impl TextRegion {
 
 #[derive(Clone)]
 struct ShapedTextRegion {
+    media_references: Arc<[rebook_publication::media_references::MediaReference]>,
     citations: Arc<[rebook_layout::InlineCitationPlacement]>,
     layout: Arc<Layout<TextBrush>>,
     text: Arc<str>,
@@ -1884,6 +1904,12 @@ impl ShapedTextRegion {
             || self.source.start.node != range.start.node
         {
             return None;
+        }
+        if self.fragmented && self.source.start.text_offset == self.source.end.text_offset
+            && range.start.text_offset <= self.source.start.text_offset
+            && range.end.text_offset >= self.source.start.text_offset
+        {
+            return self.visible_byte_range();
         }
         let start_offset = range
             .start
@@ -2760,6 +2786,15 @@ fn fixed_page_mask_color(
 }
 
 fn shaped_text_regions(text: &TextPlacement) -> impl Iterator<Item = TextRegion> + '_ {
+    // Only actual links participate. Caption labels retain their neutral, bold
+    // presentation, and external/work references cannot acquire invisible hits.
+    // Hit testing follows the link color, independently of decorative underlines.
+    let links: Vec<_> = text.layout.lines().skip(text.lines.start).take(text.lines.len())
+        .flat_map(|line| line.items()).filter_map(|item| {
+            let PositionedLayoutItem::GlyphRun(run) = item else { return None };
+            let brush = run.style().brush;
+            (brush.color.blue > brush.color.red).then(|| run.run().text_range())
+        }).collect();
     text.source_spans
         .iter()
         .map(|span| (span.range.clone(), &span.source))
@@ -2769,8 +2804,11 @@ fn shaped_text_regions(text: &TextPlacement) -> impl Iterator<Item = TextRegion>
                 .filter(|_| text.source_spans.is_empty())
                 .map(|source| (text.source_text_start..text.text.len(), source)),
         )
-        .filter_map(|(range, source)| {
+        .filter_map(move |(range, source)| {
             let region = ShapedTextRegion {
+                media_references: rebook_publication::media_references::link_references(&text.text[range.clone()])
+                    .into_iter().map(|mut r| { r.range.start += range.start; r.range.end += range.start; r })
+                    .filter(|r| links.iter().any(|link| link.start < r.range.end && link.end > r.range.start)).collect(),
                 citations: Arc::clone(&text.citations),
                 layout: Arc::clone(&text.layout),
                 text: Arc::clone(&text.text),
@@ -2788,6 +2826,19 @@ fn shaped_text_regions(text: &TextPlacement) -> impl Iterator<Item = TextRegion>
                 .visible_byte_range()
                 .map(|_| TextRegion::Shaped(region))
         })
+}
+
+/// Popup text uses the same cluster geometry as the body, including line wrapping.
+pub fn text_media_reference_rects(text: &TextPlacement) -> Vec<(Rect, rebook_publication::media_references::MediaKey)> {
+    let source = text.source.clone().unwrap_or_else(|| SourceRange {
+        start: SourceAnchor { spine: rebook_publication::SpineItemId::new("media-popup").unwrap(), node: "text".into(), text_offset: 0 },
+        end: SourceAnchor { spine: rebook_publication::SpineItemId::new("media-popup").unwrap(), node: "text".into(), text_offset: text.text.chars().count() as u64 },
+    });
+    let mut text = text.clone(); text.source = Some(source);
+    shaped_text_regions(&text).flat_map(|region| {
+        let TextRegion::Shaped(r) = region else { return Vec::new() };
+        r.media_references.iter().flat_map(|m| r.selection_rects(m.range.clone()).into_iter().map(|rect| (rect, m.key.clone()))).collect::<Vec<_>>()
+    }).collect()
 }
 
 fn fixed_text_region(image: &ImagePlacement) -> Option<TextRegion> {

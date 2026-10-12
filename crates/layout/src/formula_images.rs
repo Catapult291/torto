@@ -8,7 +8,7 @@ pub(super) fn only_formula(block: &TextBlock) -> Option<(&InlineImageRun, Option
     let mut label = String::new();
     for inline in &block.content {
         match inline {
-            Inline::Image(run) if image.is_none() => image = Some(run.as_ref()),
+            Inline::Image(run) if image.is_none() && run.image.ocr_text.is_none() => image = Some(run.as_ref()),
             Inline::Text(run) => label.push_str(&run.text),
             Inline::Break => label.push(' '),
             _ => return None,
@@ -128,6 +128,7 @@ mod tests {
                             style: Default::default(),
                             source: None,
                             text_layer: None,
+                            ocr_text: None,
                             formula_image: true,
                             formula: Some(ImageFormula {
                                 latex: (*latex).into(),
@@ -428,6 +429,7 @@ mod tests {
         )))]);
         for formula in [false, true] {
             let image = Block::Image(ImageBlock {
+                ocr_text: None,
                 formula_image: formula,
                 formula: formula.then(|| ImageFormula {
                     latex: "x=1".into(),
@@ -529,6 +531,7 @@ mod tests {
             end: anchor,
         };
         let image = ImageBlock {
+            ocr_text: None,
             formula_image: true,
             formula: Some(ImageFormula {
                 latex: r"P_i=\frac{e^{U_i/t}}{\sum_j e^{U_j/t}}".into(),

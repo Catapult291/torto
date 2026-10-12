@@ -60,13 +60,13 @@ fn search_sections(
         for block in &section.blocks {
             if let Block::Table(table) = block {
                 for cell in table.text_blocks() {
-                    let Some(source_range) = &cell.source else {
+                    let Some(_source_range) = &cell.source else {
                         continue;
                     };
                     let text = text_block_text(cell);
                     for found in matcher.find_iter(&text) {
                         let range =
-                            source_range_for_match(source_range, &text, found.start(), found.end());
+                            text_block_match_range(cell, found.start(), found.end());
                         results.push(BookSearchResult {
                             section_index,
                             section_title: section_title.clone(),
@@ -100,7 +100,7 @@ fn search_sections(
                 }
                 Block::Quote(quote) => {
                     for child in quote.body.iter().chain(quote.attribution.iter()) {
-                        let Some(source_range) = &child.source else {
+                        let Some(_source_range) = &child.source else {
                             continue;
                         };
                         let text = text_block_text(child);
@@ -116,12 +116,7 @@ fn search_sections(
                                 ),
                                 matched_text: found.as_str().to_owned(),
                                 block_kind: text_block_kind(child).to_owned(),
-                                range: source_range_for_match(
-                                    source_range,
-                                    &text,
-                                    found.start(),
-                                    found.end(),
-                                ),
+                                range: text_block_match_range(child, found.start(), found.end()),
                             });
                             if results.len() >= max_results {
                                 return Ok(results);
@@ -147,7 +142,9 @@ fn search_sections(
                 }
             };
             for found in matcher.find_iter(&text) {
-                let range = source_range_for_match(source_range, &text, found.start(), found.end());
+                let range = if let Block::Text(block) = block {
+                    text_block_match_range(block, found.start(), found.end())
+                } else { source_range_for_match(source_range, &text, found.start(), found.end()) };
                 results.push(BookSearchResult {
                     section_index,
                     section_title: section_title.clone(),
@@ -188,7 +185,7 @@ pub(crate) fn text_block_text(block: &TextBlock) -> String {
             Inline::Text(run) => run.text.clone(),
             Inline::Ruby(run) => run.base_text(),
             Inline::Math(run) => run.original_text().unwrap_or_else(|| run.latex.clone()),
-            Inline::Image(_) => String::new(),
+            Inline::Image(image) => image.image.ocr_text.as_ref().map(|text| text.display_text().to_owned()).unwrap_or_default(),
             Inline::Break => "\n".to_owned(),
         })
         .collect()
@@ -268,6 +265,41 @@ fn source_range_for_match(
     }
 }
 
+fn text_block_match_range(block: &TextBlock, byte_start: usize, byte_end: usize) -> SourceRange {
+    let source = block.source.as_ref().expect("search requires a source");
+    let text = text_block_text(block);
+    if !block.content.iter().any(|i| matches!(i,Inline::Image(r) if r.image.ocr_text.is_some())) {
+        return source_range_for_match(source, &text, byte_start, byte_end);
+    }
+    if source.start.spine != source.end.spine || source.start.node != source.end.node { return source.clone() }
+    let segments = block.content.iter().map(|i| match i {
+        Inline::Text(r) => (r.text.chars().count(), r.text.chars().count()),
+        Inline::Ruby(r) => (r.source_char_len(), r.source_char_len()),
+        Inline::Math(r) => (r.original_text().unwrap_or_else(|| r.latex.clone()).chars().count(), r.source_char_len()),
+        Inline::Image(r) => (r.image.ocr_text.as_ref().map_or(0, |t| t.display_text().chars().count()), 0),
+        Inline::Break => (1,1),
+    }).collect::<Vec<_>>();
+    let total = segments.iter().map(|(_,canonical)| canonical).sum::<usize>();
+    let canonical = |at: usize| {
+        let mut display = 0;
+        let mut source = 0;
+        for (len, original) in &segments {
+            if at <= display + len { return source + (at - display).min(*original); }
+            display += len;
+            source += original;
+        }
+        source
+    };
+    let raw_length = source.end.text_offset.saturating_sub(source.start.text_offset);
+    let offset = |at: usize| source.start.text_offset + if total == 0 { 0 } else {
+        (canonical(at) as u128 * raw_length as u128 / total as u128) as u64
+    };
+    SourceRange {
+        start: SourceAnchor { text_offset: offset(text[..byte_start].chars().count()), ..source.start.clone() },
+        end: SourceAnchor { text_offset: offset(text[..byte_end].chars().count()), ..source.end.clone() },
+    }
+}
+
 fn excerpt(text: &str, start: usize, end: usize, context_chars: usize) -> String {
     let context_start = text[..start]
         .char_indices()
@@ -295,6 +327,26 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn recognized_text_search_keeps_following_source_offsets_and_image_slot() {
+        let mut block = TextBlock { kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun { text: "A".into(), style: Default::default(), link: None }),
+                Inline::Image(Box::new(rebook_publication::InlineImageRun {
+                    image: ImageBlock { ocr_text: Some(rebook_publication::ImageText { text: "か".into(), literal: true, translated: None }),
+                        formula_image: false, formula: None, href: PublicationUrl::parse("kana.png").unwrap(), alt: String::new(),
+                        style: Default::default(), source: None, text_layer: None },
+                    size_scale: 1.0, intrinsic_sizing: false, vertical_align: rebook_publication::InlineImageAlignment::Baseline, presentation: false,
+                })), Inline::Text(TextRun { text: " B".into(), style: Default::default(), link: None })],
+            style: Default::default(), source: None };
+        let start = SourceAnchor { spine: SpineItemId::new("s").unwrap(), node: "p".into(), text_offset: 0 };
+        block.source = Some(SourceRange { start: start.clone(), end: SourceAnchor { text_offset: 3, ..start } });
+        assert_eq!(text_block_text(&block), "Aか B");
+        let kana = text_block_match_range(&block, 1, 4);
+        assert_eq!((kana.start.text_offset, kana.end.text_offset), (1,1));
+        let following = text_block_match_range(&block, 5, 6);
+        assert_eq!((following.start.text_offset, following.end.text_offset), (2,3));
+    }
 
     struct SearchSource {
         book: Book,
@@ -409,6 +461,7 @@ mod tests {
                 id: spine,
                 href,
                 blocks: vec![Block::Image(ImageBlock {
+                    ocr_text: None,
                     formula_image: false,
                     formula: None,
                     href: PublicationUrl::parse("Pages/page-00001.png").unwrap(),

@@ -119,8 +119,6 @@ impl DesktopReader {
             || old_ocr_provider != new_ocr_provider;
         let toc_recognition_enable_changed =
             self.plugin_settings.ocr_enabled != plugin_settings.ocr_enabled;
-        let pdf_ocr_reflow_changed =
-            self.plugin_settings.pdf_ocr_reflow_enabled != plugin_settings.pdf_ocr_reflow_enabled;
         let translation_mode_changed =
             self.plugin_settings.translation_mode != plugin_settings.translation_mode;
 
@@ -246,15 +244,6 @@ impl DesktopReader {
                     self.queue_visible_section_translation();
                 }
                 self.queue_toc_translation();
-                if pdf_ocr_reflow_changed && self.pdf_ocr.available {
-                    self.persist_progress();
-                    self.reopen_notice = Some(
-                        language
-                            .text("已更新 PDF OCR 内容重排", "PDF OCR content reflow updated")
-                            .into(),
-                    );
-                    self.reopen_requested = Some(self.source_path.clone());
-                }
             }
             Err(error) => {
                 self.error = Some(format!(

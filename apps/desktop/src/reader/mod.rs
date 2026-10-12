@@ -82,6 +82,7 @@ mod footnote_layout;
 mod footnote_navigation;
 mod footnotes;
 mod images;
+mod media_preview;
 mod interaction;
 mod navigation;
 pub(super) mod render;
@@ -295,7 +296,7 @@ pub(crate) fn open_reader_staged(
         if format == BookFormat::Pdf {
             match load_pdf_ocr_source(
                 Arc::clone(&canonical_source),
-                plugin_settings.pdf_ocr_reflow_enabled,
+                true, // OCR content always uses reflow; original-PDF view remains separate.
                 original_cache,
             ) {
                 Ok(loaded) => (
@@ -875,6 +876,7 @@ pub(super) struct DesktopReader {
     selected_image: Option<SelectedImage>,
     image_pointer_state: ImagePointerState,
     image_preview: Option<ImagePreview>,
+    media_preview: media_preview::MediaPreviewController,
     annotation_note_draft: Option<AnnotationDraft>,
     selected_highlight_id: Option<String>,
     focused_mark: Option<FocusedMark>,
@@ -1013,6 +1015,8 @@ struct FocusUnit {
     is_image: bool,
     image_rect: Option<egui::Rect>,
     caption_rect: Option<egui::Rect>,
+    /// Display-only geometry of consecutive titles preceding this semantic unit.
+    heading_rect: Option<egui::Rect>,
     is_table: bool,
     rectangular_activation: bool,
     structured_activation: bool,
@@ -1043,6 +1047,9 @@ impl FocusFootnote {
             return &self.text;
         }
         let text = self.text.trim();
+        if rebook_publication::media_references::is_citation(text) {
+            return text;
+        }
         for (open, close) in [('(', ')'), ('（', '）'), ('[', ']'), ('［', '］')] {
             if let Some(inner) = text.strip_prefix(open).and_then(|s| s.strip_suffix(close)) {
                 return inner.trim();
@@ -1143,64 +1150,66 @@ fn text_block_footnote_references(block: &TextBlock) -> Vec<(String, Publication
 
 fn text_block_focus_footnotes(block: &TextBlock) -> Vec<FocusFootnoteSource> {
     let mut notes = Vec::new();
-    for (index, range) in rebook_layout::paragraph_footnotes(block)
+    let mut footnotes = rebook_layout::paragraph_footnotes(block)
         .into_iter()
         .enumerate()
-    {
-        let Inline::Text(first) = &block.content[range.start] else {
-            unreachable!()
-        };
-        let text: String = block.content[range]
-            .iter()
-            .filter_map(|inline| {
-                if let Inline::Text(run) = inline {
-                    Some(run.text.as_str())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let number = if first.style.footnote_number == 0 {
-            index as u32 + 1
-        } else {
-            first.style.footnote_number
-        };
-        if first.style.inline_role == InlineRole::Footnote {
-            notes.push(FocusFootnoteSource::Inline(text.trim().to_owned(), number));
-        } else if let Some(target) = &first.link {
-            notes.push(FocusFootnoteSource::Reference {
-                marker: text.trim().to_owned(),
-                target: target.clone(),
-                number,
-            });
-        }
-    }
-    if let Some(source) = &block.source {
-        let mut index = 0;
-        while index < block.content.len() {
-            let Inline::Text(run) = &block.content[index] else {
-                index += 1;
-                continue;
+        .peekable();
+    let mut index = 0;
+    // Walk the inlines once so references, inline notes and citations stay
+    // interleaved in their authored order, independently of their numbering.
+    while index < block.content.len() {
+        if footnotes
+            .peek()
+            .is_some_and(|(_, range)| range.start == index)
+        {
+            let (ordinal, range) = footnotes.next().unwrap();
+            let Inline::Text(first) = &block.content[range.start] else {
+                unreachable!()
             };
-            let number = run.style.inline_citation;
-            if number == 0 {
-                index += 1;
-                continue;
+            index = range.end;
+            let text = block.content[range]
+                .iter()
+                .flat_map(Inline::text_runs)
+                .map(|run| run.text.as_str())
+                .collect::<String>();
+            let number = if first.style.footnote_number == 0 {
+                ordinal as u32 + 1
+            } else {
+                first.style.footnote_number
+            };
+            if first.style.inline_role == InlineRole::Footnote {
+                notes.push(FocusFootnoteSource::Inline(text.trim().to_owned(), number));
+            } else if let Some(target) = &first.link {
+                notes.push(FocusFootnoteSource::Reference {
+                    marker: text.trim().to_owned(),
+                    target: target.clone(),
+                    number,
+                });
             }
-            let mut text = String::new();
-            while let Some(Inline::Text(run)) = block.content.get(index) {
-                if run.style.inline_citation != number {
-                    break;
-                }
-                text.push_str(&run.text);
-                index += 1;
-            }
-            notes.push(FocusFootnoteSource::Citation {
-                text,
-                source: source.clone(),
-                number,
-            });
+            continue;
         }
+        let Inline::Text(run) = &block.content[index] else {
+            index += 1;
+            continue;
+        };
+        let number = run.style.inline_citation;
+        let Some(source) = block.source.as_ref().filter(|_| number != 0) else {
+            index += 1;
+            continue;
+        };
+        let mut text = String::new();
+        while let Some(Inline::Text(run)) = block.content.get(index) {
+            if run.style.inline_citation != number {
+                break;
+            }
+            text.push_str(&run.text);
+            index += 1;
+        }
+        notes.push(FocusFootnoteSource::Citation {
+            text,
+            source: source.clone(),
+            number,
+        });
     }
     notes
 }
@@ -1658,6 +1667,11 @@ fn merge_inferred_caption_focus_unit(image: &mut FocusUnit, caption: FocusUnit) 
     image.text = caption.text;
     image.clipboard_text = caption.clipboard_text;
     image.rect = image.rect.union(caption.rect);
+    image.heading_rect = match (image.heading_rect, caption.heading_rect) {
+        (Some(left), Some(right)) => Some(left.union(right)),
+        (Some(rect), None) | (None, Some(rect)) => Some(rect),
+        (None, None) => None,
+    };
     image.is_table |= caption.is_table;
     image.rectangular_activation |= caption.rectangular_activation;
     image.structured_activation |= caption.structured_activation;
@@ -2818,7 +2832,6 @@ impl DesktopReader {
                 note.owner = owners.get(&note.number).cloned();
             }
         }
-        notes.sort_by_key(|note| note.citation.is_some());
         notes
     }
 
@@ -2865,6 +2878,7 @@ impl DesktopReader {
             focus_anchor_block_index(&section.blocks, self.focus_anchor.as_ref());
         let mut first_unit_after_anchor = None;
         let mut leading_heading_ranges = Vec::new();
+        let mut pending_heading_ranges = Vec::new();
         let mut units: Vec<FocusUnit> = Vec::new();
         let mut active_list_root: Option<(usize, u8)> = None;
         for (block_index, block) in section.blocks.iter().enumerate() {
@@ -2877,10 +2891,12 @@ impl DesktopReader {
                 })
             }) {
                 active_list_root = None;
+                pending_heading_ranges.clear();
                 continue;
             }
             if block_is_footnote_definition(block) {
                 active_list_root = None;
+                pending_heading_ranges.clear();
                 continue;
             }
             let inferred_caption_image_range = if matches!(
@@ -2903,10 +2919,11 @@ impl DesktopReader {
                     Block::Text(block) => {
                         if block.kind.is_heading() {
                             active_list_root = None;
-                            if units.is_empty()
-                                && let Some(range) = block.source.clone()
-                            {
-                                leading_heading_ranges.push(range);
+                            if let Some(range) = block.source.clone() {
+                                if units.is_empty() {
+                                    leading_heading_ranges.push(range.clone());
+                                }
+                                pending_heading_ranges.push(range);
                             }
                             continue;
                         }
@@ -3070,6 +3087,9 @@ impl DesktopReader {
             if is_table {
                 rect.max.y += FOCUS_TABLE_BOTTOM_MARGIN;
             }
+            let heading_rect =
+                focus_unit_geometry(layout, &pending_heading_ranges).map(|(rect, _)| rect);
+            pending_heading_ranges.clear();
             let target_reached = first_unit_after_anchor.is_none()
                 && focus_block_index.is_some_and(|target| block_index >= target);
             let single_image = matches!(block, Block::Image(image) if image.text_layer.is_none())
@@ -3100,6 +3120,7 @@ impl DesktopReader {
                 is_image,
                 image_rect,
                 caption_rect,
+                heading_rect,
                 is_table,
                 rectangular_activation,
                 structured_activation,
@@ -4616,6 +4637,7 @@ impl DesktopReader {
             selected_image: None,
             image_pointer_state: ImagePointerState::Idle,
             image_preview: None,
+            media_preview: Default::default(),
             annotation_note_draft: None,
             selected_highlight_id: None,
             focused_mark: None,
@@ -5337,6 +5359,73 @@ mod tests {
     }
 
     #[test]
+    fn endnote_tables_with_nested_marker_ids_resolve_as_individual_notes() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("notes").unwrap(),
+            href: PublicationUrl::parse("notes.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let section = rebook_html::parse_section_with_hints_and_image_classifier(
+            r##"<html><body><div><h2>Notes</h2><h3>Introduction</h3><table><tbody><tr><td><p id="n3"><a href="body.xhtml#r3">3</a></p></td><td>The term infantocracy is associated with Milan Kundera.</td></tr></tbody></table><table><tbody><tr><td><p id="n4"><a href="body.xhtml#r4">4</a></p></td><td>Ellis, B. E. White.</td></tr></tbody></table></div></body></html>"##,
+            &descriptor,
+            |_| None,
+            |_| false,
+            rebook_html::SectionParseHints { note_section: true, ..Default::default() },
+        ).unwrap();
+        for (id, marker, expected, excluded) in [
+            ("n3", "3", "Milan Kundera", "White"),
+            ("n4", "4", "White", "Milan Kundera"),
+        ] {
+            let target = descriptor.href.resolve(&format!("#{id}")).unwrap();
+            let popup = focus_footnote_text_in_section(&section, &target, marker).unwrap();
+            assert!(popup.contains(expected), "{popup}");
+            assert!(!popup.contains(excluded), "{popup}");
+            assert!(!popup.contains("Introduction"), "{popup}");
+            assert!(!popup.starts_with(marker), "{popup}");
+            assert_eq!(focus_footnote_translation_ranges_in_section(&section, &target).len(), 2);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires TORTO_FOOTNOTE_BOOK pointing to the local Infantilised EPUB"]
+    fn local_epub_infantilised_footnotes_resolve_without_neighboring_entries() {
+        let path = std::env::var("TORTO_FOOTNOTE_BOOK").unwrap();
+        let opened = rebook_formats::open_file_for_reading(path, None).unwrap();
+        let source = opened.source();
+        for index in 0..source.book().sections.len() {
+            let section = source.parse_section(index).unwrap();
+            for block in &section.blocks {
+                let Block::Text(text) = block else { continue };
+                if !rebook_formats::reflow::text(text).starts_with("But while infantilisation") {
+                    continue;
+                }
+                let notes = text_block_focus_footnotes(text);
+                assert_eq!(notes.len(), 2);
+                for (note, marker, expected, excluded) in [
+                    (&notes[0], "3", "Milan Kundera", "Ellis"),
+                    (&notes[1], "4", "Ellis", "Milan Kundera"),
+                ] {
+                    let FocusFootnoteSource::Reference { marker: actual, target, .. } = note
+                    else { panic!("not a linked footnote") };
+                    assert_eq!(actual, marker);
+                    let target_index = source.book().sections.iter()
+                        .position(|item| item.href.path() == target.path()).unwrap();
+                    let definition = source.parse_section(target_index).unwrap();
+                    let popup = focus_footnote_text_in_section(&definition, target, marker).unwrap();
+                    assert!(popup.contains(expected), "{popup}");
+                    assert!(!popup.contains(excluded), "{popup}");
+                    assert!(!popup.starts_with(marker), "{popup}");
+                    eprintln!("INFANTILISED_FOOTNOTE marker={marker} popup={popup}");
+                }
+                return;
+            }
+        }
+        panic!("Infantilised introduction paragraph was not found");
+    }
+
+    #[test]
     fn focus_footnotes_reuse_current_and_linked_section_parses() {
         let current = footnote_section("current", "current.xhtml", "1 Current note");
         let linked = footnote_section("linked", "linked.xhtml", "2 Linked note");
@@ -5615,6 +5704,55 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires TORTO_TEST_NATIVE_GENERATION pointing to the local Pick, Click, Flick! cache"]
+    fn local_native_wikipedia_footnote_resolves_to_complete_popup_text() {
+        let directory =
+            std::path::PathBuf::from(std::env::var("TORTO_TEST_NATIVE_GENERATION").unwrap());
+        let manifest: rebook_formats::pdf_reflow::Manifest =
+            serde_json::from_slice(&std::fs::read(directory.join("manifest.json")).unwrap())
+                .unwrap();
+        let source =
+            rebook_formats::pdf_reflow::ReflowSource::open(&directory, manifest.book.id.as_str())
+                .unwrap();
+        for index in 0..source.book().sections.len() {
+            let section = source.parse_section(index).unwrap();
+            for block in &section.blocks {
+                let Block::Text(text) = block else { continue };
+                let plain = rebook_formats::reflow::text(text);
+                if !plain.starts_with("Wikipedia") || !plain.contains("definition:") {
+                    continue;
+                }
+                let notes = text_block_focus_footnotes(text);
+                let [FocusFootnoteSource::Reference { marker, target, .. }] = notes.as_slice()
+                else {
+                    panic!("missing Wikipedia linked footnote: {plain}");
+                };
+                assert_eq!(marker, "2");
+                let target_index = source
+                    .book()
+                    .sections
+                    .iter()
+                    .position(|item| item.href.path() == target.path())
+                    .unwrap();
+                let definition = source.parse_section(target_index).unwrap();
+                let popup = focus_footnote_text_in_section(&definition, target, marker).unwrap();
+                let compact = popup.split_whitespace().collect::<Vec<_>>().join(" ");
+                assert!(
+                    popup.contains("en.wikipedia.org/wiki/Interaction_technique"),
+                    "{popup}"
+                );
+                assert!(compact.contains("references to Wikipedia"), "{popup}");
+                assert!(compact.contains("original sources that"), "{popup}");
+                assert!(popup.contains("change."), "{popup}");
+                assert!(!popup.starts_with("2."), "{popup}");
+                eprintln!("WIKIPEDIA_FOOTNOTE section={index} target={target} popup={popup}");
+                return;
+            }
+        }
+        panic!("Wikipedia definition paragraph was not found");
+    }
+
+    #[test]
     fn superscript_backlinks_are_not_exposed_as_focus_footnotes() {
         let block = TextBlock {
             kind: TextBlockKind::Paragraph,
@@ -5632,6 +5770,72 @@ mod tests {
         };
 
         assert!(text_block_focus_footnotes(&block).is_empty());
+    }
+
+    #[test]
+    fn mixed_footnotes_and_citations_follow_inline_appearance_order() {
+        let source = SourceRange {
+            start: SourceAnchor {
+                spine: SpineItemId::new("chapter").unwrap(),
+                node: "mixed-notes".into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine: SpineItemId::new("chapter").unwrap(),
+                node: "mixed-notes".into(),
+                text_offset: 100,
+            },
+        };
+        let citation = |text: &str, number| {
+            Inline::Text(TextRun {
+                text: text.into(),
+                style: TextStyle {
+                    inline_citation: number,
+                    ..Default::default()
+                },
+                link: None,
+            })
+        };
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            style: BlockStyle::default(),
+            source: Some(source.clone()),
+            content: vec![
+                citation("First ", 2),
+                citation("citation", 2),
+                Inline::Text(TextRun {
+                    text: "1".into(),
+                    style: TextStyle {
+                        link_role: LinkRole::FootnoteReference,
+                        ..Default::default()
+                    },
+                    link: Some(PublicationUrl::parse("notes.xhtml#n1").unwrap()),
+                }),
+                citation("Second citation", 1),
+                Inline::Text(TextRun {
+                    text: "Inline note".into(),
+                    style: TextStyle {
+                        inline_role: InlineRole::Footnote,
+                        ..Default::default()
+                    },
+                    link: None,
+                }),
+            ],
+        };
+        let (mut reader, _, _) = super::semantic_layout::tests::fixture();
+        let notes = reader.resolve_focus_footnotes(&Block::Text(block));
+        assert_eq!(
+            notes
+                .iter()
+                .map(|note| (note.citation.is_some(), note.number))
+                .collect::<Vec<_>>(),
+            [(true, 2), (false, 1), (true, 1), (false, 2)]
+        );
+        assert_eq!(notes[0].text, "First citation");
+        assert_eq!(notes[2].text, "Second citation");
+        assert_eq!(notes[3].text, "Inline note");
+        assert_eq!(notes[1].owner, Some(source.clone()));
+        assert_eq!(notes[3].owner, Some(source));
     }
 
     #[test]
@@ -6242,6 +6446,7 @@ mod tests {
         let caption_range = range("caption");
         let block = Block::Figure(FigureBlock {
             images: vec![ImageBlock {
+                ocr_text: None,
                 formula_image: false,
                 formula: None,
                 href: PublicationUrl::parse("image.png").unwrap(),
@@ -6300,6 +6505,7 @@ mod tests {
             is_image: true,
             image_rect: None,
             caption_rect: None,
+            heading_rect: None,
             is_table: false,
             rectangular_activation: false,
             structured_activation: false,
@@ -6318,6 +6524,7 @@ mod tests {
             is_image: false,
             image_rect: None,
             caption_rect: None,
+            heading_rect: None,
             is_table: false,
             rectangular_activation: false,
             structured_activation: false,
@@ -6372,6 +6579,7 @@ mod tests {
             is_image: true,
             image_rect: Some(image),
             caption_rect: None,
+            heading_rect: None,
             is_table: false,
             rectangular_activation: false,
             structured_activation: false,
@@ -6652,6 +6860,7 @@ mod tests {
             is_image: false,
             image_rect: None,
             caption_rect: None,
+            heading_rect: None,
             is_table: false,
             rectangular_activation: false,
             structured_activation: false,
@@ -6731,6 +6940,7 @@ mod tests {
             is_image: false,
             image_rect: None,
             caption_rect: None,
+            heading_rect: None,
             is_table: false,
             rectangular_activation: false,
             structured_activation: false,

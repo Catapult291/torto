@@ -1,6 +1,7 @@
 //! Format-neutral publication, resource, and locator contracts.
 
 mod headings;
+pub mod media_references;
 pub use headings::heading_ordinal_key;
 
 use std::fmt;
@@ -848,6 +849,9 @@ pub struct TextRun {
 /// Image block referencing a publication resource.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImageBlock {
+    /// Derived faithful Unicode transcription; the authored image remains available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ocr_text: Option<ImageText>,
     /// Vision confirmed a formula, even if transcription was unreadable.
     #[serde(default)]
     pub formula_image: bool,
@@ -899,6 +903,22 @@ pub struct ImageFormula {
     pub latex: String,
     /// Number transcribed from the image, not an existing HTML equation label.
     pub equation_number: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageText {
+    pub text: String,
+    /// Script/character examples must not be rewritten by translation.
+    #[serde(default)]
+    pub literal: bool,
+    #[serde(skip)]
+    pub translated: Option<String>,
+}
+
+impl ImageText {
+    pub fn display_text(&self) -> &str {
+        self.translated.as_deref().unwrap_or(&self.text)
+    }
 }
 
 /// An authored image figure kept together with its caption.

@@ -1629,13 +1629,6 @@ fn ocr_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                 });
                 ui.end_row();
 
-                settings_row_label(ui, language.text("流式版式", "Reflow layout"));
-                settings_row_control_sized(ui, 44.0, |ui| {
-                    ui.add_enabled_ui(settings.pdf_ocr_enabled, |ui| {
-                        toggle_switch(ui, &mut settings.pdf_ocr_reflow_enabled);
-                    });
-                });
-                ui.end_row();
             });
     });
 }

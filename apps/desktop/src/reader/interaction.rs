@@ -234,6 +234,16 @@ impl DesktopReader {
             })
     }
 
+    pub(in crate::reader) fn media_reference_at_canvas(&mut self, x: f32, y: f32) -> Option<rebook_renderer::MediaReferenceHit> {
+        if self.reader.style().typesetting.mode != rebook_layout::TypesettingMode::Unified { return None; }
+        if self.is_scroll_mode() {
+            let (position, px, py) = self.scroll_page_coordinates(x, y)?;
+            self.reader.media_reference_at_page(position, px, py).ok().flatten()
+        } else {
+            self.reader.media_reference_at_current_spread(x, y).ok().flatten()
+        }
+    }
+
     pub(in crate::reader) fn citation_at_canvas(
         &mut self,
         x: f32,

@@ -11,16 +11,23 @@ use rebook_publication::{
 
 use super::TranslationMode;
 mod diagnostics;
+mod image_tags;
 #[cfg(test)]
 use super::search::text_block_text;
 
 const MATH_PLACEHOLDER_PREFIX: &str = "<t-math-";
 const MATH_PLACEHOLDER_SUFFIX: &str = "/>";
+const IMAGE_PLACEHOLDER_PREFIX: &str = "<t-img-";
+
+#[cfg(test)]
+#[path = "translation/inline_images_tests.rs"]
+mod inline_images_tests;
 
 // Normalize old cached protocol tags on read; newly generated requests use t-.
 fn normalize_legacy_placeholder_tags(text: &str) -> std::borrow::Cow<'_, str> {
-    if text.contains("<torto-") || text.contains("</torto-") {
-        std::borrow::Cow::Owned(text.replace("<torto-", "<t-").replace("</torto-", "</t-"))
+    if text.contains("<torto-") || text.contains("</torto-") || text.contains("<t-image-") || text.contains("</t-image-") {
+        std::borrow::Cow::Owned(text.replace("<torto-", "<t-").replace("</torto-", "</t-")
+            .replace("<t-image-", "<t-img-").replace("</t-image-", "</t-img-"))
     } else {
         std::borrow::Cow::Borrowed(text)
     }
@@ -61,6 +68,15 @@ pub(crate) fn prepare_translation_inputs(
 struct StoredBlockTranslation {
     whole: Option<String>,
     segments: HashMap<usize, String>,
+}
+
+impl StoredBlockTranslation {
+    fn matches_input(&self, input: &TranslationBlockInput) -> bool {
+        input.segment_index.map_or_else(
+            || self.whole.as_deref(),
+            |segment| self.segments.get(&segment).map(String::as_str),
+        ).is_some_and(|text| validate_translation_image_placeholders(&input.text, text).is_ok())
+    }
 }
 
 #[derive(Default)]
@@ -120,12 +136,7 @@ impl TranslationBookSource {
                     .any(|range| source_range_nodes_overlap(source, range))
                     && !stored
                         .and_then(|entries| entries.get(&input.block_index))
-                        .is_some_and(|value| {
-                            input.segment_index.map_or_else(
-                                || value.whole.is_some(),
-                                |segment| value.segments.contains_key(&segment),
-                            )
-                        })
+                        .is_some_and(|value| value.matches_input(input))
             })
             .map(|(input, _)| input.clone())
             .collect())
@@ -309,12 +320,7 @@ impl TranslationBookSource {
                         && !stored.is_some_and(|translations| {
                             translations
                                 .get(&input.block_index)
-                                .is_some_and(|translation| {
-                                    input.segment_index.map_or_else(
-                                        || translation.whole.is_some(),
-                                        |segment| translation.segments.contains_key(&segment),
-                                    )
-                                })
+                                .is_some_and(|translation| translation.matches_input(input))
                         })
                 })
                 .collect(),
@@ -364,6 +370,7 @@ fn prepared_input_matches(block: &Block, translation: &StoredBlockTranslation) -
         } {
             let source = translation_text(text);
             valid &= validate_translation_math_placeholders(&source, translated).is_ok()
+                && validate_translation_image_placeholders(&source, translated).is_ok()
                 && validate_translation_footnotes(&source, translated).is_ok()
                 && validate_translation_websites(&source, translated).is_ok()
                 && validate_translation_citations(&source, translated).is_ok();
@@ -1368,6 +1375,7 @@ fn translated_fixed_page_block(text: &str, source: Option<SourceRange>) -> TextB
 fn translation_text(block: &TextBlock) -> String {
     let mut text = String::new();
     let mut math_index = 0;
+    let mut image_index = 0;
     let mut citation = 0;
     let mut website = 0;
     let notes = rebook_layout::paragraph_footnotes(block);
@@ -1428,7 +1436,10 @@ fn translation_text(block: &TextBlock) -> String {
                 push_math_placeholder(&mut text, math_index);
                 math_index += 1;
             }
-            Inline::Image(_) => {}
+            Inline::Image(run) => {
+                image_tags::push(&mut text, image_index, run);
+                image_index += 1;
+            }
             Inline::Break => text.push('\n'),
         }
     }
@@ -1462,7 +1473,9 @@ fn translatable_text(block: &TextBlock) -> Option<String> {
         .iter()
         .flat_map(Inline::text_runs)
         .any(|run| run.text.chars().any(|character| !character.is_whitespace()))
-        .then(|| translation_text(block))
+        .then_some(())
+        .or_else(|| block.content.iter().any(|i| matches!(i,Inline::Image(r) if r.image.ocr_text.is_some())).then_some(()))
+        .map(|()| translation_text(block))
 }
 
 fn push_math_placeholder(output: &mut String, index: usize) {
@@ -1508,6 +1521,32 @@ pub(super) fn validate_translation_math_placeholders(
         Ok(())
     } else {
         Err("译文必须完整保留每个公式占位符且各出现一次".to_owned())
+    }
+}
+
+fn image_placeholder_indices(text: &str) -> Result<Vec<usize>, ()> {
+    let normalized = normalize_legacy_placeholder_tags(text);
+    image_tags::tokens(&normalized).map(|tokens| tokens.iter().map(|t| t.id).collect())
+}
+
+pub(super) fn validate_translation_image_placeholders(
+    source: &str,
+    translated: &str,
+) -> Result<(), String> {
+    let source = normalize_legacy_placeholder_tags(source);
+    let translated = normalize_legacy_placeholder_tags(translated);
+    let mut expected = image_tags::tokens(&source)
+        .map_err(|()| "Invalid source inline image placeholder".to_owned())?;
+    let mut actual = image_tags::tokens(&translated)
+        .map_err(|()| "Inline image placeholder format was changed".to_owned())?;
+    expected.sort_by_key(|t| t.id);
+    actual.sort_by_key(|t| t.id);
+    if expected.len() == actual.len()
+        && expected.windows(2).all(|pair| pair[0].id != pair[1].id)
+        && expected.iter().zip(&actual).all(|(a,b)| image_tags::valid_pair(a,b)) {
+        Ok(())
+    } else {
+        Err("Preserve each inline image placeholder unchanged and exactly once".into())
     }
 }
 
@@ -1717,7 +1756,16 @@ fn replacement_content(text: &str, style: TextStyle, original: Option<&[Inline]>
             Inline::Ruby(_) | Inline::Text(_) | Inline::Image(_) | Inline::Break => None,
         })
         .collect::<Vec<_>>();
-    if validate_math_placeholder_count(&text, math.len()).is_err() {
+    let images = original.iter().filter(|inline| matches!(inline, Inline::Image(_))).collect::<Vec<_>>();
+    let image_ids = image_placeholder_indices(&text).map(|mut ids| { ids.sort_unstable(); ids });
+    let mut original_image_tags = String::new();
+    for (index, image) in images.iter().enumerate() {
+        if let Inline::Image(run) = image { image_tags::push(&mut original_image_tags, index, run); }
+    }
+    if validate_math_placeholder_count(&text, math.len()).is_err()
+        || image_ids != Ok((0..images.len()).collect())
+        || validate_translation_image_placeholders(&original_image_tags, &text).is_err()
+    {
         // Never degrade structured formulas into untranslated LaTeX text. This
         // also safely handles translations cached by versions that exposed
         // formulas to the model as `$...$`.
@@ -1754,14 +1802,13 @@ fn replacement_content(text: &str, style: TextStyle, original: Option<&[Inline]>
     restore_source_sizes(&mut styled, original);
     let mut content = Vec::new();
     for (text, style) in styled {
-        append_translated_span(&mut content, &text, style, original, &math);
+        append_translated_span(&mut content, &text, style, original, &math, &images);
     }
     for inline in &mut content {
         if let Inline::Text(run) = inline {
             run.style.display_writing_system = Some(rebook_publication::WritingSystem::Unknown);
         }
     }
-    restore_inline_images(&mut content, original);
     content
 }
 
@@ -1793,70 +1840,6 @@ fn restore_source_sizes(styled: &mut [(String, TextStyle)], original: &[Inline])
     }
 }
 
-fn restore_inline_images(content: &mut Vec<Inline>, original: &[Inline]) {
-    let original_length = original.iter().map(inline_translation_units).sum::<usize>();
-    let translated_length = content.iter().map(inline_translation_units).sum::<usize>();
-    let mut cursor = 0usize;
-    let mut images = Vec::new();
-    for inline in original {
-        if let Inline::Image(run) = inline {
-            let target = if original_length == 0 {
-                0
-            } else {
-                cursor.saturating_mul(translated_length) / original_length
-            };
-            images.push((target, run.clone()));
-        } else {
-            cursor += inline_translation_units(inline);
-        }
-    }
-    for (target, image) in images.into_iter().rev() {
-        insert_inline_at_offset(content, target, Inline::Image(image));
-    }
-}
-
-fn inline_translation_units(inline: &Inline) -> usize {
-    match inline {
-        Inline::Text(run) => run.text.chars().count(),
-        Inline::Ruby(run) => run.source_char_len(),
-        Inline::Math(_) | Inline::Break => 1,
-        Inline::Image(_) => 0,
-    }
-}
-
-fn insert_inline_at_offset(content: &mut Vec<Inline>, offset: usize, value: Inline) {
-    let mut cursor = 0;
-    for index in 0..content.len() {
-        let len = inline_translation_units(&content[index]);
-        if offset <= cursor {
-            content.insert(index, value);
-            return;
-        }
-        if let Inline::Text(run) = &content[index]
-            && offset < cursor + len
-        {
-            let split = offset - cursor;
-            let mut trailing = run.clone();
-            let leading = run.text.chars().take(split).collect::<String>();
-            trailing.text = run.text.chars().skip(split).collect();
-            let mut replacement = Vec::with_capacity(3);
-            if !leading.is_empty() {
-                let mut leading_run = run.clone();
-                leading_run.text = leading;
-                replacement.push(Inline::Text(leading_run));
-            }
-            replacement.push(value);
-            if !trailing.text.is_empty() {
-                replacement.push(Inline::Text(trailing));
-            }
-            content.splice(index..=index, replacement);
-            return;
-        }
-        cursor += len;
-    }
-    content.push(value);
-}
-
 fn validate_math_placeholder_count(text: &str, math_count: usize) -> Result<(), ()> {
     let mut actual = math_placeholder_indices(text)?;
     actual.sort_unstable();
@@ -1871,23 +1854,47 @@ fn append_translated_span(
     style: TextStyle,
     original: &[Inline],
     math: &[rebook_publication::MathRun],
+    images: &[&Inline],
 ) {
     let mut rest = text;
-    while let Some(start) = rest.find(MATH_PLACEHOLDER_PREFIX) {
+    while let Some((start, prefix)) = [MATH_PLACEHOLDER_PREFIX, IMAGE_PLACEHOLDER_PREFIX]
+        .into_iter().filter_map(|prefix| rest.find(prefix).map(|start| (start, prefix)))
+        .min_by_key(|(start, _)| *start)
+    {
         append_translated_text(content, &rest[..start], style, original);
-        let token = &rest[start + MATH_PLACEHOLDER_PREFIX.len()..];
+        if prefix == IMAGE_PLACEHOLDER_PREFIX {
+            let Ok(token) = image_tags::at(rest, start) else { append_translated_text(content, rest, style, original); return; };
+            if let Some(original) = images.get(token.id) {
+                let mut restored = (**original).clone();
+                if let Inline::Image(run) = &mut restored
+                    && let (Some(ocr), Some(text)) = (&mut run.image.ocr_text, token.text)
+                    && !ocr.literal
+                {
+                    ocr.translated = Some(text.to_owned());
+                }
+                content.push(restored);
+                rest = &rest[token.range.end..];
+                continue;
+            }
+            append_translated_text(content, rest, style, original);
+            return;
+        }
+        let token = &rest[start + prefix.len()..];
         let digit_count = token.bytes().take_while(u8::is_ascii_digit).count();
-        let formula = token[..digit_count]
-            .parse::<usize>()
-            .ok()
-            .and_then(|index| math.get(index));
-        let Some(formula) =
-            formula.filter(|_| token[digit_count..].starts_with(MATH_PLACEHOLDER_SUFFIX))
+        let restored = token[..digit_count].parse::<usize>().ok().and_then(|index| {
+            if prefix == IMAGE_PLACEHOLDER_PREFIX {
+                images.get(index).map(|image| (**image).clone())
+            } else {
+                math.get(index).cloned().map(Inline::Math)
+            }
+        });
+        let Some(restored) =
+            restored.filter(|_| token[digit_count..].starts_with(MATH_PLACEHOLDER_SUFFIX))
         else {
             append_translated_text(content, rest, style, original);
             return;
         };
-        content.push(Inline::Math(formula.clone()));
+        content.push(restored);
         rest = &token[digit_count + MATH_PLACEHOLDER_SUFFIX.len()..];
     }
     append_translated_text(content, rest, style, original);
@@ -2015,10 +2022,7 @@ fn neutral_translation_style(fallback: TextStyle, original: &[Inline]) -> TextSt
 fn normalize_translation_spacing(text: &str) -> String {
     let normalized = normalize_legacy_placeholder_tags(text);
     let text = normalized.as_ref();
-    text.split('\n')
-        .map(normalize_translation_line_spacing)
-        .collect::<Vec<_>>()
-        .join("\n")
+    image_tags::normalize_spacing(text)
 }
 
 fn normalize_translation_line_spacing(line: &str) -> String {
@@ -2681,6 +2685,7 @@ mod tests {
                 id: spine.clone(),
                 href,
                 blocks: vec![Block::Image(ImageBlock {
+                    ocr_text: None,
                     formula_image: false,
                     formula: None,
                     href: image_href,
@@ -2754,6 +2759,7 @@ mod tests {
     fn replacement_preserves_inline_heading_images_at_their_relative_position() {
         let image = rebook_publication::InlineImageRun {
             image: ImageBlock {
+                ocr_text: None,
                 formula_image: false,
                 formula: None,
                 href: PublicationUrl::parse("images/chapter-icon.jpg").unwrap(),
@@ -2783,10 +2789,10 @@ mod tests {
                 style: BlockStyle::default(),
                 source: None,
             }),
-            "Why Goal Setting Is Broken"
+            "<t-img-0/>Why Goal Setting Is Broken"
         );
         let translated =
-            replacement_content("目标设定的致命缺陷", TextStyle::default(), Some(&original));
+            replacement_content("<t-img-0/>目标设定的致命缺陷", TextStyle::default(), Some(&original));
         assert!(matches!(translated.first(), Some(Inline::Image(run)) if run.as_ref() == &image));
         assert!(
             matches!(translated.get(1), Some(Inline::Text(run)) if run.text == "目标设定的致命缺陷")
@@ -2974,6 +2980,7 @@ mod tests {
             "<t-math-0/>",
             TextStyle::default(),
             &original,
+            &[],
             &[],
         );
         assert!(!content.is_empty());

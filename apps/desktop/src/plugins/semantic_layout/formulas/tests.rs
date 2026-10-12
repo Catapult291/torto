@@ -1,6 +1,76 @@
 use super::*;
 
 #[test]
+fn text_results_preserve_images_and_do_not_become_formulas() {
+    use super::super::tests::{image, section};
+    let original = section(vec![image("text")]);
+    let candidate = candidates(&original).pop().unwrap();
+    let response = Response { text: Some("か".into()), literal: true, transient: false,
+        status: "recognized_text".into(), latex: None, equation_number: None };
+    let mut annotations = Vec::new();
+    let mut failed = 0;
+    record(Some(&response), &candidate.image.href, &mut annotations, &mut failed);
+    assert_eq!(failed, 0);
+    assert!(validate_annotations(&original, &annotations));
+    let mut working = original.blocks.clone();
+    super::super::compose(&mut working, &annotations[0]);
+    let Block::Text(text) = &working[0] else { panic!() };
+    let Inline::Image(image) = &text.content[0] else { panic!() };
+    assert_eq!(image.image.href, candidate.image.href);
+    assert!(!image.image.formula_image);
+    assert!(image.image.formula.is_none());
+    assert_eq!(image.image.ocr_text.as_ref().unwrap().text, "か");
+    assert_eq!(text.source, candidate.image.source);
+    for invalid in ["", "<b>x</b>", "\u{fffd}", "x\0y"] { assert!(validate_text(invalid).is_err()); }
+    assert!(validate_text("か き\nÁ").is_ok());
+}
+
+#[test]
+#[ignore = "requires TORTO_INLINE_IMAGE_BOOK; renders real kana extraction without model calls"]
+fn local_book_unicode_image_text_layout() {
+    use anyrender::ImageRenderer;
+    let opened = rebook_formats::open_file(std::env::var("TORTO_INLINE_IMAGE_BOOK").unwrap()).unwrap();
+    let source = opened.source();
+    for index in 0..source.book().sections.len() {
+        let section = source.parse_section(index).unwrap();
+        for block in &section.blocks {
+            let Block::Text(original) = block else { continue };
+            if !text_block_text(original).contains("Cree and Cherokee") { continue }
+            let mut blocks = vec![block.clone()];
+            let selected = candidates(&Section { blocks: blocks.clone(), ..section.clone() });
+            assert_eq!(selected.len(), 2);
+            for (candidate, value) in selected.iter().zip(["か","き"]) {
+                compose_text(&mut blocks, &candidate.image.href, &ImageText { text: value.into(), literal: true, translated: None });
+            }
+            let mut style = rebook_layout::ReaderStyle::default();
+            style.typesetting.mode = rebook_layout::TypesettingMode::Unified;
+            style.spread = rebook_layout::SpreadMode::Single;
+            let fonts = crate::fonts::embedded_reader_fonts();
+            let mut engine = rebook_layout::LayoutEngine::with_fonts(fonts.iter().cloned());
+            let layout = engine.layout_blocks(source.as_ref(), &blocks, rebook_layout::LayoutViewport::new(1100,600).unwrap(), &style).unwrap();
+            let mut text = String::new();
+            for item in &layout.pages[0].items {
+                if let rebook_layout::PageItem::Text(placement) = item {
+                    text.push_str(&placement.text);
+                    assert!(placement.inline_images.is_empty(), "recognized text must shape as glyphs");
+                    let zero = placement.source_spans.iter().filter(|span| span.source.start.text_offset == span.source.end.text_offset).collect::<Vec<_>>();
+                    assert_eq!(zero.len(), 2);
+                }
+            }
+            assert!(text.contains("か (ka) and き (ki)"));
+            let display = rebook_renderer::DisplayListCompiler.compile(&layout.pages[0]);
+            let mut renderer = anyrender_vello_cpu::VelloCpuImageRenderer::new(1100,600);
+            let mut pixels = Vec::new();
+            renderer.render_to_vec(|scene| display.paint(scene), &mut pixels);
+            image::RgbaImage::from_raw(1100,600,pixels).unwrap().save("F:/projects/ebook/tmp/ocr-kana-original.png").unwrap();
+            println!("section={index}; recognized Unicode at original slots; source ranges retained");
+            return;
+        }
+    }
+    panic!("sample paragraph missing");
+}
+
+#[test]
 fn formula_request_keeps_threefold_enlargement_and_white_padding() {
     let pixels = RgbaImage::from_pixel(3, 7, Rgba([0, 0, 0, 128]));
     let url = image_url(pixels.into()).unwrap();
@@ -45,6 +115,8 @@ fn formula_transcriptions_must_render_and_keep_negative_results_empty() {
     }
     assert!(
         Response {
+            text: None,
+            literal: false,
             transient: false,
             status: "not_formula".into(),
             latex: None,
@@ -56,6 +128,8 @@ fn formula_transcriptions_must_render_and_keep_negative_results_empty() {
     );
     assert!(
         Response {
+            text: None,
+            literal: false,
             transient: false,
             status: "unreadable".into(),
             latex: Some("x".into()),
@@ -370,6 +444,7 @@ fn live_computational_formula_images() {
         let resource = source.resource(&href).unwrap();
         let candidate = Candidate {
             image: ImageBlock {
+                ocr_text: None,
                 formula_image: false,
                 formula: None,
                 href,

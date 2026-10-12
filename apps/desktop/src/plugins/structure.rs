@@ -342,6 +342,7 @@ mod list_structure_tests {
         ] {
             let image = Inline::Image(Box::new(rebook_publication::InlineImageRun {
                 image: rebook_publication::ImageBlock {
+                    ocr_text: None,
                     formula_image: true,
                     formula: None,
                     href: PublicationUrl::parse("formula.png").unwrap(),

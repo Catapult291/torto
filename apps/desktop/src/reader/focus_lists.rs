@@ -194,6 +194,83 @@ mod tests {
     }
 
     #[test]
+    fn paragraph_encoded_lists_include_plain_introductions_in_activation_and_copy() {
+        let r = reader(
+            "<html><body><p>Earlier prose.</p><p>Alphabetic scripts have the following characteristics.</p><p>◆ Each written symbol corresponds to a consonant or a vowel.</p><p>◆ The alphabet consists of a limited number of characters.</p><p>◆ Characters are written in a linear sequence.</p><p>After.</p></body></html>",
+            2000.0,
+        );
+        assert_eq!(r.focus_units.len(), 3);
+        let unit = &r.focus_units[1];
+        let group = unit.list_group.as_ref().unwrap();
+        assert_eq!(group.parts.len(), 4);
+        assert!(!group.split);
+        assert!(unit.clipboard_text.contains("following characteristics."));
+        assert!(!unit.clipboard_text.contains("Earlier prose"));
+        assert!(!unit.clipboard_text.contains("After."));
+        assert!(unit.paint_ranges.iter().any(|range| range == &group.parts[0].range));
+    }
+
+    #[test]
+    #[ignore = "requires TORTO_LIST_BOOK and optionally TORTO_LIST_PNG"]
+    fn local_book_alphabetic_list_introduction_and_markers() {
+        use anyrender::ImageRenderer;
+        let publication = rebook_formats::open_file(std::env::var("TORTO_LIST_BOOK").unwrap()).unwrap();
+        let source = publication.source();
+        for index in 0..source.book().sections.len() {
+            let section = source.parse_section(index).unwrap();
+            let text = |block: &Block| match block {
+                Block::Text(t) => t.content.iter().filter_map(|i| match i {
+                    Inline::Text(run) => Some(run.text.as_str()), _ => None,
+                }).collect::<String>(),
+                _ => String::new(),
+            };
+            let Some(intro) = section.blocks.iter().position(|b| text(b).contains("Alphabetic scripts have the following characteristics")) else { continue };
+            let groups = rebook_layout::semantic_list_groups(&section.blocks.iter().collect::<Vec<_>>());
+            let group = groups.iter().find(|r| r.start == intro).expect("introduction shares the list scope");
+            assert_eq!(group.len(), 4);
+            let mut style = ReaderStyle::default();
+            style.typesetting = rebook_layout::ReaderTypesetting::unified();
+            style.spread = rebook_layout::SpreadMode::Single;
+            let fonts = crate::fonts::embedded_reader_fonts();
+            let mut engine = rebook_layout::LayoutEngine::with_fonts(fonts.iter().cloned());
+            let layout = engine.layout_blocks(source.as_ref(), &section.blocks[group.clone()], LayoutViewport::new(1100, 600).unwrap(), &style).unwrap();
+            let mut bullets = 0;
+            for page in &layout.pages {
+                let display = rebook_renderer::DisplayListCompiler.compile(page);
+                for item in &page.items {
+                    if let rebook_layout::PageItem::Text(t) = item {
+                        assert!(t.inline_images.is_empty(), "authored bullet images must not render");
+                        if t.text.starts_with("•\u{00a0}") { bullets += 1; }
+                    }
+                }
+                // Body selection still points to the exact authored offsets,
+                // despite replacing an image marker and hiding its whitespace.
+                for region in 0..display.text_region_count() {
+                    let value = display.text_region_text(region).unwrap();
+                    if let Some(at) = value.find("Each written symbol") {
+                        let range = display.text_region_source_range(region, at..at + "Each written symbol".len()).unwrap();
+                        let Block::Text(original) = &section.blocks[intro + 1] else { panic!() };
+                        let original_text = text(&section.blocks[intro + 1]);
+                        let offset = original_text[..original_text.find("Each written symbol").unwrap()].chars().count() as u64;
+                        assert_eq!(range.start.text_offset, original.source.as_ref().unwrap().start.text_offset + offset);
+                    }
+                }
+            }
+            assert_eq!(bullets, 3);
+            if let Ok(path) = std::env::var("TORTO_LIST_PNG") {
+                let display = rebook_renderer::DisplayListCompiler.compile(&layout.pages[0]);
+                let mut renderer = anyrender_vello_cpu::VelloCpuImageRenderer::new(1100, 600);
+                let mut pixels = Vec::new();
+                renderer.render_to_vec(|scene| display.paint(scene), &mut pixels);
+                image::RgbaImage::from_raw(1100, 600, pixels).unwrap().save(path).unwrap();
+            }
+            println!("section={index}; introduction plus three items; unified bullets; authored offsets verified");
+            return;
+        }
+        panic!("sample introduction missing");
+    }
+
+    #[test]
     fn captions_quotes_tables_images_and_headings_are_not_list_introductions() {
         for preceding in [
             "<h2>Heading</h2>",

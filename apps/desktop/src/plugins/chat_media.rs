@@ -489,6 +489,7 @@ mod tests {
             },
         };
         let image = |name: &str| ImageBlock {
+            ocr_text: None,
             formula_image: false,
             formula: None,
             href: PublicationUrl::parse(name).unwrap(),

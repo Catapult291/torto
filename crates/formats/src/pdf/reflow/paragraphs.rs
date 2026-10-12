@@ -454,6 +454,7 @@ mod tests {
         };
         Block::Figure(FigureBlock {
             images: vec![ImageBlock {
+                ocr_text: None,
                 formula_image: false,
                 formula: None,
                 href: PublicationUrl::parse("resources/image.png").unwrap(),

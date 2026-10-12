@@ -1,5 +1,32 @@
 use super::*;
 
+fn complete_image_response(mut value: Value) -> Value {
+    if let Some(items) = value["results"].as_array_mut() {
+        for item in items {
+            if let Some(object) = item.as_object_mut() {
+                object.entry("text").or_insert(Value::Null);
+                object.entry("literal").or_insert(Value::Bool(false));
+            }
+        }
+    }
+    value
+}
+
+#[test]
+fn mixed_math_and_unicode_text_results_keep_ids_and_character_examples() {
+    let value = r#"{"results":[{"image_id":2,"status":"recognized_text","text":"か","literal":true,"latex":null,"equation_number":null},{"image_id":0,"status":"recognized","text":null,"literal":false,"latex":"x^2","equation_number":null},{"image_id":1,"status":"not_formula","text":null,"literal":false,"latex":null,"equation_number":null}]}"#;
+    let results = parse(value, &[0,1,2]);
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[&2].text.as_deref(), Some("か"));
+    assert!(results[&2].literal);
+    assert!(results[&2].formula().unwrap().is_none());
+    assert!(results[&0].formula().unwrap().is_some());
+    let damaged = r#"{"results":[{"image_id":2,"status":"recognized_text","text":"<script>bad</script>","literal":false,"latex":null,"equation_number":null}]}"#;
+    let results = parse(damaged, &[2]);
+    assert_eq!(results[&2].status, "unreadable_text");
+    assert!(results[&2].transient);
+}
+
 #[test]
 fn batch_results_match_ids_and_isolate_bad_items() {
     let item = json!({"image_id":0,"status":"recognized","latex":"x=1","equation_number":null});
@@ -101,7 +128,7 @@ fn batch_retries_only_missing_items_without_reviewing_valid_siblings() {
                 _ => vec![item(1, Some("y=2")), item(0, Some("x=1"))],
             };
             let response =
-                json!({"choices":[{"index":0,"finish_reason":"stop","message":{"content":super::super::super::wire::encode(&json!({"results":results})).to_string()}}]})
+                json!({"choices":[{"index":0,"finish_reason":"stop","message":{"content":super::super::super::wire::encode(&complete_image_response(json!({"results":results}))).to_string()}}]})
                     .to_string();
             write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).unwrap();
         }
@@ -120,6 +147,7 @@ fn batch_retries_only_missing_items_without_reviewing_valid_siblings() {
             url: "data:image/png;base64,fixture".into(),
             candidate: Candidate {
                 image: ImageBlock {
+                    ocr_text: None,
                     formula_image: false,
                     formula: None,
                     href: PublicationUrl::parse(&format!("math-{i}.png")).unwrap(),
@@ -223,7 +251,7 @@ fn run_batch_fixture(replies: Vec<(Value, Vec<usize>)>) -> Vec<Option<Response>>
             } else {
                 (
                     "200 OK",
-                    json!({"choices":[{"index":0,"finish_reason":"stop","message":{"content":super::super::super::wire::encode(&reply).to_string()}}]}).to_string(),
+                    json!({"choices":[{"index":0,"finish_reason":"stop","message":{"content":super::super::super::wire::encode(&complete_image_response(reply)).to_string()}}]}).to_string(),
                 )
             };
             write!(socket,"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
@@ -243,6 +271,7 @@ fn run_batch_fixture(replies: Vec<(Value, Vec<usize>)>) -> Vec<Option<Response>>
             url: "data:image/png;base64,fixture".into(),
             candidate: Candidate {
                 image: ImageBlock {
+                    ocr_text: None,
                     formula_image: false,
                     formula: None,
                     href: PublicationUrl::parse(&format!("math-{i}.png")).unwrap(),

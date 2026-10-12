@@ -3,6 +3,21 @@ use super::*;
 use rebook_publication::TextRun;
 
 #[test]
+fn media_parentheses_share_citation_order_and_preserve_source_prose() {
+    let original = section(vec![text("p", "正文（如图 4.4），参考 (Smith, 2020)，比较（见图五、七E）。（如图4.4所示，这是说明文字。）")]);
+    let inner = super::super::tests::original_source(original.clone());
+    let source = SemanticLayoutSource::new(inner.clone(), inner);
+    source.configure("local-media-citations", &PluginSettings::default());
+    source.set_unified_citations(true);
+    let displayed = source.parse_section(0).unwrap();
+    let Block::Text(block) = &displayed.blocks[0] else { panic!() };
+    assert_eq!(marked_citations(block), [(1, "（如图 4.4）".into()), (2, "(Smith, 2020)".into()), (3, "（见图五、七E）".into())]);
+    assert_eq!(text_block_text(block), text_block_text(match &original.blocks[0] { Block::Text(t) => t, _ => unreachable!() }));
+    source.set_unified_citations(false);
+    assert_eq!(source.parse_section(0).unwrap(), original);
+}
+
+#[test]
 fn heuristic_author_groups_handle_multiple_works_years_and_name_periods() {
     for value in [
         "(Just & Carpenter, 1992; Just & Varma, 2002)",

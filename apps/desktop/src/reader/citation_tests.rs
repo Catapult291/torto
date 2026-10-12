@@ -2,7 +2,7 @@ use super::*;
 use rebook_publication::{SpineItemId, TextRun, TextStyle};
 
 #[test]
-fn popup_keeps_footnotes_before_citations_and_merges_styled_parts() {
+fn popup_preserves_appearance_order_and_merges_styled_citation_parts() {
     let anchor = SourceAnchor {
         spine: SpineItemId::new("test").unwrap(),
         node: "p".into(),
@@ -41,10 +41,10 @@ fn popup_keeps_footnotes_before_citations_and_merges_styled_parts() {
     };
     let items = text_block_focus_footnotes(&block);
     assert_eq!(items.len(), 3);
-    assert!(matches!(&items[0],FocusFootnoteSource::Inline(t, 1) if t=="Note content"));
     assert!(
-        matches!(&items[1],FocusFootnoteSource::Citation{text,source,number:1} if text=="(Smith, 2020)" && source==&range)
+        matches!(&items[0],FocusFootnoteSource::Citation{text,source,number:1} if text=="(Smith, 2020)" && source==&range)
     );
+    assert!(matches!(&items[1],FocusFootnoteSource::Inline(t, 1) if t=="Note content"));
     assert!(matches!(
         &items[2],
         FocusFootnoteSource::Citation { number: 2, .. }

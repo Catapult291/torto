@@ -29,6 +29,10 @@ fn parse_results(content: &str, ids: &[usize]) -> HashMap<usize, Response> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Item {
+        #[serde(default)]
+        text: Option<String>,
+        #[serde(default)]
+        literal: bool,
         image_id: usize,
         status: String,
         latex: Option<String>,
@@ -68,6 +72,8 @@ fn parse_results(content: &str, ids: &[usize]) -> HashMap<usize, Response> {
             continue;
         };
         let response = Response {
+            text: item.text,
+            literal: item.literal,
             status: item.status,
             latex: item.latex,
             equation_number: item.equation_number,
@@ -75,8 +81,10 @@ fn parse_results(content: &str, ids: &[usize]) -> HashMap<usize, Response> {
         };
         let response = match response.formula() {
             Ok(_) => response,
-            Err(_) if response.status == "recognized" => Response {
-                status: "unreadable".into(),
+            Err(_) if matches!(response.status.as_str(), "recognized" | "recognized_text") => Response {
+                text: None,
+                literal: false,
+                status: if response.status == "recognized_text" { "unreadable_text" } else { "unreadable" }.into(),
                 latex: None,
                 equation_number: None,
                 transient: true,

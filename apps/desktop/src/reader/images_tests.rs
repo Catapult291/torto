@@ -75,6 +75,7 @@ fn fixture(id: &str, count: usize) -> (Arc<Source>, Vec<DeferredRaster>) {
             alt: String::new(),
             style: ImageStyle::default(),
             source: None,
+            ocr_text: None,
             formula_image: false,
             formula: None,
             text_layer: None,
@@ -317,6 +318,7 @@ fn deferred_formulas_paint_after_loading_with_stable_blob_identity() {
         alt: String::new(),
         style: ImageStyle::default(),
         source: None,
+        ocr_text: None,
         formula_image: true,
         formula: Some(rebook_publication::ImageFormula {
             latex: r"\frac{x+1}{2}".into(),

@@ -1452,7 +1452,7 @@ fn fixture_with_optional_blocks(
     let mut section=Section {id:spine.clone(),href:href.clone(),anchors:vec![],blocks:vec![
         text("earlier","Earlier paragraphs change height when recognized as a quotation. ".repeat(25)),
         text("current","Current paragraph stays next to its illustration after the preceding content is reflowed. ".repeat(6)),
-        Block::Image(ImageBlock {formula_image: false,
+        Block::Image(ImageBlock {ocr_text: None, formula_image: false,
 formula: None,
 href:PublicationUrl::parse("image.png").unwrap(),alt:String::new(),style:Default::default(),source:Some(SourceRange {start:image_anchor.clone(),end:image_anchor}),text_layer:None}),
     ]};

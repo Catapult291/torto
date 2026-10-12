@@ -238,6 +238,7 @@ impl EpubPublication {
             |href| crate::html_context::image_dimensions(&self.archive.read(href).ok()?),
             self.html_context.hints(descriptor),
         )?;
+        self.html_context.mark_note_references(&mut section);
         if let Some(hints) = self.toc_heading_hints.get(descriptor.href.path()) {
             promote_toc_headings(&mut section, hints);
         }

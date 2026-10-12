@@ -1,7 +1,7 @@
 use super::*;
 use base64::Engine as _;
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
-use rebook_publication::{ImageBlock, ImageFormula};
+use rebook_publication::{ImageBlock, ImageFormula, ImageText};
 use std::io::Cursor;
 
 pub(super) const PROMPT: &str = include_str!("formulas/prompt.md");
@@ -11,10 +11,12 @@ mod batch;
 pub(super) fn options() -> Value {
     let item = json!({"type":"object","additionalProperties":false,"properties":{
         "image_id":{"type":"integer","description":"Copy an ID from requested_ids. IDs need not be consecutive."},
-        "status":{"type":"string","enum":["recognized","not_formula","unreadable"],"description":"recognized: the whole meaningful image represents math, a symbol or a formal production rule. not_formula: a diagram, plot, table, photo, decoration or prose, even with equations. unreadable: essential formula details are unclear or unsupported. For either negative status, set latex and equation_number to null."},
+        "status":{"type":"string","enum":["recognized","recognized_text","not_formula","unreadable","unreadable_text"],"description":"recognized: the whole image is mathematics or a formal rule. recognized_text: the whole meaningful image is faithful Unicode text, including letters or script examples. not_formula: diagrams, plots, tables, photos, decorations or mixed visual/text images. unreadable: formula details are unclear; unreadable_text: text details are unclear or unsupported. Never infer characters from the surrounding words."},
+        "text":{"type":["string","null"],"description":"Exact visible Unicode text for recognized_text only; otherwise null. Preserve case, accents, combining characters, punctuation and meaningful spaces. No Markdown, XML/HTML, LaTeX, explanation or guessed characters."},
+        "literal":{"type":"boolean","description":"For recognized_text, true for character/script/pronunciation examples and literal symbols which must remain unchanged in translation; false for ordinary prose/words. Otherwise false."},
         "latex":{"type":["string","null"],"description":"Transcribe faithful supported LaTeX without dollar delimiters or Markdown. For a negative status, return null. Use standard math commands, text operators and matrix/aligned environments. Exclude custom macros, packages, images, URLs and executable commands. Encode each command backslash as two JSON backslashes; encode a row separator as four. Do not drop backslashes or turn command prefixes into control characters."},
         "equation_number":{"type":["string","null"],"description":"Copy only a separate equation number visible in this image. Exclude it from latex. Do not infer it from context. If absent or the status is negative, return null."}
-    },"required":["image_id","status","latex","equation_number"]});
+    },"required":["image_id","status","latex","equation_number","text","literal"]});
     json!({"temperature":0.0,"output_schema":{
             "type":"object","additionalProperties":false,
             "properties":{"results":{"type":"array","description":"Return one result per requested ID, including negative results. Use an array for a single image too. IDs must match exactly; order is unrestricted.","items":item}},
@@ -79,6 +81,9 @@ pub(super) fn candidates(section: &Section) -> Vec<Candidate> {
                     }
                 }
                 Block::Note(n) => visit(&n.blocks, result),
+                Block::Figure(figure) => {
+                    for caption in &figure.captions { text(caption, result); }
+                }
                 // Captioned figures and diagrams are not formula candidates.
                 _ => {}
             }
@@ -153,6 +158,10 @@ pub(super) fn validate_formula(formula: &ImageFormula) -> Result<(), String> {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Response {
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    literal: bool,
     #[serde(skip)]
     transient: bool,
     status: String,
@@ -162,8 +171,14 @@ struct Response {
 
 impl Response {
     fn formula(&self) -> Result<Option<ImageFormula>, String> {
+        if self.status == "recognized_text" {
+            if self.latex.is_some() || self.equation_number.is_some() { return Err("Text result contains formula data".into()) }
+            validate_text(self.text.as_deref().ok_or("Missing image text")?)?;
+            return Ok(None);
+        }
+        if self.text.is_some() || self.literal { return Err("Unexpected text data in non-text result".into()) }
         match self.status.as_str() {
-            "not_formula" | "unreadable"
+            "not_formula" | "unreadable" | "unreadable_text"
                 if self.latex.is_none() && self.equation_number.is_none() =>
             {
                 Ok(None)
@@ -179,6 +194,14 @@ impl Response {
             _ => Err("Invalid formula result".into()),
         }
     }
+}
+
+pub(super) fn validate_text(text: &str) -> Result<(), String> {
+    if text.trim().is_empty() || text.len() > 4096
+        || text.contains(['<','>','\u{fffd}'])
+        || text.chars().any(|c| c.is_control() && c != '\n')
+    { return Err("Empty, damaged or unsupported image text".into()) }
+    Ok(())
 }
 
 fn decode(bytes: &[u8]) -> Result<DynamicImage, String> {
@@ -255,6 +278,12 @@ fn record(
         annotations.push(Annotation::ImageFormula {
             href: href.clone(),
             formula,
+        });
+    }
+    if response.status == "recognized_text" && response.formula().is_ok() {
+        annotations.push(Annotation::ImageText {
+            href: href.clone(),
+            text: ImageText { text: response.text.clone().unwrap(), literal: response.literal, translated: None },
         });
     }
 }
@@ -479,6 +508,9 @@ pub(super) fn compose(blocks: &mut [Block], href: &PublicationUrl, formula: Opti
                 }
             }
             Block::Note(n) => compose(&mut n.blocks, href, formula),
+            Block::Figure(figure) => {
+                for caption in &mut figure.captions { text(caption, href, formula); }
+            }
             _ => {}
         }
     }
@@ -491,8 +523,43 @@ pub(super) fn validate_annotations(section: &Section, annotations: &[Annotation]
         Annotation::ImageFormula { href, formula } => {
             candidates.iter().any(|c| &c.image.href == href) && validate_formula(formula).is_ok()
         }
+        Annotation::ImageText { href, text } => candidates.iter().any(|c| &c.image.href == href) && validate_text(&text.text).is_ok(),
         _ => true,
     })
+}
+
+pub(super) fn compose_text(blocks: &mut [Block], href: &PublicationUrl, text: &ImageText) {
+    fn inline(block: &mut TextBlock, href: &PublicationUrl, text: &ImageText) {
+        for item in &mut block.content {
+            if let Inline::Image(image) = item && &image.image.href == href {
+                image.image.ocr_text = Some(text.clone());
+                image.image.formula = None;
+                image.image.formula_image = false;
+            }
+        }
+    }
+    for block in blocks {
+        match block {
+            Block::Image(image) if &image.href == href => {
+                let mut image = image.clone();
+                image.ocr_text = Some(text.clone());
+                image.formula = None;
+                image.formula_image = false;
+                let source = image.source.clone();
+                *block = Block::Text(TextBlock { kind: TextBlockKind::Paragraph,
+                    content: vec![Inline::Image(Box::new(rebook_publication::InlineImageRun {
+                        image, size_scale: 1.0, intrinsic_sizing: false,
+                        vertical_align: rebook_publication::InlineImageAlignment::Baseline, presentation: false,
+                    }))], style: Default::default(), source });
+            }
+            Block::Text(t) => inline(t, href, text),
+            Block::Quote(q) => for t in q.body.iter_mut().chain(q.attribution.iter_mut()) { inline(t, href, text); },
+            Block::Table(table) => for t in table.text_blocks_mut() { inline(t, href, text); },
+            Block::Figure(figure) => for t in &mut figure.captions { inline(t, href, text); },
+            Block::Note(note) => compose_text(&mut note.blocks, href, text),
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]

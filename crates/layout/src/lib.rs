@@ -12,6 +12,8 @@ use text_layout::{Layout, PositionedLayoutItem};
 
 mod caption_labels;
 mod formula_images;
+mod image_text;
+mod list_markers;
 mod formula_raster;
 mod headings;
 mod hyphen_cache;
@@ -2144,6 +2146,10 @@ impl LayoutEngine {
         content_width: f32,
         source_spans: Vec<TextSourceSpan>,
     ) -> Result<PreparedText, LayoutError> {
+        let normalized = list_markers::normalize(
+            block, reader_style.typesetting.mode == TypesettingMode::Unified,
+        );
+        let block = normalized.as_ref();
         let rasters = self.load_inline_rasters(source, block)?;
         Ok(self.shape_text_with_sources(
             block,
@@ -2683,6 +2689,14 @@ impl LayoutEngine {
         optimize_line_breaks: bool,
         formula_context: Option<(&dyn BookSource, u64)>,
     ) -> PreparedText {
+        let normalized = list_markers::normalize(
+            block, reader_style.typesetting.mode == TypesettingMode::Unified,
+        );
+        let block = normalized.as_ref();
+        let image_text = reader_style.typesetting.mode == TypesettingMode::Unified
+            && block.content.iter().any(|i| matches!(i,Inline::Image(r) if r.image.ocr_text.is_some()));
+        let original_source_spans = if image_text { source_spans.clone() } else { Vec::new() };
+        if image_text { source_spans = image_text::source_spans(block, &source_spans); }
         let (start_offset, available_width, first_line_indent) =
             resolve_text_measure(block, content_width, minimum_width);
         let sentence_reference = if block.style.sentence_indents
@@ -2844,6 +2858,19 @@ impl LayoutEngine {
                 parley::OverflowWrap::BreakWord
             },
         );
+        if image_text && layout.lines().any(|line| line.items().any(|item| {
+            let PositionedLayoutItem::GlyphRun(run) = item else { return false };
+            let range = run.run().text_range();
+            (source_spans.is_empty() || source_spans.iter().any(|span| span.source.start.text_offset == span.source.end.text_offset
+                && span.range.start < range.end && span.range.end > range.start)
+            )
+                && run.glyphs().any(|glyph| glyph.id == 0)
+        })) {
+            let mut original = block.clone();
+            for inline in &mut original.content { if let Inline::Image(run) = inline { run.image.ocr_text = None; } }
+            return self.shape_text_with_sources(&original, reader_style, content_width, minimum_width,
+                inline_rasters, original_source_spans, optimize_line_breaks, formula_context);
+        }
         self.apply_text_indents(
             &mut layout,
             block,
@@ -3935,9 +3962,9 @@ fn resolve_text_block<'a>(
                     run.style.italic = false;
                 }
                 if block.kind == TextBlockKind::Caption {
-                    // Preserve authored bold text; numbered labels are emphasized
-                    // separately after resolving the caption presentation. Keep the
-                    // existing neutral italic/semantic decoration policy.
+                    // Unified captions use neutral prose. Restore emphasis only
+                    // for their numbered labels after clearing authored styles.
+                    run.style.bold = false;
                     run.style.italic = false;
                     run.style.emphasis = false;
                     run.style.alternate_voice = false;
@@ -3980,6 +4007,13 @@ fn resolve_text_block<'a>(
         caption_labels::normalize(&mut resolved.content);
     }
     resolve_semantic_inline_presentation(&mut resolved.content, reader_style.writing_system);
+    if block.kind != TextBlockKind::Caption {
+    rebook_publication::media_references::style_links(
+        &mut resolved.content,
+        if reader_style.foreground.red > 128 { Rgba { red: 140, green: 180, blue: 245, alpha: 255 } }
+        else { Rgba { red: 45, green: 104, blue: 210, alpha: 255 } },
+    );
+    }
     web_links::detect(&mut resolved.content);
     if matches!(
         block.kind,
@@ -5060,6 +5094,14 @@ fn prepare_inline_content(
                 }
             }
             Inline::Image(run) => {
+                if unified_math && let Some(ocr) = &run.image.ocr_text {
+                    let start = text.len();
+                    text.push_str(ocr.display_text());
+                    spans.push(StyledRange { ruby: None, range: start..text.len(),
+                        style: image_text::style(block, inline_index, run.size_scale, fallback_color),
+                        footnote_reference_group: 0, hyphenation_suppressed: ocr.literal });
+                    continue;
+                }
                 let Some(image) = inline_rasters.get(inline_index).and_then(Clone::clone) else {
                     continue;
                 };
@@ -6736,6 +6778,7 @@ mod tests {
                 for width in [180.0, 480.0] {
                     let image = Inline::Image(Box::new(rebook_publication::InlineImageRun {
                         image: ImageBlock {
+                            ocr_text: None,
                             formula_image: false,
                             formula: None,
                             href: PublicationUrl::parse("image.png").unwrap(),
@@ -6835,6 +6878,7 @@ mod tests {
             content: vec![
                 Inline::Image(Box::new(rebook_publication::InlineImageRun {
                     image: ImageBlock {
+                        ocr_text: None,
                         formula_image: false,
                         formula: None,
                         href: PublicationUrl::parse("images/chapter-icon.jpg").unwrap(),
@@ -6899,6 +6943,7 @@ mod tests {
             content: vec![Inline::Image(Box::new(
                 rebook_publication::InlineImageRun {
                     image: ImageBlock {
+                        ocr_text: None,
                         formula_image: false,
                         formula: None,
                         href: PublicationUrl::parse("images/pi.jpg").unwrap(),
@@ -6954,12 +6999,12 @@ mod tests {
     }
 
     #[test]
-    fn inferred_image_marker_hanging_indent_includes_the_actual_image_advance() {
+    fn inferred_image_marker_uses_the_unified_bullet_and_hanging_indent() {
         let block = TextBlock {
             kind: TextBlockKind::ListItem { ordered: false, ordinal: 1, depth: 0, marker_visible: false },
             content: vec![
                 Inline::Image(Box::new(rebook_publication::InlineImageRun {
-                    image: ImageBlock { formula_image: false, formula: None,
+                    image: ImageBlock { ocr_text: None, formula_image: false, formula: None,
                         href: PublicationUrl::parse("images/diamond.gif").unwrap(), alt: "image".into(),
                         style: ImageStyle::default(), source: None, text_layer: None },
                     size_scale: 1.0, intrinsic_sizing: true,
@@ -6993,11 +7038,11 @@ mod tests {
             None,
         );
         assert!(prepared.layout.len() > 1);
-        assert_eq!(prepared.inline_images.len(), 1);
-        assert_eq!(prepared.source_text_start, 0);
-        let advance = prepared.inline_images[0].width
-            + engine.measure_list_marker_width(
-                "\u{00a0}",
+        assert!(prepared.inline_images.is_empty());
+        assert!(prepared.text.starts_with("•\u{00a0}\u{2060}A large"));
+        assert_eq!(prepared.source_text_start, "•\u{00a0}".len());
+        let advance = engine.measure_list_marker_width(
+                "•\u{00a0}",
                 &style.typography.default_stack(),
                 &style.typography,
             );
@@ -7330,7 +7375,7 @@ mod tests {
     }
 
     #[test]
-    fn unified_captions_preserve_authored_bold_and_clear_italic_sources() {
+    fn unified_captions_clear_authored_emphasis_and_only_bold_numbered_labels() {
         let block = TextBlock {
             kind: TextBlockKind::Caption,
             content: vec![Inline::Text(TextRun {
@@ -7341,6 +7386,7 @@ mod tests {
                     emphasis: true,
                     alternate_voice: true,
                     citation: true,
+                    underline: true,
                     ..TextStyle::default()
                 },
                 link: None,
@@ -7364,17 +7410,25 @@ mod tests {
         };
         assert!(classic_run.style.bold);
         assert!(classic_run.style.italic);
+        assert!(classic_run.style.underline);
         assert!(unified_run.style.bold);
-        assert!(
+        assert_eq!(
             unified
                 .content
                 .iter()
-                .all(|inline| matches!(inline, Inline::Text(run) if run.style.bold))
+                .flat_map(Inline::text_runs)
+                .filter(|run| run.style.bold)
+                .map(|run| run.text.as_str())
+                .collect::<String>(),
+            "Figure 1"
         );
-        assert!(!unified_run.style.italic);
-        assert!(!unified_run.style.emphasis);
-        assert!(!unified_run.style.alternate_voice);
-        assert!(!unified_run.style.citation);
+        for run in unified.content.iter().flat_map(Inline::text_runs) {
+            assert!(!run.style.italic);
+            assert!(!run.style.underline);
+            assert!(!run.style.emphasis);
+            assert!(!run.style.alternate_voice);
+            assert!(!run.style.citation);
+        }
     }
 
     #[test]
@@ -8839,16 +8893,20 @@ mod tests {
     }
 
     #[test]
-    fn authored_markers_keep_source_offsets_and_align_wrapped_body() {
+    fn unified_markers_keep_source_offsets_and_align_wrapped_body() {
         let style = ReaderStyle {
             typesetting: ReaderTypesetting::unified(),
             ..ReaderStyle::default()
         };
-        for (prefix, count) in [("● ", 2), ("12. ", 4), ("·", 1)] {
+        for (prefix, count, ordered, ordinal) in [
+            ("● ", 2, false, 1), ("·", 1, false, 1), ("◆ ", 2, false, 1),
+            ("12. ", 4, true, 12), ("A) ", 3, true, 1), ("①", 1, true, 1),
+            ("一、", 2, true, 1), ("iv. ", 4, true, 4),
+        ] {
             let block = TextBlock {
                 kind: TextBlockKind::ListItem {
-                    ordered: prefix.starts_with('1'),
-                    ordinal: 12,
+                    ordered,
+                    ordinal,
                     depth: 0,
                     marker_visible: false,
                 },
@@ -8869,10 +8927,13 @@ mod tests {
             let resolved = resolve_text_block(&block, &style, TextContext::Flow);
             let prepared = engine.shape_text_with_min_width(&resolved, &style, 260.0, 40.0);
             assert!(prepared.layout.len() > 1);
-            assert!(prepared.text.starts_with(prefix));
-            assert_eq!(prepared.source_text_start, 0);
+            let unified_prefix = if ordered { format!("{ordinal}.\u{00a0}") } else { "•\u{00a0}".into() };
+            assert!(prepared.text.starts_with(&unified_prefix));
+            assert_eq!(prepared.source_text_start, unified_prefix.len());
+            assert_eq!(prepared.text[prepared.source_text_start..].chars().count(),
+                block.content.iter().filter_map(|i| if let Inline::Text(r) = i { Some(r.text.chars().count()) } else { None }).sum::<usize>());
             let advance = engine.measure_list_marker_width(
-                prefix,
+                &unified_prefix,
                 &style.typography.default_stack(),
                 &style.typography,
             );
@@ -9368,6 +9429,7 @@ mod tests {
             })
         };
         let ornament = ImageBlock {
+            ocr_text: None,
             formula_image: false,
             formula: None,
             href: PublicationUrl::parse("rule.png").unwrap(),
@@ -10032,6 +10094,7 @@ mod tests {
                     source: None,
                 }),
                 Block::Image(ImageBlock {
+                    ocr_text: None,
                     formula_image: false,
                     formula: None,
                     href: PublicationUrl::parse("figure.png").unwrap(),
@@ -10341,6 +10404,7 @@ mod tests {
                     source: None,
                 }),
                 Block::Image(ImageBlock {
+                    ocr_text: None,
                     formula_image: false,
                     formula: None,
                     href: image_href,
@@ -10391,6 +10455,7 @@ mod tests {
             href: PublicationUrl::parse("chapter.xhtml").unwrap(),
             blocks: vec![Block::Figure(rebook_publication::FigureBlock {
                 images: vec![ImageBlock {
+                    ocr_text: None,
                     formula_image: false,
                     formula: None,
                     href: PublicationUrl::parse("images/figure.png").unwrap(),
@@ -10461,6 +10526,7 @@ mod tests {
             href: PublicationUrl::parse("chapter.xhtml").unwrap(),
             blocks: vec![
                 Block::Image(ImageBlock {
+                    ocr_text: None,
                     formula_image: false,
                     formula: None,
                     href: PublicationUrl::parse("images/figure.png").unwrap(),
@@ -10601,6 +10667,7 @@ mod tests {
         with_symbol.content.push(Inline::Image(Box::new(
             rebook_publication::InlineImageRun {
                 image: ImageBlock {
+                    ocr_text: None,
                     formula_image: false,
                     formula: None,
                     href: PublicationUrl::parse("symbol.png").unwrap(),
@@ -11088,6 +11155,7 @@ mod tests {
                     source: None,
                 }),
                 Block::Image(ImageBlock {
+                    ocr_text: None,
                     formula_image: false,
                     formula: None,
                     href: image_href,
@@ -11144,6 +11212,7 @@ mod tests {
                     source: None,
                 }),
                 Block::Image(ImageBlock {
+                    ocr_text: None,
                     formula_image: false,
                     formula: None,
                     href: image_href,
@@ -11439,6 +11508,7 @@ mod tests {
             id: SpineItemId::new("pdf-page-1").unwrap(),
             href: PublicationUrl::parse("page-1.pdf").unwrap(),
             blocks: vec![Block::Image(ImageBlock {
+                ocr_text: None,
                 formula_image: false,
                 formula: None,
                 href,
@@ -11508,6 +11578,7 @@ mod tests {
             id: SpineItemId::new("cover").unwrap(),
             href: PublicationUrl::parse("cover.xhtml").unwrap(),
             blocks: vec![Block::Image(ImageBlock {
+                ocr_text: None,
                 formula_image: false,
                 formula: None,
                 href: cover,
@@ -11553,6 +11624,7 @@ mod tests {
             id: SpineItemId::new("illustration").unwrap(),
             href: PublicationUrl::parse("illustration.xhtml").unwrap(),
             blocks: vec![Block::Image(ImageBlock {
+                ocr_text: None,
                 formula_image: false,
                 formula: None,
                 href: image_href,
@@ -11600,6 +11672,7 @@ mod tests {
                 }),
                 Inline::Image(Box::new(rebook_publication::InlineImageRun {
                     image: ImageBlock {
+                        ocr_text: None,
                         formula_image: false,
                         formula: None,
                         href: PublicationUrl::parse("symbol.png").unwrap(),

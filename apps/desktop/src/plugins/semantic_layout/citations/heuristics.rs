@@ -211,7 +211,8 @@ pub(in crate::plugins::semantic_layout) fn annotations(section: &Section) -> Vec
         .filter_map(|block| {
             let spans: Vec<_> = candidates(block)
                 .into_iter()
-                .filter(|c| author_date(&c.text) || numeric_reference(block, c))
+                .filter(|c| author_date(&c.text) || numeric_reference(block, c)
+                    || rebook_publication::media_references::is_citation(&c.text))
                 .collect();
             (!spans.is_empty()).then(|| Annotation::InlineCitations {
                 source: block.source.clone().unwrap(),
@@ -243,7 +244,8 @@ pub(in crate::plugins::semantic_layout) fn apply_display_fallback(section: &mut 
         for text in paragraphs {
             let spans: Vec<_> = candidate_spans(text)
                 .into_iter()
-                .filter(|c| author_date(&c.text) || numeric_reference(text, c))
+                .filter(|c| author_date(&c.text) || numeric_reference(text, c)
+                    || rebook_publication::media_references::is_citation(&c.text))
                 .collect();
             apply(text, &spans);
         }
