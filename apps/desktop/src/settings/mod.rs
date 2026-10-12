@@ -8,7 +8,7 @@ use rebook_reader::SelectionGranularity;
 
 use crate::plugins::PluginSettings;
 use crate::preferences::{
-    self, AppLanguage, AppTheme, InterfaceTypography, ReaderPreferences, ReadingMode,
+    self, AppLanguage, AppTheme, FocusStyle, InterfaceTypography, ReaderPreferences, ReadingMode,
     ShortcutPreferences,
 };
 use crate::sync::SyncSettings;
@@ -25,6 +25,7 @@ use provider_models::{ProviderModelsRequest, fetch_provider_models};
 pub(crate) struct AppliedSettings {
     pub(crate) spread: SpreadMode,
     pub(crate) reading_mode: ReadingMode,
+    pub(crate) focus_style: FocusStyle,
     pub(crate) hide_cursor_in_focus_mode: bool,
     pub(crate) interface_typography: InterfaceTypography,
     pub(crate) typography: ReaderTypography,
@@ -50,6 +51,7 @@ pub(crate) struct SettingsFeature {
     settings_tab: SettingsTab,
     draft_spread: SpreadMode,
     draft_reading_mode: ReadingMode,
+    draft_focus_style: FocusStyle,
     draft_hide_cursor_in_focus_mode: bool,
     draft_interface_typography: InterfaceTypography,
     draft_typography: ReaderTypography,
@@ -113,6 +115,7 @@ impl SettingsFeature {
         let applied = AppliedSettings {
             spread: preferences.spread,
             reading_mode: preferences.reading_mode,
+            focus_style: preferences.focus_style,
             hide_cursor_in_focus_mode: preferences.hide_cursor_in_focus_mode,
             interface_typography: preferences.interface_typography,
             typography: preferences.typography,
@@ -141,6 +144,7 @@ impl SettingsFeature {
             settings_tab: SettingsTab::System,
             draft_spread: applied.spread,
             draft_reading_mode: applied.reading_mode,
+            draft_focus_style: applied.focus_style,
             draft_hide_cursor_in_focus_mode: applied.hide_cursor_in_focus_mode,
             draft_interface_typography: applied.interface_typography.clone(),
             draft_typography: applied.typography.clone(),
@@ -175,6 +179,7 @@ impl SettingsFeature {
         self.settings_tab = SettingsTab::System;
         self.draft_spread = self.applied.spread;
         self.draft_reading_mode = self.applied.reading_mode;
+        self.draft_focus_style = self.applied.focus_style;
         self.draft_hide_cursor_in_focus_mode = self.applied.hide_cursor_in_focus_mode;
         self.draft_interface_typography
             .clone_from(&self.applied.interface_typography);
@@ -292,6 +297,7 @@ impl SettingsFeature {
             language: self.applied.language,
             spread: self.applied.spread,
             reading_mode: self.applied.reading_mode,
+            focus_style: self.applied.focus_style,
             hide_cursor_in_focus_mode: self.applied.hide_cursor_in_focus_mode,
             theme: self.applied.theme,
             selection_granularity: self.applied.selection_granularity,
@@ -331,11 +337,13 @@ impl SettingsFeature {
         }
         self.applied.spread = preferences.spread;
         self.applied.reading_mode = preferences.reading_mode;
+        self.applied.focus_style = preferences.focus_style;
         self.applied.hide_cursor_in_focus_mode = preferences.hide_cursor_in_focus_mode;
         self.applied.theme = preferences.theme;
         self.applied.selection_granularity = preferences.selection_granularity;
         self.draft_spread = preferences.spread;
         self.draft_reading_mode = preferences.reading_mode;
+        self.draft_focus_style = preferences.focus_style;
         self.draft_hide_cursor_in_focus_mode = preferences.hide_cursor_in_focus_mode;
         self.draft_theme = preferences.theme;
         if layout_changed {
@@ -361,6 +369,7 @@ impl SettingsFeature {
         AppliedSettings {
             spread: self.draft_spread,
             reading_mode: self.draft_reading_mode,
+            focus_style: self.draft_focus_style,
             hide_cursor_in_focus_mode: self.draft_hide_cursor_in_focus_mode,
             interface_typography: self.draft_interface_typography.clone(),
             typography: self.draft_typography.clone(),
@@ -422,6 +431,7 @@ impl SettingsFeature {
             theme,
             spread: self.draft_spread,
             reading_mode: self.draft_reading_mode,
+            focus_style: self.draft_focus_style,
             hide_cursor_in_focus_mode: self.draft_hide_cursor_in_focus_mode,
             selection_granularity: self.applied.selection_granularity,
             shortcuts: self.draft_shortcuts.clone(),
@@ -443,6 +453,7 @@ impl SettingsFeature {
         let next_applied = AppliedSettings {
             spread: self.draft_spread,
             reading_mode: self.draft_reading_mode,
+            focus_style: self.draft_focus_style,
             hide_cursor_in_focus_mode: self.draft_hide_cursor_in_focus_mode,
             interface_typography,
             typography,
@@ -663,6 +674,7 @@ mod tests {
         let applied = AppliedSettings {
             spread: preferences.spread,
             reading_mode: preferences.reading_mode,
+            focus_style: preferences.focus_style,
             hide_cursor_in_focus_mode: preferences.hide_cursor_in_focus_mode,
             interface_typography: preferences.interface_typography,
             typography: preferences.typography,
@@ -676,6 +688,21 @@ mod tests {
             sync_password: String::new(),
         };
         assert!(!settings_close_needs_apply(&applied, &applied));
+
+        let mut changed = applied.clone();
+        changed.focus_style = FocusStyle::SurroundingDim;
+        assert!(settings_close_needs_apply(&changed, &applied));
+        let mut state = SettingsFeature::from_applied(
+            applied.clone(),
+            LayoutEngine::with_fonts(std::iter::empty()).available_reader_font_families(),
+            Vec::new(),
+        );
+        state.draft_focus_style = FocusStyle::SurroundingDim;
+        state.draft_reading_mode = ReadingMode::Classic;
+        assert_eq!(
+            state.draft_settings().focus_style,
+            FocusStyle::SurroundingDim
+        );
 
         let mut changed = applied.clone();
         changed.theme = match applied.theme {

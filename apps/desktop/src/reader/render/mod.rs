@@ -1,5 +1,6 @@
 mod layers;
 mod scene;
+mod surroundings;
 mod vello;
 #[cfg(test)]
 pub(in crate::reader) use vello::VelloScene;

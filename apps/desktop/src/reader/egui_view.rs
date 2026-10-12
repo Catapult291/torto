@@ -5228,6 +5228,11 @@ impl DesktopReader {
     }
 
     fn selected_image_overlay(&self, ctx: &egui::Context, page_rect: Rect) {
+        if self.is_focus_mode()
+            && self.focus_style == crate::preferences::FocusStyle::SurroundingDim
+        {
+            return;
+        }
         let offset = Vec2::new(self.preview_offset_x(page_rect.width()), 0.0);
         if self.is_focus_mode()
             && self.is_scroll_mode()
@@ -8821,6 +8826,7 @@ mod reference_suggestion_label_tests {
                 plugin_settings: settings,
                 language: AppLanguage::SimplifiedChinese,
                 reading_mode: ReadingMode::Focus,
+                focus_style: crate::preferences::FocusStyle::default(),
                 hide_cursor_in_focus_mode: false,
                 selection_granularity: SelectionGranularity::Paragraph,
                 shortcuts: ShortcutPreferences::default(),
@@ -9007,6 +9013,7 @@ mod reference_suggestion_label_tests {
                     plugin_settings: settings,
                     language: AppLanguage::SimplifiedChinese,
                     reading_mode: ReadingMode::Focus,
+                    focus_style: crate::preferences::FocusStyle::default(),
                     hide_cursor_in_focus_mode: false,
                     selection_granularity: SelectionGranularity::Paragraph,
                     shortcuts: ShortcutPreferences::default(),
@@ -10035,6 +10042,49 @@ mod reference_suggestion_label_tests {
                 "preview jumped at width={width}"
             );
             previous = next;
+        }
+    }
+
+    #[test]
+    fn surrounding_dim_keeps_images_clear_without_a_focus_border() {
+        let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+        let layout = reader.current_scroll_layout().unwrap();
+        reader.rebuild_focus_units(&layout);
+        let index = reader
+            .focus_units
+            .iter()
+            .position(|unit| unit.is_image)
+            .unwrap();
+        reader.select_focus_unit(index);
+        reader.scroll_viewport = Some(super::super::ScrollViewportState {
+            size: Vec2::new(800.0, 600.0),
+            offset_y: reader.focus_units[index].rect.top() + reader.scroll_content_padding(600.0)
+                - 100.0,
+        });
+        let page = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let ctx = egui::Context::default();
+        for style in [
+            crate::preferences::FocusStyle::BackgroundHighlight,
+            crate::preferences::FocusStyle::SurroundingDim,
+        ] {
+            reader.focus_style = style;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(page),
+                    ..Default::default()
+                },
+                |_| {
+                    reader.selected_image_overlay(&ctx, page);
+                },
+            );
+            let border = output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Rect(rect) if rect.stroke.width == 2.0 && rect.stroke.color == palette().accent
+            ));
+            assert_eq!(
+                border,
+                style == crate::preferences::FocusStyle::BackgroundHighlight
+            );
+            output.textures_delta.clear();
         }
     }
 

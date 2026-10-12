@@ -217,6 +217,7 @@ fn chapter_book_with_progress(
             plugin_settings: settings,
             language: AppLanguage::English,
             reading_mode,
+            focus_style: crate::preferences::FocusStyle::default(),
             hide_cursor_in_focus_mode: false,
             selection_granularity: SelectionGranularity::Free,
             shortcuts: ShortcutPreferences::default(),

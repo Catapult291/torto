@@ -246,6 +246,7 @@ impl DesktopReader {
         scene.append(&text, None);
         scene.append(&foreground, None);
         self.paint_scroll_bridges(&mut scene, &layout, viewport, content_padding);
+        self.paint_focus_surroundings(&mut scene, viewport, content_padding);
         let preview_x = f64::from(self.preview_offset_x(viewport.size.x));
         if preview_x != 0.0 {
             let mut positioned = Scene::new();
@@ -327,7 +328,7 @@ impl DesktopReader {
         if let Some(selection) = &self.selection {
             paint(&selection.ranges, TEXT_SELECTION_COLOR, false, false);
         }
-        if self.is_focus_mode()
+        if self.focus_background_highlight()
             && focus_unit_activation_visible(
                 self.selection.is_some(),
                 self.focus_selection_anchor.is_some(),
@@ -352,7 +353,7 @@ impl DesktopReader {
         content_padding: f32,
     ) -> Rect {
         let mut bounds: Option<Rect> = None;
-        if self.is_focus_mode()
+        if self.focus_background_highlight()
             && focus_unit_activation_visible(
                 self.selection.is_some(),
                 self.focus_selection_anchor.is_some(),
@@ -382,7 +383,7 @@ impl DesktopReader {
             bounds = Some(bounds.map_or(rect, |previous| previous.union(rect)));
             scene.fill(Fill::NonZero, Affine::IDENTITY, neutral, None, &background);
         }
-        if self.is_focus_mode()
+        if self.focus_background_highlight()
             && focus_unit_activation_visible(
                 self.selection.is_some(),
                 self.focus_selection_anchor.is_some(),
@@ -578,10 +579,11 @@ impl DesktopReader {
             .is_focus_mode()
             .then(|| self.focus_units.get(self.focus_unit_index))
             .flatten();
-        let activation_visible = focus_unit_activation_visible(
-            self.selection.is_some(),
-            self.focus_selection_anchor.is_some(),
-        );
+        let activation_visible = self.focus_background_highlight()
+            && focus_unit_activation_visible(
+                self.selection.is_some(),
+                self.focus_selection_anchor.is_some(),
+            );
         if let Some(unit) = focus_unit.filter(|unit| {
             activation_visible && unit.rectangular_activation && !self.is_scroll_mode()
         }) {
@@ -670,7 +672,7 @@ impl DesktopReader {
         } else if !self.is_focus_mode() {
             page.paint_all_footnote_icons(scene, focus_footnote_icon_color(), offset_x);
         }
-        if self.is_focus_mode()
+        if self.focus_background_highlight()
             && focus_unit_activation_visible(
                 self.selection.is_some(),
                 self.focus_selection_anchor.is_some(),

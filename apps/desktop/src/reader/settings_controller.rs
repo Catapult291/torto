@@ -188,6 +188,10 @@ impl DesktopReader {
                     || translation_mode_changed;
                 self.plugin_settings = plugin_settings;
                 self.language = language;
+                if self.focus_style != settings.focus_style {
+                    self.focus_style = settings.focus_style;
+                    self.bump_scene_revision();
+                }
                 if self.hide_cursor_in_focus_mode != settings.hide_cursor_in_focus_mode {
                     self.focus_cursor_hidden_override = None;
                 }

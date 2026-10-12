@@ -9,7 +9,7 @@ use crate::plugins::{
     TranslationMode,
 };
 use crate::preferences::{
-    AppLanguage, AppTheme, MAX_SHORTCUT_KEYS, ReadingMode, SYSTEM_INTERFACE_FONT,
+    AppLanguage, AppTheme, FocusStyle, MAX_SHORTCUT_KEYS, ReadingMode, SYSTEM_INTERFACE_FONT,
     shortcut_chord_key_count,
 };
 use crate::sync::CloudProviderKind;
@@ -811,6 +811,7 @@ fn typography_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
         ui,
         state.draft_language,
         &mut state.draft_reading_mode,
+        &mut state.draft_focus_style,
         &mut state.draft_spread,
         &mut state.draft_hide_cursor_in_focus_mode,
         &mut state.draft_typesetting,
@@ -829,6 +830,7 @@ fn reader_layout_settings(
     ui: &mut egui::Ui,
     language: AppLanguage,
     reading_mode: &mut ReadingMode,
+    focus_style: &mut FocusStyle,
     spread: &mut SpreadMode,
     hide_cursor_in_focus_mode: &mut bool,
     typesetting: &mut rebook_layout::ReaderTypesetting,
@@ -900,6 +902,25 @@ fn reader_layout_settings(
                 }
 
                 if *reading_mode == ReadingMode::Focus {
+                    settings_row_label(ui, language.text("聚焦样式", "Focus style"));
+                    settings_row_control_sized(ui, 300.0, |ui| {
+                        for (style, label) in [
+                            (
+                                FocusStyle::BackgroundHighlight,
+                                language.text("背景高亮", "Background highlight"),
+                            ),
+                            (
+                                FocusStyle::SurroundingDim,
+                                language.text("周边淡化", "Dim surroundings"),
+                            ),
+                        ] {
+                            if choice_button(ui, label, *focus_style == style).clicked() {
+                                *focus_style = style;
+                            }
+                        }
+                    });
+                    ui.end_row();
+
                     settings_row_label(ui, language.text("隐藏鼠标", "Hide cursor"));
                     settings_row_control_sized(ui, SETTINGS_SELECT_WIDTH, |ui| {
                         toggle_switch(ui, hide_cursor_in_focus_mode);
@@ -2711,6 +2732,7 @@ mod tests {
         let applied = crate::settings::AppliedSettings {
             spread: preferences.spread,
             reading_mode: preferences.reading_mode,
+            focus_style: preferences.focus_style,
             hide_cursor_in_focus_mode: preferences.hide_cursor_in_focus_mode,
             interface_typography: preferences.interface_typography,
             typography: preferences.typography,
@@ -2742,6 +2764,7 @@ mod tests {
             SettingsTab::About,
         ] {
             state.settings_tab = tab;
+            state.draft_focus_style = FocusStyle::SurroundingDim;
             let ctx = egui::Context::default();
             for pass in 0..12 {
                 let mut output = ctx.run_ui(

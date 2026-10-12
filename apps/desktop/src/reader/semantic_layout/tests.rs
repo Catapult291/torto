@@ -1535,6 +1535,7 @@ href:PublicationUrl::parse("image.png").unwrap(),alt:String::new(),style:Default
             plugin_settings: settings,
             language: AppLanguage::English,
             reading_mode: ReadingMode::Focus,
+            focus_style: crate::preferences::FocusStyle::default(),
             hide_cursor_in_focus_mode: false,
             selection_granularity: SelectionGranularity::Paragraph,
             shortcuts: ShortcutPreferences::default(),

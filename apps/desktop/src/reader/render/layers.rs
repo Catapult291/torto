@@ -636,6 +636,9 @@ impl DesktopReader {
                 measured_clip(window, Some(bounds)),
                 (preview_x, 0.0),
             );
+            let mut surroundings = Scene::new();
+            self.paint_focus_surroundings(&mut surroundings, viewport, padding);
+            result.dynamic(surroundings, window, (preview_x, 0.0));
         } else {
             let cached = self.page_scene_layers();
             let spread = self.reader.current_spread().ok()?;

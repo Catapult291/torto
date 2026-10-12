@@ -29,7 +29,9 @@ use crate::plugins::{
     RewriteBookSource, TranslationBlockInput, TranslationBookSource, has_pending_pdf_ocr_task,
     load_pdf_ocr_source,
 };
-use crate::preferences::{self, AppLanguage, ReaderPreferences, ReadingMode, ShortcutPreferences};
+use crate::preferences::{
+    self, AppLanguage, FocusStyle, ReaderPreferences, ReadingMode, ShortcutPreferences,
+};
 use crate::settings::ReaderSettingsChange;
 use crate::sync::{SyncSettings, SyncStore};
 
@@ -585,6 +587,7 @@ pub(crate) fn open_reader_staged(
             plugin_settings,
             language: reader_preferences.language,
             reading_mode,
+            focus_style: reader_preferences.focus_style,
             hide_cursor_in_focus_mode: reader_preferences.hide_cursor_in_focus_mode,
             selection_granularity: reader_preferences.selection_granularity,
             shortcuts: reader_preferences.shortcuts,
@@ -878,6 +881,7 @@ pub(super) struct DesktopReader {
     plugin_settings: PluginSettings,
     language: AppLanguage,
     reading_mode: ReadingMode,
+    focus_style: FocusStyle,
     hide_cursor_in_focus_mode: bool,
     focus_cursor_hidden_override: Option<bool>,
     shortcuts: ShortcutPreferences,
@@ -3741,6 +3745,7 @@ struct DesktopReaderResources {
     plugin_settings: PluginSettings,
     language: AppLanguage,
     reading_mode: ReadingMode,
+    focus_style: FocusStyle,
     hide_cursor_in_focus_mode: bool,
     selection_granularity: SelectionGranularity,
     shortcuts: ShortcutPreferences,
@@ -4500,6 +4505,7 @@ impl DesktopReader {
             plugin_settings,
             language,
             reading_mode,
+            focus_style,
             hide_cursor_in_focus_mode,
             selection_granularity,
             shortcuts,
@@ -4664,6 +4670,7 @@ impl DesktopReader {
             plugin_settings,
             language,
             reading_mode,
+            focus_style,
             hide_cursor_in_focus_mode,
             focus_cursor_hidden_override: None,
             shortcuts,

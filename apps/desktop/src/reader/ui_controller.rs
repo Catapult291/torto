@@ -303,6 +303,7 @@ mod tests {
         let mut settings = crate::settings::AppliedSettings {
             spread: preferences.spread,
             reading_mode: ReadingMode::Classic,
+            focus_style: preferences.focus_style,
             hide_cursor_in_focus_mode: preferences.hide_cursor_in_focus_mode,
             interface_typography: preferences.interface_typography,
             typography: preferences.typography,

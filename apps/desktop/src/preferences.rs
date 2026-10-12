@@ -107,6 +107,7 @@ pub(crate) struct ReaderPreferences {
     pub(crate) language: AppLanguage,
     pub(crate) spread: SpreadMode,
     pub(crate) reading_mode: ReadingMode,
+    pub(crate) focus_style: FocusStyle,
     pub(crate) hide_cursor_in_focus_mode: bool,
     pub(crate) theme: AppTheme,
     pub(crate) selection_granularity: SelectionGranularity,
@@ -122,6 +123,7 @@ impl Default for ReaderPreferences {
             language: AppLanguage::default(),
             spread: SpreadMode::Single,
             reading_mode: ReadingMode::Focus,
+            focus_style: FocusStyle::default(),
             hide_cursor_in_focus_mode: false,
             theme: AppTheme::default(),
             selection_granularity: SelectionGranularity::Free,
@@ -135,6 +137,14 @@ pub(crate) enum ReadingMode {
     Classic,
     #[default]
     Focus,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum FocusStyle {
+    #[default]
+    BackgroundHighlight,
+    SurroundingDim,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -431,6 +441,8 @@ struct StoredReaderPreferences {
     #[serde(default)]
     reading_mode: StoredReadingMode,
     #[serde(default)]
+    focus_style: FocusStyle,
+    #[serde(default)]
     hide_cursor_in_focus_mode: bool,
     #[serde(default)]
     selection_granularity: StoredSelectionGranularity,
@@ -607,6 +619,7 @@ fn load_from(path: PathBuf) -> PreferencesResult<ReaderPreferences> {
         language: stored.language,
         spread: stored.spread.into(),
         reading_mode: stored.reading_mode.into(),
+        focus_style: stored.focus_style,
         hide_cursor_in_focus_mode: stored.hide_cursor_in_focus_mode,
         theme: stored.theme.into(),
         selection_granularity: stored.selection_granularity.into(),
@@ -645,6 +658,7 @@ fn save_to(path: &Path, preferences: &ReaderPreferences) -> PreferencesResult<()
         language: preferences.language,
         spread: preferences.spread.into(),
         reading_mode: preferences.reading_mode.into(),
+        focus_style: preferences.focus_style,
         hide_cursor_in_focus_mode: preferences.hide_cursor_in_focus_mode,
         theme: preferences.theme.into(),
         selection_granularity: preferences.selection_granularity.into(),
@@ -719,6 +733,7 @@ mod tests {
             language: AppLanguage::English,
             spread: SpreadMode::Single,
             reading_mode: ReadingMode::Focus,
+            focus_style: FocusStyle::SurroundingDim,
             hide_cursor_in_focus_mode: true,
             theme: AppTheme::Dark,
             selection_granularity: SelectionGranularity::Sentence,
@@ -762,6 +777,7 @@ mod tests {
         assert_eq!(loaded.spread, SpreadMode::Single);
         assert_eq!(loaded.reading_mode, ReadingMode::Focus);
         assert!(loaded.hide_cursor_in_focus_mode);
+        assert_eq!(loaded.focus_style, FocusStyle::SurroundingDim);
         assert_eq!(loaded.theme, AppTheme::Dark);
         assert_eq!(loaded.selection_granularity, SelectionGranularity::Sentence);
         assert_eq!(
@@ -784,6 +800,7 @@ mod tests {
         assert!(matches!(stored.spread, StoredSpreadMode::Single));
         assert!(matches!(stored.reading_mode, StoredReadingMode::Focus));
         assert!(!stored.hide_cursor_in_focus_mode);
+        assert_eq!(stored.focus_style, FocusStyle::BackgroundHighlight);
         assert!(matches!(stored.theme, StoredAppTheme::System));
         assert!(matches!(
             stored.selection_granularity,
