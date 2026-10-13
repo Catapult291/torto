@@ -318,7 +318,14 @@ impl SemanticLayoutSource {
         {
             return Ok((original, hash.clone()));
         }
-        let hash = fingerprint(&original);
+        let cached = self.original.cached_section_fingerprint(index)
+            .filter(|_| before == self.original.content_revision());
+        let hash = cached.map(|hash| {
+            use std::fmt::Write as _;
+            let mut value = String::with_capacity(64);
+            for byte in hash { write!(value, "{byte:02x}").unwrap(); }
+            value
+        }).unwrap_or_else(|| fingerprint(&original));
         if let Some(revision) = revision
             && let Ok(mut cache) = self.fingerprints.write()
         {
@@ -524,9 +531,7 @@ impl BookSource for SemanticLayoutSource {
             text_formulas::restore_originals(&mut section.blocks);
             if unified_citations {
                 let (original, hash) = self.original_snapshot(index)?;
-                for annotation in self.cached_heuristics(index, &original, &hash) {
-                    compose(&mut section.blocks, &annotation);
-                }
+                citations::compose_many(&mut section.blocks, &self.cached_heuristics(index, &original, &hash));
                 citations::apply_heuristic_fallback(&mut section);
             }
             return Ok(section);
@@ -588,9 +593,7 @@ impl BookSource for SemanticLayoutSource {
         }
         text_formulas::normalize_formula_quotes(&mut section.blocks);
         if unified_citations && let Some((original, hash)) = snapshot.as_ref() {
-            for annotation in self.cached_heuristics(index, original, hash) {
-                compose(&mut section.blocks, &annotation);
-            }
+            citations::compose_many(&mut section.blocks, &self.cached_heuristics(index, original, hash));
             citations::apply_heuristic_fallback(&mut section);
         }
         Ok(section)
@@ -609,6 +612,10 @@ impl BookSource for SemanticLayoutSource {
         href: &rebook_publication::PublicationUrl,
     ) -> Result<Option<[u32; 2]>, rebook_publication::PublicationError> {
         self.inner.raster_resource_dimensions(href)
+    }
+
+    fn image_resource_dimensions(&self, href: &PublicationUrl) -> Result<Option<[u32; 2]>, PublicationError> {
+        self.inner.image_resource_dimensions(href)
     }
 
     fn fixed_page_dimensions(
@@ -2105,6 +2112,9 @@ fn complete_quote_attribution(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod local_perf_tests;
 
 #[cfg(test)]
 mod attribution_tests;

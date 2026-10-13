@@ -80,6 +80,7 @@ pub struct DeferredRaster {
     block: ImageBlock,
     generated: Option<Arc<dyn RasterTask>>,
     source_owned: bool,
+    immutable_encoded: bool,
     target: [u32; 2],
     dimensions: [u32; 2],
 }
@@ -310,8 +311,17 @@ impl DeferredRaster {
                 source.resource(&self.block.href)?
             };
             // Revalidate sources with no resource revision, before publishing pixels.
-            let (resource_key, key) =
-                encoded_keys(source, &self.block, &resource.bytes, self.target);
+            let (resource_key, key) = if self.immutable_encoded {
+                if source.image_resource_dimensions(&self.block.href)? != Some(self.dimensions) {
+                    return Err(PublicationError::InvalidPublication(
+                        "Encoded image dimensions changed during preparation".into(),
+                    )
+                    .into());
+                }
+                immutable_encoded_keys(source, &self.block, self.dimensions, self.target)
+            } else {
+                encoded_keys(source, &self.block, &resource.bytes, self.target)
+            };
             if !needed() {
                 return Ok(());
             }
@@ -325,6 +335,12 @@ impl DeferredRaster {
                 let _timing = timing::stage(timing::TimingStage::ImageDecode);
                 image::load_from_memory(&resource.bytes)?
             };
+            if self.immutable_encoded && [decoded.width(), decoded.height()] != self.dimensions {
+                return Err(PublicationError::InvalidPublication(
+                    "Encoded image metadata does not match its pixels".into(),
+                )
+                .into());
+            }
             if !needed() {
                 return Ok(());
             }
@@ -397,6 +413,23 @@ fn owned_keys(
     (resource_key, hash.finish())
 }
 
+fn immutable_encoded_keys(
+    source: &dyn BookSource,
+    block: &ImageBlock,
+    dimensions: [u32; 2],
+    target: [u32; 2],
+) -> (u64, u64) {
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    "immutable-encoded-image-v1".hash(&mut hash);
+    source.book().id.hash(&mut hash);
+    source.content_revision().hash(&mut hash);
+    block.href.hash(&mut hash);
+    dimensions.hash(&mut hash);
+    let resource_key = hash.finish();
+    target.hash(&mut hash);
+    (resource_key, hash.finish())
+}
+
 pub(super) fn prepare(
     source: &dyn BookSource,
     block: &ImageBlock,
@@ -411,8 +444,18 @@ pub(super) fn prepare(
         target
     };
     let source_dimensions = source.raster_resource_dimensions(&block.href)?;
+    let encoded_dimensions = if source_dimensions.is_none() {
+        source
+            .image_resource_dimensions(&block.href)?
+            .filter(|[w, h]| *w > 0 && *h > 0)
+    } else {
+        None
+    };
     let (width, height, resource_key, key) = if let Some([width, height]) = source_dimensions {
         let (resource_key, key) = owned_keys(source, block, [width, height], target);
+        (width, height, resource_key, key)
+    } else if let Some([width, height]) = encoded_dimensions {
+        let (resource_key, key) = immutable_encoded_keys(source, block, [width, height], target);
         (width, height, resource_key, key)
     } else {
         let resource = source.resource(&block.href)?;
@@ -438,6 +481,7 @@ pub(super) fn prepare(
             block: block.clone(),
             generated: None,
             source_owned: source_dimensions.is_some(),
+            immutable_encoded: encoded_dimensions.is_some(),
             target,
             dimensions: [width.max(1), height.max(1)],
         }),
@@ -489,6 +533,7 @@ pub(super) fn prepare_generated(
             },
             generated: Some(task),
             source_owned: false,
+            immutable_encoded: false,
             target: dimensions,
             dimensions,
         }),
@@ -645,6 +690,13 @@ pub(super) fn load(
         };
         (decoded, encoded)
     };
+    let immutable_dimensions = if decoded.is_none() {
+        source
+            .image_resource_dimensions(&block.href)?
+            .filter(|[w, h]| *w > 0 && *h > 0)
+    } else {
+        None
+    };
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     source.book().id.hash(&mut hash);
     owner.1.hash(&mut hash);
@@ -662,6 +714,16 @@ pub(super) fn load(
         target.hash(&mut hash);
     }
     let key = hash.finish();
+    let (resource_key, key) = if let Some(dimensions) = immutable_dimensions {
+        immutable_encoded_keys(
+            source,
+            block,
+            dimensions,
+            if exact { [u32::MAX; 2] } else { target },
+        )
+    } else {
+        (resource_key, key)
+    };
     {
         let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
         cache.clock = cache.clock.wrapping_add(1);
@@ -700,6 +762,12 @@ pub(super) fn load(
             let _timing = timing::stage(timing::TimingStage::ImageDecode);
             image::load_from_memory(&encoded.expect("encoded image resource").bytes)?
         };
+        if immutable_dimensions.is_some_and(|size| size != [image.width(), image.height()]) {
+            return Err(PublicationError::InvalidPublication(
+                "Encoded image metadata does not match its pixels".into(),
+            )
+            .into());
+        }
         if exact {
             let _timing = timing::stage(timing::TimingStage::ImagePixels);
             let rgba = image.into_rgba8();
@@ -772,6 +840,7 @@ mod tests {
             generated: None,
             source_owned: false,
             target: [2, 2],
+            immutable_encoded: false,
             dimensions: [2, 2],
         };
         cache.insert(key, raster(2, 2, vec![255; 16].into(), None), BUDGET);

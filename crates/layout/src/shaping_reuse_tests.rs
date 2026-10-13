@@ -1,4 +1,31 @@
 // Included in the layout tests to use their source fixtures.
+#[test]
+fn converged_hyphen_plan_reuse_matches_full_replanning_geometry() {
+    use std::sync::Arc;
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) { DISABLE_BREAK_PLAN_REUSE.with(|flag| flag.set(self.0)); }
+    }
+    let font = ReaderFontBlob::new(Arc::new(include_bytes!("../../../assets/fonts/Literata-opsz-wght.ttf").as_slice()));
+    let style = ReaderStyle { typesetting: ReaderTypesetting::unified(), ..Default::default() };
+    let prose = "An efficient affiliation requires internationalization and experimentation. \
+        Scientific investigation combines information about extraordinary opportunities, \
+        identification, computational processing and reading comprehension. ";
+    for value in [prose.to_owned(), prose.repeat(8), format!("{prose}(Smith, 2020)."), "混合文字 computational models：information processing and internationalization.".into()] {
+        let mut block = reuse_test_block(&value);
+        for inline in &mut block.content { if let Inline::Text(run) = inline { run.style.language = rebook_publication::TextLanguage::EnglishUs; } }
+        for width in [110., 180., 320., 620.] {
+            let previous = DISABLE_BREAK_PLAN_REUSE.with(|flag| flag.replace(true));
+            let restore = Restore(previous);
+            let expected = LayoutEngine::with_fonts([font.clone()]).shape_text(&block, &style, width);
+            drop(restore);
+            let actual = LayoutEngine::with_fonts([font.clone()]).shape_text(&block, &style, width);
+            assert_eq!(actual.text, expected.text);
+            assert_eq!(reuse_test_geometry(&actual), reuse_test_geometry(&expected), "width={width}");
+            assert_eq!(actual.hyphens.iter().map(|h| h.line_index).collect::<Vec<_>>(), expected.hyphens.iter().map(|h| h.line_index).collect::<Vec<_>>());
+        }
+    }
+}
 fn reuse_test_block(value: &str) -> TextBlock {
     TextBlock {
         kind: TextBlockKind::Paragraph,
@@ -30,8 +57,9 @@ fn reuse_test_geometry(text: &PreparedText) -> Vec<String> {
                         )
                         .unwrap();
                     }
-                    crate::text_layout::PositionedLayoutItem::InlineBox(_) => {
-                        panic!("plain cell has a box")
+                    crate::text_layout::PositionedLayoutItem::InlineBox(inline_box) => {
+                        use std::fmt::Write as _;
+                        write!(value, " box {:?}", inline_box).unwrap();
                     }
                 }
             }

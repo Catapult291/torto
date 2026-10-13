@@ -310,9 +310,15 @@ fn citation_key(value: &str) -> String {
 }
 
 fn apply(text: &mut TextBlock, spans: &[Citation]) {
+    if spans.is_empty() { return; }
+    let available = candidate_spans(text);
+    apply_available(text, spans, &available);
+}
+
+fn apply_available(text: &mut TextBlock, spans: &[Citation], available: &[Citation]) {
+    if spans.is_empty() { return; }
     // Explicit translation markup is authoritative; legacy text matching must
     // not renumber or overwrite already restored citations.
-    let available = candidate_spans(text);
     let mut located = Vec::new();
     for original in spans {
         let exact: Vec<_> = available
@@ -485,6 +491,61 @@ pub(super) fn compose(blocks: &mut [Block], source: &SourceRange, spans: &[Citat
             _ => {
                 companion = false;
             }
+        }
+    }
+}
+
+/// Resolve all source-backed local citations in one block traversal. Preserve
+/// annotation order, duplicate source ranges and translated-companion behavior.
+pub(super) fn compose_many(blocks: &mut [Block], annotations: &[Annotation]) {
+    type Groups<'a> = HashMap<u64, Vec<(&'a SourceRange, Vec<&'a [Citation]>)>>;
+    fn key(source: &SourceRange) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        (source.start.spine.as_str(), &source.start.node, source.start.text_offset,
+         source.end.spine.as_str(), &source.end.node, source.end.text_offset).hash(&mut hash);
+        hash.finish()
+    }
+    fn find<'a, 'b>(groups: &'a Groups<'b>, source: &SourceRange) -> Option<&'a Vec<&'b [Citation]>> {
+        // The hash is just an index; compare complete ranges on collisions.
+        groups.get(&key(source))?.iter().find(|(known, _)| *known == source).map(|(_, spans)| spans)
+    }
+    let mut by_source = Groups::new();
+    for annotation in annotations {
+        if let Annotation::InlineCitations { source, spans } = annotation {
+            let bucket = by_source.entry(key(source)).or_default();
+            if let Some((_, group)) = bucket.iter_mut().find(|(known, _)| *known == source) {
+                group.push(spans);
+            } else {
+                bucket.push((source, vec![spans]));
+            }
+        }
+    }
+    if by_source.is_empty() { return; }
+    let apply_group = |text: &mut TextBlock, group: &Vec<&[Citation]>| {
+        for spans in group { apply(text, spans); }
+    };
+    let mut companion = None;
+    for block in blocks {
+        match block {
+            Block::Text(text) => {
+                let matching = text.source.as_ref().and_then(|source| find(&by_source, source));
+                if let Some(group) = matching.or_else(|| text.source.is_none().then_some(companion).flatten()) {
+                    apply_group(text, group);
+                }
+                companion = matching;
+            }
+            Block::Quote(quote) => for text in &mut quote.body {
+                if let Some(group) = text.source.as_ref().and_then(|source| find(&by_source, source)) {
+                    apply_group(text, group);
+                }
+            },
+            Block::Table(table) => for text in table.text_blocks_mut() {
+                if let Some(group) = text.source.as_ref().and_then(|source| find(&by_source, source)) {
+                    apply_group(text, group);
+                }
+            },
+            _ => companion = None,
         }
     }
 }

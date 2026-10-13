@@ -1,5 +1,8 @@
 use crate::reader::*;
 
+#[path = "open_perf_tests.rs"]
+mod open_perf_tests;
+
 #[test]
 #[ignore = "requires TORTO_OPEN_BOOK and optional TORTO_OPEN_LOCATOR; read-only book/progress profiling"]
 fn local_book_open_performance() {

@@ -80,7 +80,42 @@ pub(super) struct EpubPublication {
     html_context: crate::HtmlContext,
 }
 
+/// Descriptor-only state. It contains no decoded resources or parsed chapters.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(super) struct ReadingIndex {
+    pub book: Book,
+    cover_page: Option<PublicationUrl>,
+    media_types: HashMap<String, String>,
+    navigation_documents: Vec<PublicationUrl>,
+}
+
 impl EpubPublication {
+    pub(super) fn reading_index(&self) -> ReadingIndex {
+        ReadingIndex {
+            book: self.book.clone(),
+            cover_page: self.cover_page.clone(),
+            media_types: self.media_types.clone(),
+            navigation_documents: self.html_context.navigation_documents.clone(),
+        }
+    }
+
+    pub(super) fn from_reading_index(
+        bytes: Arc<[u8]>,
+        index: ReadingIndex,
+    ) -> Result<Self, EpubError> {
+        let limits = EpubLimits::default();
+        ensure_limit(bytes.len() as u64 <= limits.archive_bytes, "archive exceeds configured byte limit")?;
+        let archive = EpubArchive::new(bytes, limits)?;
+        Ok(Self {
+            toc_heading_hints: collect_toc_heading_hints(&index.book.table_of_contents),
+            html_context: crate::HtmlContext::new(&index.book.table_of_contents, index.navigation_documents),
+            book: index.book,
+            cover_page: index.cover_page,
+            media_types: index.media_types,
+            archive,
+        })
+    }
+
     /// Opens an EPUB from immutable bytes using default limits.
     pub(super) fn open_bytes(bytes: impl Into<Arc<[u8]>>) -> Result<Self, EpubError> {
         Self::open_bytes_with_options(bytes, EpubOpenOptions::default())
@@ -90,6 +125,23 @@ impl EpubPublication {
     fn open_bytes_with_options(
         bytes: impl Into<Arc<[u8]>>,
         options: EpubOpenOptions,
+    ) -> Result<Self, EpubError> {
+        Self::open_bytes_with_identity(bytes, options, None)
+    }
+
+    /// The cache opener has already hashed these immutable bytes. Reuse that
+    /// identity rather than hashing a multi-megabyte EPUB for a second time.
+    pub(super) fn open_bytes_with_id(
+        bytes: Arc<[u8]>,
+        id: PublicationId,
+    ) -> Result<Self, EpubError> {
+        Self::open_bytes_with_identity(bytes, EpubOpenOptions::default(), Some(id))
+    }
+
+    fn open_bytes_with_identity(
+        bytes: impl Into<Arc<[u8]>>,
+        options: EpubOpenOptions,
+        id: Option<PublicationId>,
     ) -> Result<Self, EpubError> {
         let bytes = bytes.into();
         ensure_limit(
@@ -130,8 +182,10 @@ impl EpubPublication {
                 |href| archive.read_content_xml(href).ok(),
             );
         }
-        let digest = Sha256::digest(bytes.as_ref());
-        let id = PublicationId::new(format!("{digest:x}"))?;
+        let id = match id {
+            Some(id) => id,
+            None => PublicationId::new(format!("{:x}", Sha256::digest(bytes.as_ref())))?,
+        };
 
         Ok(Self {
             cover_page,
@@ -1548,7 +1602,7 @@ impl EpubError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::io::{Cursor, Write};
 
     use image::{DynamicImage, ImageFormat};
@@ -2345,11 +2399,11 @@ mod tests {
         }
     }
 
-    fn minimal_epub() -> Vec<u8> {
+    pub(crate) fn minimal_epub() -> Vec<u8> {
         zip_entries(&minimal_entries())
     }
 
-    fn note_section_epub() -> Vec<u8> {
+    pub(crate) fn note_section_epub() -> Vec<u8> {
         zip_entries(&[
             ("mimetype", b"application/epub+zip", CompressionMethod::Stored),
             (
@@ -2400,7 +2454,7 @@ mod tests {
         ])
     }
 
-    fn minimal_entries() -> Vec<(&'static str, &'static [u8], CompressionMethod)> {
+    pub(crate) fn minimal_entries() -> Vec<(&'static str, &'static [u8], CompressionMethod)> {
         vec![
             ("mimetype", b"application/epub+zip", CompressionMethod::Stored),
             (
@@ -2496,7 +2550,7 @@ mod tests {
         ]
     }
 
-    fn zip_entries(entries: &[(&str, &[u8], CompressionMethod)]) -> Vec<u8> {
+    pub(crate) fn zip_entries(entries: &[(&str, &[u8], CompressionMethod)]) -> Vec<u8> {
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
         for (name, bytes, compression) in entries {
             writer

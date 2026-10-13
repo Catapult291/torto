@@ -155,6 +155,14 @@ impl BookSource for RewriteBookSource {
         self.inner.table_of_contents_origin()
     }
 
+    fn cached_section_fingerprint(&self, index: usize) -> Option<[u8; 32]> {
+        let rewrites = self.rewrites.read().ok()?;
+        if rewrites.keys().any(|key| key.section_index == index) {
+            return None;
+        }
+        self.inner.cached_section_fingerprint(index)
+    }
+
     fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
         // Cache canonical IR, never rewritten/translated text. Reflow can then
         // reuse parsing while every read still applies the latest rewrites.
@@ -243,6 +251,10 @@ impl BookSource for RewriteBookSource {
         self.inner.raster_resource_dimensions(href)
     }
 
+    fn image_resource_dimensions(&self, href: &PublicationUrl) -> Result<Option<[u32; 2]>, PublicationError> {
+        self.inner.image_resource_dimensions(href)
+    }
+
     fn fixed_page_dimensions(
         &self,
         section_index: usize,
@@ -294,6 +306,25 @@ mod tests {
         fn resource(&self, _href: &PublicationUrl) -> Result<Resource, PublicationError> {
             unreachable!()
         }
+
+        fn cached_section_fingerprint(&self, _index: usize) -> Option<[u8; 32]> {
+            use sha2::{Digest, Sha256};
+            Some(Sha256::digest(serde_json::to_vec(&self.section).unwrap()).into())
+        }
+    }
+
+    #[test]
+    fn cached_fingerprint_is_used_only_when_the_section_has_no_rewrites() {
+        let raw = source();
+        let fingerprint = raw.cached_section_fingerprint(0).unwrap();
+        let rewritten = RewriteBookSource::new(raw);
+        assert_eq!(rewritten.cached_section_fingerprint(0), Some(fingerprint));
+        let transaction = rewritten.apply_rewrites(&[BlockRewrite {
+            section_index: 0, block_id: "paragraph-1".into(), text: "New text".into(),
+        }]).unwrap();
+        assert_eq!(rewritten.cached_section_fingerprint(0), None);
+        rewritten.rollback(transaction).unwrap();
+        assert_eq!(rewritten.cached_section_fingerprint(0), Some(fingerprint));
     }
 
     fn source() -> Arc<dyn BookSource> {

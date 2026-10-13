@@ -5,6 +5,7 @@
 //! their publication descriptors, lazy sections, and resources directly.
 
 mod cbz;
+mod reading_cache;
 mod chm;
 mod continuations;
 mod cover;
@@ -146,6 +147,17 @@ pub fn open_file_for_reading(
     known_publication_id: Option<&str>,
 ) -> Result<OpenedPublication, FormatError> {
     open_file_with_options(path, false, known_publication_id)
+}
+
+/// Opens a local reflowable publication using a disposable, content-addressed
+/// descriptor and section cache. Cache errors always fall back to the parser.
+/// This function performs blocking work and belongs on the opening worker.
+pub fn open_file_for_reading_cached(
+    path: impl AsRef<Path>,
+    known_publication_id: Option<&str>,
+    cache_directory: impl AsRef<Path>,
+) -> Result<OpenedPublication, FormatError> {
+    reading_cache::open(path.as_ref(), known_publication_id, cache_directory.as_ref())
 }
 
 fn open_file_with_options(

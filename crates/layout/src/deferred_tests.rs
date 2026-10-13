@@ -336,6 +336,79 @@ fn figure_caption_inline_and_table_geometry_does_not_depend_on_pixels() {
     }
 }
 
+struct MetadataSource {
+    inner: Source,
+    dimensions: [u32; 2],
+    reads: std::sync::atomic::AtomicUsize,
+}
+impl BookSource for MetadataSource {
+    fn book(&self) -> &Book {
+        self.inner.book()
+    }
+    fn parse_section(&self, _: usize) -> Result<Section, PublicationError> {
+        unreachable!()
+    }
+    fn image_resource_dimensions(
+        &self,
+        _: &PublicationUrl,
+    ) -> Result<Option<[u32; 2]>, PublicationError> {
+        Ok(Some(self.dimensions))
+    }
+    fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.resource(href)
+    }
+}
+
+#[test]
+fn cached_encoded_dimensions_reserve_geometry_without_reading_pixels_and_keep_resizing() {
+    let source = MetadataSource {
+        inner: Source::new("cached-encoded-image-size"),
+        dimensions: [240, 160],
+        reads: Default::default(),
+    };
+    let mut engine = LayoutEngine::new();
+    engine.set_deferred_images(true);
+    engine.raster_target = [60, 40];
+    let block = image("picture.png");
+    let prepared = engine.load_raster(&source, &block).unwrap();
+    assert_eq!([prepared.width, prepared.height], [240, 160]);
+    assert!(prepared.pixels.is_empty());
+    assert_eq!(source.reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let request = prepared.deferred.as_ref().unwrap();
+    request.load(&source).unwrap();
+    let ready = request.ready_for_test().unwrap();
+    assert_eq!([ready.width, ready.height], [60, 40]);
+    assert_eq!(source.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        ready.origin.as_ref().map(|o| [o.width, o.height]),
+        Some([240, 160])
+    );
+    // Eager consumers (e.g. popups) reuse the same pixel variant and upload ID.
+    engine.set_deferred_images(false);
+    let eager = engine.load_raster(&source, &block).unwrap();
+    assert_eq!(
+        eager.blob.as_ref().unwrap().id(),
+        ready.blob.as_ref().unwrap().id()
+    );
+    retire_publication_rasters(source.book().id.as_str(), false);
+}
+
+#[test]
+fn encoded_dimensions_mismatch_is_rejected_before_publishing_pixels() {
+    let source = MetadataSource {
+        inner: Source::new("mismatched-encoded-image-size"),
+        dimensions: [999, 999],
+        reads: Default::default(),
+    };
+    let mut engine = LayoutEngine::new();
+    engine.set_deferred_images(true);
+    let prepared = engine.load_raster(&source, &image("wrong.png")).unwrap();
+    let request = prepared.deferred.as_ref().unwrap();
+    assert!(request.load(&source).is_err());
+    assert!(request.ready_for_test().is_none());
+}
+
 #[test]
 fn only_requested_pixels_are_loaded_and_view_retirement_releases_pixels() {
     let source = Source::new("deferred-retirement");

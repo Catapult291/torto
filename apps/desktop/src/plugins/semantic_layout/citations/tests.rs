@@ -3,6 +3,26 @@ use super::*;
 use rebook_publication::TextRun;
 
 #[test]
+fn batched_citations_match_individual_composition_with_companions_and_duplicates() {
+    let original = section(vec![text("a", "Claim (Smith, 2020)."), text("b", "More (Jones, 2021).")]);
+    let mut annotations = heuristic_annotations(&original);
+    annotations.push(annotations[0].clone());
+    let mut blocks = vec![original.blocks[0].clone(), text("translated", "Claim (Smith, 2020)."), original.blocks[1].clone()];
+    if let Block::Text(companion) = &mut blocks[1] { companion.source = None; }
+    let mut expected = blocks.clone();
+    for annotation in &annotations {
+        if let Annotation::InlineCitations { source, spans } = annotation {
+            compose(&mut expected, source, spans);
+        }
+    }
+    compose_many(&mut blocks, &annotations);
+    assert_eq!(blocks, expected);
+    let mut fallback = section(blocks.clone());
+    apply_heuristic_fallback(&mut fallback);
+    assert_eq!(fallback.blocks, blocks);
+}
+
+#[test]
 fn media_parentheses_share_citation_order_and_preserve_source_prose() {
     let original = section(vec![text("p", "正文（如图 4.4），参考 (Smith, 2020)，比较（见图五、七E）。（如图4.4所示，这是说明文字。）")]);
     let inner = super::super::tests::original_source(original.clone());

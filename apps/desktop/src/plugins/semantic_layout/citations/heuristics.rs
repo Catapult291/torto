@@ -242,12 +242,14 @@ pub(in crate::plugins::semantic_layout) fn apply_display_fallback(section: &mut 
             _ => Vec::new(),
         };
         for text in paragraphs {
-            let spans: Vec<_> = candidate_spans(text)
-                .into_iter()
+            let available = candidate_spans(text);
+            let spans: Vec<_> = available
+                .iter()
                 .filter(|c| author_date(&c.text) || numeric_reference(text, c)
                     || rebook_publication::media_references::is_citation(&c.text))
+                .cloned()
                 .collect();
-            apply(text, &spans);
+            apply_available(text, &spans, &available);
         }
     }
 }

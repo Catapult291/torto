@@ -189,6 +189,10 @@ impl BookSource for ParagraphStructureSource {
         self.inner.raster_resource_dimensions(href)
     }
 
+    fn image_resource_dimensions(&self, href: &PublicationUrl) -> Result<Option<[u32; 2]>, PublicationError> {
+        self.inner.image_resource_dimensions(href)
+    }
+
     fn fixed_page_dimensions(
         &self,
         section_index: usize,

@@ -300,6 +300,7 @@ pub(crate) fn plan_optimized(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn plan_optimized_with_hanging_indent(
     layout: &mut Layout<TextBrush>,
     text: &str,
@@ -309,6 +310,46 @@ pub(crate) fn plan_optimized_with_hanging_indent(
     default_em: f32,
     hyphen_breaks: &HashMap<usize, f32>,
 ) -> Option<ParagraphPlan> {
+    let analysis = ParagraphAnalysis::new(text);
+    plan_optimized_reusable(layout, text, column_width, first_line_indent, continuation_indent,
+        default_em, hyphen_breaks, &analysis).map(|prepared| prepared.plan)
+}
+
+/// Immutable text analysis shared by the bounded hyphen-fence refinement loop.
+pub(crate) struct ParagraphAnalysis {
+    supported: bool,
+    legal_breaks: Vec<usize>,
+}
+
+impl ParagraphAnalysis {
+    pub(crate) fn new(text: &str) -> Self {
+        let _timing = crate::timing::stage(crate::timing::TimingStage::LineBreak);
+        let supported = is_supported_ltr_prose(text);
+        Self { supported, legal_breaks: if supported { super::engine::legal_breaks(text) } else { Vec::new() } }
+    }
+}
+
+pub(crate) struct ReusableParagraphPlan {
+    pub(crate) plan: ParagraphPlan,
+    clusters: Vec<MeasuredCluster>,
+}
+
+impl ReusableParagraphPlan {
+    /// A shaping fence may change glyphs without changing any optimizer input.
+    /// Exact metrics equality permits the existing optimum to be reused. Any
+    /// cluster, fallback size or reference attachment change triggers re-planning.
+    pub(crate) fn matches(&self, layout: &mut Layout<TextBrush>) -> bool {
+        let _timing = crate::timing::stage(crate::timing::TimingStage::LineBreak);
+        measured_clusters(layout).is_some_and(|clusters| clusters == self.clusters)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_optimized_reusable(
+    layout: &mut Layout<TextBrush>, text: &str, column_width: f32,
+    first_line_indent: f32, continuation_indent: f32, default_em: f32,
+    hyphen_breaks: &HashMap<usize, f32>, analysis: &ParagraphAnalysis,
+) -> Option<ReusableParagraphPlan> {
     let _timing = crate::timing::stage(crate::timing::TimingStage::LineBreak);
     let has_in_flow_box = layout
         .inline_boxes()
@@ -318,12 +359,20 @@ pub(crate) fn plan_optimized_with_hanging_indent(
         || column_width <= 0.0
         || !default_em.is_finite()
         || default_em <= 0.0
-        || !is_supported_ltr_prose(text)
+        || !analysis.supported
         || layout.is_rtl()
     {
         return None;
     }
 
+    let clusters = measured_clusters(layout)?;
+    let plan = plan_measured_content_with_analysis(text, &clusters,
+        &layout.inline_boxes().collect::<Vec<_>>(), column_width, first_line_indent,
+        continuation_indent, default_em, hyphen_breaks, analysis)?;
+    Some(ReusableParagraphPlan { plan, clusters })
+}
+
+fn measured_clusters(layout: &mut Layout<TextBrush>) -> Option<Vec<MeasuredCluster>> {
     layout.break_all_lines(None);
     if layout.len() != 1 {
         return None;
@@ -351,16 +400,7 @@ pub(crate) fn plan_optimized_with_hanging_indent(
         }
     }
 
-    plan_measured_content(
-        text,
-        &clusters,
-        &layout.inline_boxes().collect::<Vec<_>>(),
-        column_width,
-        first_line_indent,
-        continuation_indent,
-        default_em,
-        hyphen_breaks,
-    )
+    Some(clusters)
 }
 
 /// Applies the same Unicode-aware Knuth--Plass paragraph optimization used by
@@ -396,6 +436,17 @@ fn plan_measured_content(
     default_em: f32,
     hyphen_breaks: &HashMap<usize, f32>,
 ) -> Option<ParagraphPlan> {
+    let analysis = ParagraphAnalysis::new(text);
+    plan_measured_content_with_analysis(text, measured, inline_boxes, column_width,
+        first_line_indent, continuation_indent, default_em, hyphen_breaks, &analysis)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn plan_measured_content_with_analysis(
+    text: &str, measured: &[MeasuredCluster], inline_boxes: &[InlineBox],
+    column_width: f32, first_line_indent: f32, continuation_indent: f32,
+    default_em: f32, hyphen_breaks: &HashMap<usize, f32>, analysis: &ParagraphAnalysis,
+) -> Option<ParagraphPlan> {
     let mut in_flow_boxes = inline_boxes
         .iter()
         .filter(|inline_box| inline_box.kind == InlineBoxKind::InFlow)
@@ -407,11 +458,11 @@ fn plan_measured_content(
         || column_width <= 0.0
         || !default_em.is_finite()
         || default_em <= 0.0
-        || !is_supported_ltr_prose(text)
+        || !analysis.supported
     {
         return None;
     }
-    let legal_breaks = super::engine::legal_breaks(text);
+    let legal_breaks = &analysis.legal_breaks;
     let mut expected_start = 0;
     let mut text_clusters = Vec::with_capacity(measured.len());
     for cluster in measured {

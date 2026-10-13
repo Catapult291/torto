@@ -147,7 +147,48 @@ mod imp {
 }
 
 pub(crate) fn log(event: &'static str, fields: &[Field<'_>]) {
+    #[cfg(test)]
+    if open_capture::record(event, fields) { return; }
     imp::log(event, fields);
+}
+
+pub(crate) fn reader_timings_enabled() -> bool {
+    #[cfg(test)]
+    if open_capture::active() { return true; }
+    cfg!(debug_assertions)
+}
+
+#[cfg(test)]
+pub(crate) mod open_capture {
+    use super::Field;
+    use std::cell::RefCell;
+    use serde_json::{Value, json};
+    thread_local! {
+        static EVENTS: RefCell<Option<Vec<Value>>> = const { RefCell::new(None) };
+    }
+    pub(crate) fn start() { EVENTS.with(|e| *e.borrow_mut() = Some(Vec::new())); }
+    pub(crate) fn active() -> bool { EVENTS.with(|e| e.borrow().is_some()) }
+    pub(crate) fn finish() -> Vec<Value> { EVENTS.with(|e| e.borrow_mut().take().unwrap()) }
+    pub(super) fn record(event: &str, fields: &[Field<'_>]) -> bool {
+        EVENTS.with(|e| {
+            let mut values = e.borrow_mut();
+            let Some(values) = values.as_mut() else { return false };
+            if event.starts_with("reader.open") || event == "reader.visible_images_ready" {
+                let mut value = serde_json::Map::new();
+                value.insert("event".into(), json!(event));
+                for field in fields {
+                    let (key, entry) = match field {
+                        Field::Text(k,v) => (*k, json!(v)), Field::Detail(k,v) => (*k, json!(v)),
+                        Field::Bool(k,v) => (*k, json!(v)), Field::U64(k,v) => (*k, json!(v)),
+                        Field::Usize(k,v) => (*k, json!(v)), Field::F32(k,v) => (*k, json!(v)),
+                    };
+                    value.insert(key.into(), entry);
+                }
+                values.push(Value::Object(value));
+            }
+            true // Profiling logs stay in this capture, never the user's log file.
+        })
+    }
 }
 
 pub(crate) fn install_panic_hook() {

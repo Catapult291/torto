@@ -150,6 +150,30 @@ pub(crate) fn default_open_viewport() -> LayoutViewport {
     LayoutViewport::new(INITIAL_WIDTH, INITIAL_HEIGHT).expect("valid initial viewport")
 }
 
+fn open_cached_publication_for_reading(
+    path: &Path,
+    known_id: Option<&str>,
+) -> Result<rebook_formats::OpenedPublication, rebook_formats::FormatError> {
+    // Keep real-library measurements isolated from the user's disk cache.
+    #[cfg(test)]
+    if crate::diagnostics::open_capture::active() {
+        return match std::env::var_os("TORTO_PERF_SOURCE_CACHE") {
+            Some(directory) => rebook_formats::open_file_for_reading_cached(
+                path, known_id, PathBuf::from(directory),
+            ),
+            None => open_publication_file_for_reading(path, known_id),
+        };
+    }
+    match crate::smoke::project_dirs() {
+        Some(project) => rebook_formats::open_file_for_reading_cached(
+            path,
+            known_id,
+            project.cache_dir().join("reading-source-ir"),
+        ),
+        None => open_publication_file_for_reading(path, known_id),
+    }
+}
+
 pub(crate) fn open_viewport(ui: &egui::Ui) -> LayoutViewport {
     let rect = ui.max_rect();
     LayoutViewport::new(
@@ -227,7 +251,7 @@ pub(crate) fn open_reader_staged(
         let source: Arc<dyn BookSource> = source;
         (BookFormat::Pdf, source, shelf_cover)
     } else {
-        let publication = open_publication_file_for_reading(path, known_publication_id)?;
+        let publication = open_cached_publication_for_reading(path, known_publication_id)?;
         let cover = shelf_cover.or_else(|| publication.cover_bytes().map(<[u8]>::to_vec));
         (publication.format(), publication.source(), cover)
     };
@@ -446,7 +470,7 @@ pub(crate) fn open_reader_staged(
         .and_then(|progress| progress.locator.source.clone());
     let resumed = stored_progress.is_some();
     let initial_layout_started = Instant::now();
-    let timing_scope = cfg!(debug_assertions)
+    let timing_scope = crate::diagnostics::reader_timings_enabled()
         .then(rebook_layout::timing::TimingScope::start)
         .flatten();
     let open_locator = explicit_locator
@@ -699,6 +723,7 @@ fn repair_legacy_translated_paragraph_highlights(
     let mut completed = Vec::new();
     let mut repairs = Vec::new();
     let mut indices = Vec::new();
+    let mut by_section = std::collections::BTreeMap::<usize, Vec<usize>>::new();
     for (index, highlight) in highlights.iter().enumerate() {
         if checked.get(&highlight.id) == Some(&fingerprint(highlight)) {
             continue;
@@ -714,16 +739,25 @@ fn repair_legacy_translated_paragraph_highlights(
         else {
             continue;
         };
+        by_section.entry(section_index).or_default().push(index);
+    }
+    // Validate every pending annotation in a chapter against one snapshot.
+    // Release it before moving on, rather than retaining another book cache.
+    for (section_index, annotation_indices) in by_section {
         let Ok(section) = source.parse_section(section_index) else {
             continue;
         };
-        if let Some(repaired) =
-            legacy_translated_paragraph_range(&section.blocks, range, &highlight.quote)
-        {
-            indices.push(index);
-            repairs.push((highlight.clone(), vec![repaired]));
-        } else {
-            completed.push((highlight.clone(), fingerprint(highlight)));
+        for index in annotation_indices {
+            let highlight = &highlights[index];
+            let range = &highlight.ranges[0];
+            if let Some(repaired) =
+                legacy_translated_paragraph_range(&section.blocks, range, &highlight.quote)
+            {
+                indices.push(index);
+                repairs.push((highlight.clone(), vec![repaired]));
+            } else {
+                completed.push((highlight.clone(), fingerprint(highlight)));
+            }
         }
     }
     // One transaction avoids a disk flush and connection per repaired record.
@@ -6179,6 +6213,12 @@ mod tests {
             Some("keep this note".into()),
         );
         store.insert(&highlight).unwrap();
+        for _ in 0..8 {
+            let additional = crate::highlights::StoredHighlight::with_note(
+                "range-checks".into(), vec![legacy.clone()], "译".repeat(69), None,
+            );
+            store.insert(&additional).unwrap();
+        }
         let mut highlights = store.for_book("range-checks");
         super::repair_legacy_translated_paragraph_highlights(
             &source,

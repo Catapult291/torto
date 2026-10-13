@@ -34,6 +34,10 @@ impl BookSource for CachedSource {
     fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
         self.source.resource(href)
     }
+
+    fn image_resource_dimensions(&self, href: &PublicationUrl) -> Result<Option<[u32; 2]>, PublicationError> {
+        self.source.image_resource_dimensions(href)
+    }
 }
 
 #[cfg(test)]

@@ -199,6 +199,11 @@ use thiserror::Error;
 use unicode_script::{Script, UnicodeScript as _};
 use unicode_segmentation::UnicodeSegmentation as _;
 
+#[cfg(test)]
+thread_local! {
+    static DISABLE_BREAK_PLAN_REUSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 const QUOTE_VERTICAL_PADDING: f32 = 12.0;
 const LITERATA_FAMILY: &str = "Literata";
 const LEGACY_YSABEAU_FAMILY: &str = "Ysabeau Office";
@@ -2916,8 +2921,9 @@ impl LayoutEngine {
         // Reshape at chosen discretionary breaks and remeasure before accepting
         // the paragraph. This preserves ligatures within each resulting line.
         if should_optimize {
+            let analysis = linebreak::parley::ParagraphAnalysis::new(&text);
             for _ in 0..4 {
-                let Some(plan) = linebreak::parley::plan_optimized_with_hanging_indent(
+                let Some(prepared) = linebreak::parley::plan_optimized_reusable(
                     &mut layout,
                     &text,
                     available_width,
@@ -2925,9 +2931,11 @@ impl LayoutEngine {
                     continuation_indent,
                     typography.font_size,
                     &hyphen_widths,
+                    &analysis,
                 ) else {
                     break;
                 };
+                let plan = &prepared.plan;
                 let next_breaks: Vec<_> = plan.hyphen_offsets.iter().flatten().copied().collect();
                 if next_breaks != shaping_breaks {
                     shaping_breaks = next_breaks;
@@ -2950,7 +2958,10 @@ impl LayoutEngine {
                         marker_width,
                         first_line_indent,
                     );
-                    continue;
+                    let reusable = prepared.matches(&mut layout);
+                    #[cfg(test)]
+                    let reusable = reusable && !DISABLE_BREAK_PLAN_REUSE.with(|disabled| disabled.get());
+                    if !reusable { continue; }
                 }
                 let adjusted = if let Some(adjusted) =
                     linebreak::parley::reuse_spacing(&layout, &text, &plan, available_width)

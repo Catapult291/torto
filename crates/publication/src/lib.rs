@@ -1350,6 +1350,12 @@ pub trait BookSource: Send + Sync {
     }
     /// Parses one section into the normalized reading IR.
     fn parse_section(&self, index: usize) -> Result<Section, PublicationError>;
+    /// Optional SHA-256 of `serde_json::to_vec()` for the last parsed section.
+    /// This is a cached lookup, never I/O. Derived sources must return `None`
+    /// when their output differs; consumers also validate `content_revision`.
+    fn cached_section_fingerprint(&self, _index: usize) -> Option<[u8; 32]> {
+        None
+    }
     /// Loads a referenced resource subject to format-specific budgets.
     fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError>;
     /// An authored cover page used when no usable standalone cover image exists.
@@ -1376,6 +1382,17 @@ pub trait BookSource: Send + Sync {
     /// Such resources must be immutable for the publication ID and revision;
     /// this lets interactive readers schedule materialization after layout.
     fn raster_resource_dimensions(
+        &self,
+        _href: &PublicationUrl,
+    ) -> Result<Option<[u32; 2]>, PublicationError> {
+        Ok(None)
+    }
+
+    /// Intrinsic pixel dimensions of an encoded image, without decoding pixels.
+    /// A source returning `Some` guarantees the encoded bytes are immutable for
+    /// this publication ID and content revision. Unlike source-owned rasters,
+    /// these images still use `resource()` and the renderer's display resizer.
+    fn image_resource_dimensions(
         &self,
         _href: &PublicationUrl,
     ) -> Result<Option<[u32; 2]>, PublicationError> {
