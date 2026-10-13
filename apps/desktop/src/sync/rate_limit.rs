@@ -1,0 +1,94 @@
+use std::fmt;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use reqwest::header::{HeaderMap, RETRY_AFTER};
+
+pub(super) const COOLDOWN_KEY: &str = "rate-limit-until-ms";
+pub(super) const DEFAULT_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+
+/// Preserve the server's retry deadline across the worker/UI boundary.
+#[derive(Debug)]
+pub(crate) struct RateLimited {
+    pub retry_after: Duration,
+}
+
+impl fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "WebDAV HTTP 429: 请求过于频繁，等待 {} 秒后自动重试",
+            self.retry_after.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for RateLimited {}
+
+pub(super) fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+pub(super) fn retry_after(headers: &HeaderMap, now: SystemTime) -> Duration {
+    let delay = headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            let value = value.trim();
+            if let Ok(seconds) = value.parse::<u64>() {
+                return Some(Duration::from_secs(seconds));
+            }
+            let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+            let deadline: SystemTime = date.into();
+            Some(deadline.duration_since(now).unwrap_or_default())
+        })
+        .unwrap_or(DEFAULT_COOLDOWN);
+    // Bound corrupt server values while retaining normal multi-hour/day quotas.
+    delay.clamp(
+        Duration::from_secs(1),
+        Duration::from_secs(30 * 24 * 60 * 60),
+    )
+}
+
+pub(super) fn remaining(bytes: &[u8], now: u64) -> Option<Duration> {
+    let deadline = u64::from_le_bytes(bytes.try_into().ok()?);
+    (deadline > now).then(|| Duration::from_millis(deadline - now))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_after_preserves_seconds_and_http_dates_and_handles_missing_headers() {
+        let now = UNIX_EPOCH + Duration::from_secs(784111777);
+        let mut headers = HeaderMap::new();
+        assert_eq!(retry_after(&headers, now), DEFAULT_COOLDOWN);
+        for (value, seconds) in [
+            ("7200", 7200),
+            ("Sun, 06 Nov 1994 08:51:37 GMT", 120),
+            ("Sun, 06 Nov 1994 08:49:37 GMT", 1),
+            ("invalid", 300),
+            ("18446744073709551615", 30 * 24 * 60 * 60),
+        ] {
+            headers.insert(RETRY_AFTER, value.parse().unwrap());
+            assert_eq!(
+                retry_after(&headers, now),
+                Duration::from_secs(seconds),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn saved_cooldown_expires_and_rejects_invalid_cache_data() {
+        let bytes = 1500_u64.to_le_bytes();
+        assert_eq!(remaining(&bytes, 1000), Some(Duration::from_millis(500)));
+        assert_eq!(remaining(&bytes, 1500), None);
+        assert_eq!(remaining(&bytes, 1600), None);
+        assert_eq!(remaining(b"invalid", 1000), None);
+    }
+}

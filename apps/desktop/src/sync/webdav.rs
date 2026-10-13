@@ -14,6 +14,7 @@ use reqwest::header::{
 use reqwest::{Client, Method, StatusCode, Url};
 
 use super::SyncResult;
+use super::rate_limit::{self, RateLimited};
 use super::settings::SyncSettings;
 use super::store::SyncStore;
 
@@ -39,6 +40,9 @@ pub(crate) struct WebDavClient {
     password: String,
     cstcloud_compatibility: bool,
     cache: Option<(SyncStore, String)>,
+    next_request: Arc<tokio::sync::Mutex<tokio::time::Instant>>,
+    cooldown_until: Arc<AtomicU64>,
+    cooldown_loaded: Arc<tokio::sync::OnceCell<()>>,
 }
 
 impl WebDavClient {
@@ -94,12 +98,72 @@ impl WebDavClient {
             password,
             cstcloud_compatibility: compatibility_user_agent.is_some(),
             cache: None,
+            next_request: Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now())),
+            cooldown_until: Arc::new(AtomicU64::new(0)),
+            cooldown_loaded: Arc::new(tokio::sync::OnceCell::new()),
         })
     }
 
     pub(crate) fn with_store(mut self, store: SyncStore, account: String) -> Self {
         self.cache = Some((store, account));
         self
+    }
+
+    async fn send(&self, request: reqwest::RequestBuilder) -> SyncResult<reqwest::Response> {
+        self.cooldown_loaded
+            .get_or_try_init(|| async {
+                if let Some((store, account)) = self.cache.clone() {
+                    let bytes = tokio::task::spawn_blocking(move || {
+                        store.cache_get(&account, rate_limit::COOLDOWN_KEY)
+                    })
+                    .await??;
+                    if let Some(bytes) = bytes.and_then(|bytes| <[u8; 8]>::try_from(bytes).ok()) {
+                        self.cooldown_until
+                            .store(u64::from_le_bytes(bytes), Ordering::Relaxed);
+                    }
+                }
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+            })
+            .await?;
+        self.check_cooldown()?;
+        // Pace this provider's large library scans instead of issuing a burst.
+        // Reservation is brief; neither the lock nor the timer runs on the UI.
+        if self.cstcloud_compatibility {
+            let at = {
+                let mut next = self.next_request.lock().await;
+                let at = (*next).max(tokio::time::Instant::now());
+                *next = at + Duration::from_secs(1);
+                at
+            };
+            tokio::time::sleep_until(at).await;
+        }
+        self.check_cooldown()?;
+        let response = request.send().await?;
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            let retry_after =
+                rate_limit::retry_after(response.headers(), std::time::SystemTime::now());
+            let until = rate_limit::now_ms().saturating_add(retry_after.as_millis() as u64);
+            self.cooldown_until.store(until, Ordering::Relaxed);
+            if let Some((store, account)) = self.cache.clone() {
+                let saved = tokio::task::spawn_blocking(move || {
+                    store.cache_set(&account, rate_limit::COOLDOWN_KEY, &until.to_le_bytes())
+                })
+                .await;
+                if !matches!(saved, Ok(Ok(()))) {
+                    tracing::warn!("failed to persist WebDAV rate limit cooldown");
+                }
+            }
+            return Err(RateLimited { retry_after }.into());
+        }
+        Ok(response)
+    }
+
+    fn check_cooldown(&self) -> SyncResult<()> {
+        let deadline = self.cooldown_until.load(Ordering::Relaxed).to_le_bytes();
+        if let Some(retry_after) = rate_limit::remaining(&deadline, rate_limit::now_ms()) {
+            return Err(RateLimited { retry_after }.into());
+        }
+        Ok(())
     }
 
     pub(crate) fn cache_get(&self, key: &str) -> SyncResult<Option<Vec<u8>>> {
@@ -198,7 +262,7 @@ impl WebDavClient {
         if let Some(etag) = cached.as_ref().and_then(|object| object.etag.as_ref()) {
             request = request.header(IF_NONE_MATCH, etag);
         }
-        let response = request.send().await?;
+        let response = self.send(request).await?;
         if response.status() == StatusCode::NOT_MODIFIED {
             return cached.map(Some).ok_or_else(|| {
                 io::Error::other("WebDAV returned 304 without cached content").into()
@@ -258,7 +322,7 @@ impl WebDavClient {
         if downloaded > 0 {
             request = request.header(RANGE, format!("bytes={downloaded}-"));
         }
-        let response = request.send().await?;
+        let response = self.send(request).await?;
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(false);
         }
@@ -404,7 +468,7 @@ impl WebDavClient {
             if immutable && !self.cstcloud_compatibility {
                 request = request.header(IF_NONE_MATCH, "*");
             }
-            let mut pending = Box::pin(request.send());
+            let mut pending = Box::pin(self.send(request));
             let response = loop {
                 match futures_util::future::select(
                     pending,
@@ -513,7 +577,7 @@ impl WebDavClient {
                     request
                 };
             }
-            let response = request.send().await?;
+            let response = self.send(request).await?;
             if matches!(
                 response.status(),
                 StatusCode::NOT_FOUND | StatusCode::CONFLICT
@@ -548,13 +612,12 @@ impl WebDavClient {
         let method = Method::from_bytes(b"PROPFIND")?;
         let body = r#"<?xml version="1.0" encoding="utf-8" ?>
             <d:propfind xmlns:d="DAV:"><d:prop><d:getetag/></d:prop></d:propfind>"#;
-        let response = self
+        let request = self
             .request(method, self.url(path)?)
             .header(DEPTH, HeaderValue::from_static("1"))
             .header(CONTENT_TYPE, "application/xml; charset=utf-8")
-            .body(body)
-            .send()
-            .await?;
+            .body(body);
+        let response = self.send(request).await?;
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(Vec::new());
         }
@@ -632,8 +695,7 @@ impl WebDavClient {
 
     async fn create_collection_absolute(&self, url: Url) -> SyncResult<()> {
         let response = self
-            .request(Method::from_bytes(b"MKCOL")?, url)
-            .send()
+            .send(self.request(Method::from_bytes(b"MKCOL")?, url))
             .await?;
         match response.status() {
             StatusCode::CREATED | StatusCode::METHOD_NOT_ALLOWED | StatusCode::OK => Ok(()),
@@ -685,6 +747,108 @@ mod tests {
 
     use super::*;
     use crate::sync::CloudProviderKind;
+
+    #[test]
+    fn rate_limit_survives_client_restart_and_blocks_all_request_kinds() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut buffer = [0; 1024];
+            while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                let count = socket.read(&mut buffer).unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&buffer[..count]);
+            }
+            write!(socket, "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7200\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        let mut settings = SyncSettings::new_device();
+        settings.provider = CloudProviderKind::Custom;
+        settings.base_url = format!("http://{address}");
+        settings.username = "reader".into();
+        let database =
+            std::env::temp_dir().join(format!("torto-cooldown-{}.sqlite3", uuid::Uuid::new_v4()));
+        let store = SyncStore::open_at(database.clone(), settings.device_id.clone()).unwrap();
+        let account = super::super::account_key(&settings);
+        let make_client = || {
+            WebDavClient::new(&settings, "secret".into())
+                .unwrap()
+                .with_store(store.clone(), account.clone())
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let error = make_client()
+                .get_optional("protocol.json")
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<RateLimited>().unwrap().retry_after,
+                Duration::from_secs(7200)
+            );
+        });
+        server.join().unwrap(); // No server remains: every path must fail before networking.
+        runtime.block_on(async {
+            let client = make_client();
+            for error in [
+                client.get_optional("protocol.json").await.unwrap_err(),
+                client.list_json_files("library/").await.unwrap_err(),
+                client.ensure_base_layout().await.unwrap_err(),
+                client
+                    .put_mutable_json("state.json", &serde_json::json!({}))
+                    .await
+                    .unwrap_err(),
+                client
+                    .put_mutable_bytes_with_progress("ocr.zip", vec![1], "application/zip", |_| {})
+                    .await
+                    .unwrap_err(),
+                client
+                    .download_to_file("book.epub", &database.with_extension("download"), 1, |_| {})
+                    .await
+                    .unwrap_err(),
+            ] {
+                let delay = error.downcast_ref::<RateLimited>().unwrap().retry_after;
+                assert!(delay > Duration::from_secs(7190) && delay <= Duration::from_secs(7200));
+            }
+            let other = WebDavClient::new(&settings, "secret".into())
+                .unwrap()
+                .with_store(store.clone(), "other-account".into());
+            assert!(other.cache_get(rate_limit::COOLDOWN_KEY).unwrap().is_none());
+            // Once expired, a legitimate 404 is still a normal missing-object response.
+            client
+                .cache_set(rate_limit::COOLDOWN_KEY, &0_u64.to_le_bytes())
+                .unwrap();
+            assert!(
+                make_client()
+                    .get_optional("protocol.json")
+                    .await
+                    .unwrap_err()
+                    .downcast_ref::<RateLimited>()
+                    .is_none()
+            );
+        });
+        fs::remove_file(database).unwrap();
+    }
+
+    #[test]
+    fn provider_pacing_reserves_distinct_request_slots() {
+        let mut settings = SyncSettings::new_device();
+        settings.provider = CloudProviderKind::CstCloud;
+        settings.base_url = "http://127.0.0.1:1".into();
+        settings.username = "reader".into();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let client = WebDavClient::new(&settings, "secret".into()).unwrap();
+            let before = tokio::time::Instant::now();
+            for _ in 0..2 {
+                assert!(client.get_optional("probe").await.is_err());
+            }
+            assert!(before.elapsed() >= Duration::from_secs(1));
+        });
+    }
 
     fn upload_case(status: u16, redirect: bool, immutable: bool) -> (Vec<u64>, SyncResult<bool>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

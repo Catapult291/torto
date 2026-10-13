@@ -5,6 +5,7 @@ use crate::sync::SyncMode;
 const FULL_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const MAX_READING_DELAY: Duration = Duration::from_secs(15);
 const RETRY_DELAY: Duration = Duration::from_secs(30);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct SyncSchedule {
@@ -13,6 +14,8 @@ pub(super) struct SyncSchedule {
     pending_since: Option<Instant>,
     retry_after: Instant,
     queued: Option<SyncMode>,
+    failures: u32,
+    rate_limited_until: Option<Instant>,
 }
 
 impl Default for SyncSchedule {
@@ -24,11 +27,17 @@ impl Default for SyncSchedule {
             pending_since: None,
             retry_after: now,
             queued: None,
+            failures: 0,
+            rate_limited_until: None,
         }
     }
 }
 
 impl SyncSchedule {
+    pub fn rate_limit_deadline(&self, now: Instant) -> Option<Instant> {
+        self.rate_limited_until.filter(|deadline| *deadline > now)
+    }
+
     pub fn started(&mut self, mode: SyncMode) {
         if matches!(mode, SyncMode::Full { .. }) || self.queued == Some(SyncMode::Reading) {
             self.queued = None;
@@ -82,14 +91,39 @@ impl SyncSchedule {
     }
 
     pub fn completed(&mut self, mode: SyncMode, success: bool, now: Instant) {
+        self.completed_with_limit(mode, success, now, None);
+    }
+
+    pub fn completed_with_limit(
+        &mut self,
+        mode: SyncMode,
+        success: bool,
+        now: Instant,
+        rate_limit: Option<Duration>,
+    ) {
         if success {
             if matches!(mode, SyncMode::Full { .. }) {
                 self.last_full = now;
             }
             self.retry_after = now;
+            self.failures = 0;
+            self.rate_limited_until = None;
         } else {
             self.request(mode);
-            self.retry_after = now + RETRY_DELAY;
+            self.failures = self.failures.saturating_add(1);
+            let base = if rate_limit.is_some() {
+                Duration::from_secs(5 * 60)
+            } else {
+                RETRY_DELAY
+            };
+            let delay = base
+                .saturating_mul(1_u32 << (self.failures - 1).min(6))
+                .min(MAX_RETRY_DELAY)
+                .max(rate_limit.unwrap_or_default());
+            self.retry_after = now + delay;
+            if rate_limit.is_some() {
+                self.rate_limited_until = Some(self.retry_after);
+            }
         }
     }
 }
@@ -138,6 +172,57 @@ mod tests {
         assert_eq!(
             schedule.next(now + Duration::from_secs(30), 31_000, Some(1_000)),
             Some(SyncMode::Reading)
+        );
+    }
+
+    #[test]
+    fn consecutive_failures_back_off_and_success_resets_the_delay() {
+        let mut schedule = SyncSchedule::default();
+        let mut now = schedule.last_full;
+        for delay in [30, 60, 120, 240, 480, 960, 1800, 1800] {
+            schedule.completed(SyncMode::Reading, false, now);
+            assert_eq!(
+                schedule.next(now + Duration::from_secs(delay - 1), 0, None),
+                None
+            );
+            now += Duration::from_secs(delay);
+            assert_eq!(schedule.next(now, 0, None), Some(SyncMode::Reading));
+        }
+        schedule.completed(SyncMode::Reading, true, now);
+        schedule.completed(SyncMode::Reading, false, now);
+        assert_eq!(
+            schedule.next(now + Duration::from_secs(30), 0, None),
+            Some(SyncMode::Reading)
+        );
+    }
+
+    #[test]
+    fn rate_limit_keeps_full_work_queued_and_respects_long_server_deadlines() {
+        let mut schedule = SyncSchedule::default();
+        let now = schedule.last_full;
+        schedule.completed_with_limit(
+            SyncMode::Reading,
+            false,
+            now,
+            Some(Duration::from_secs(7200)),
+        );
+        let full = SyncMode::Full {
+            force_statistics: false,
+        };
+        schedule.request(full);
+        assert!(schedule.rate_limit_deadline(now).is_some());
+        assert_eq!(
+            schedule.next(now + Duration::from_secs(7199), 0, None),
+            None
+        );
+        assert_eq!(
+            schedule.next(now + Duration::from_secs(7200), 0, None),
+            Some(full)
+        );
+        schedule.completed(full, true, now + Duration::from_secs(7200));
+        assert_eq!(
+            schedule.rate_limit_deadline(now + Duration::from_secs(7200)),
+            None
         );
     }
 }

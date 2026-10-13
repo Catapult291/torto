@@ -1,6 +1,7 @@
 mod derived;
 mod engine;
 mod protocol;
+mod rate_limit;
 mod settings;
 mod store;
 #[cfg(test)]
@@ -15,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) use engine::{LocalSyncBook, SyncMode, SyncProgress, SyncReport, SyncStage, run_sync};
 pub(crate) use settings::{CloudProviderKind, SyncSettings};
+pub(crate) use rate_limit::RateLimited;
 pub(crate) use store::SyncStore;
 
 pub(crate) type SyncResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;

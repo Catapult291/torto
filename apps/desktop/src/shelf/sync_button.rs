@@ -17,7 +17,10 @@ pub(super) enum SyncButtonState {
     Complete {
         expires_at: Instant,
     },
-    Failed,
+    Failed {
+        detail: String,
+        retry_at: Option<Instant>,
+    },
 }
 
 impl SyncButtonState {
@@ -45,9 +48,22 @@ impl SyncButtonState {
                 language.text("同步完成", "Sync complete").into()
             }
             Self::Complete { .. } => language.text("云同步", "Cloud sync").into(),
-            Self::Failed => language
-                .text("同步失败，点击重试", "Sync failed. Click to retry")
-                .into(),
+            Self::Failed {
+                retry_at: Some(deadline),
+                ..
+            } if *deadline > Instant::now() => {
+                let seconds = deadline.saturating_duration_since(Instant::now()).as_secs() + 1;
+                format!(
+                    "{} · {} {}",
+                    language.text("云端请求限流（429）", "Cloud request limit (429)"),
+                    seconds,
+                    language.text("秒后自动重试", "seconds until automatic retry")
+                )
+            }
+            Self::Failed { detail, .. } => format!(
+                "{}\n{detail}",
+                language.text("同步失败，点击重试", "Sync failed. Click to retry")
+            ),
         }
     }
 
@@ -162,9 +178,50 @@ mod tests {
         };
         state.expire(now + Duration::from_secs(10));
         assert!(matches!(state, SyncButtonState::Running { .. }));
-        state = SyncButtonState::Failed;
+        state = SyncButtonState::Failed {
+            detail: "offline".into(),
+            retry_at: None,
+        };
         state.expire(now + Duration::from_secs(10));
-        assert!(matches!(state, SyncButtonState::Failed));
+        assert!(matches!(state, SyncButtonState::Failed { .. }));
+    }
+
+    #[test]
+    fn failure_hover_explains_cooldown_and_keeps_settled_frames_idle() {
+        let ctx = egui::Context::default();
+        let state = SyncButtonState::Failed {
+            detail: "HTTP 429".into(),
+            retry_at: Some(Instant::now() + Duration::from_secs(300)),
+        };
+        assert!(
+            state
+                .hover_text(AppLanguage::English)
+                .contains("Cloud request limit (429)")
+        );
+        assert!(
+            state
+                .hover_text(AppLanguage::SimplifiedChinese)
+                .contains("秒后自动重试")
+        );
+        let mut repaint_delay = Duration::ZERO;
+        for pass in 0..6 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(640.0, 480.0),
+                    )),
+                    time: Some(f64::from(pass)),
+                    ..Default::default()
+                },
+                |ui| {
+                    state.show(ui, false, AppLanguage::English);
+                },
+            );
+            repaint_delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+            output.textures_delta.clear();
+        }
+        assert!(repaint_delay > Duration::from_secs(60));
     }
 
     fn frame(

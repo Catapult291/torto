@@ -172,7 +172,11 @@ pub(crate) struct SyncTask {
     pub(crate) mode: SyncMode,
 }
 
-pub(crate) type SyncTaskMessage = TaskResult<SyncReport>;
+pub(crate) struct SyncTaskMessage {
+    pub(crate) id: u64,
+    pub(crate) result: Result<SyncReport, String>,
+    pub(crate) rate_limit: Option<Duration>,
+}
 pub(crate) struct SyncProgressMessage {
     pub(crate) id: u64,
     pub(crate) progress: SyncProgress,
@@ -445,6 +449,8 @@ impl ShelfFeature {
         self.sync.password.clone_from(&settings.sync_password);
         if changed {
             self.sync.monitor.invalidate();
+            self.sync.task.cancel();
+            self.sync.schedule = SyncSchedule::default();
             self.read_activity.invalidate();
             self.local_store = SyncStore::open_default(self.sync.settings.device_id.clone()).ok();
             self.refresh_read_activity();
@@ -561,6 +567,10 @@ impl ShelfFeature {
             return;
         }
         if !self.sync.settings.enabled {
+            return;
+        }
+        if self.sync.schedule.rate_limit_deadline(Instant::now()).is_some() {
+            self.sync.schedule.request(mode);
             return;
         }
         self.sync.schedule.started(mode);
@@ -743,7 +753,7 @@ impl ShelfFeature {
 
         if let Some(request) = self.sync.task.take_pending() {
             let proxy = proxy.clone();
-            runtime.spawn(async move {
+            let worker = runtime.spawn(async move {
                 let id = request.id;
                 let payload = request.payload;
                 if let Err(log_error) = append_sync_log(
@@ -753,6 +763,7 @@ impl ShelfFeature {
                     tracing::warn!(%log_error, "failed to append WebDAV sync log");
                 }
                 let progress_proxy = proxy.clone();
+                let mut rate_limit = None;
                 let result = match run_sync(
                     payload.settings,
                     payload.password,
@@ -789,18 +800,19 @@ impl ShelfFeature {
                         Ok(report)
                     }
                     Err(error) => {
+                        rate_limit = error.downcast_ref::<crate::sync::RateLimited>()
+                            .map(|error| error.retry_after);
                         let detail = format_error_chain(error.as_ref());
-                        if let Err(log_error) = append_sync_log("ERROR", &detail) {
-                            tracing::warn!(%log_error, "failed to append WebDAV sync log");
-                        }
                         Err(detail)
                     }
                 };
                 let _ = proxy.send_event(crate::platform::UserEvent::ShelfSync(SyncTaskMessage {
                     id,
                     result,
+                    rate_limit,
                 }));
             });
+            self.sync.task.attach_worker(worker);
         }
     }
 
@@ -820,7 +832,10 @@ impl ShelfFeature {
     }
 
     fn sync_failed(&mut self, error: String) {
-        self.sync.button = SyncButtonState::Failed;
+        self.sync.button = SyncButtonState::Failed {
+            detail: error.clone(),
+            retry_at: self.sync.schedule.rate_limit_deadline(Instant::now()),
+        };
         if let Err(log_error) = append_sync_log("ERROR", &error) {
             tracing::warn!(%log_error, "failed to append WebDAV sync log");
         }
@@ -833,7 +848,7 @@ impl ShelfFeature {
         let success = message.result.is_ok() && self.sync.import_error.is_none();
         self.sync
             .schedule
-            .completed(task.mode, success, Instant::now());
+            .completed_with_limit(task.mode, success, Instant::now(), message.rate_limit);
         if matches!(task.mode, SyncMode::Full { .. })
             || message
                 .result
