@@ -6,6 +6,7 @@ pub(super) struct ListGroup {
     pub rect: egui::Rect,
     pub split: bool,
     pub paint_ranges: Vec<SourceRange>,
+    pub footnotes: Vec<FocusFootnote>,
     parts: Vec<FocusUnit>,
 }
 
@@ -16,11 +17,6 @@ fn must_split(height: f32, viewport: f32, was_split: bool) -> bool {
 
 fn emit(group: ListGroup, output: &mut Vec<FocusUnit>) {
     let group = Arc::new(group);
-    let notes = group
-        .parts
-        .iter()
-        .flat_map(|p| p.footnotes.clone())
-        .collect::<Vec<_>>();
     let mut parts = if group.split {
         group.parts.clone()
     } else {
@@ -36,7 +32,6 @@ fn emit(group: ListGroup, output: &mut Vec<FocusUnit>) {
         part.list_group = Some(Arc::clone(&group));
         part.rectangular_activation = true;
         part.structured_activation = true; // normal green, not quote blue
-        part.footnotes.clone_from(&notes);
     }
     output.extend(parts);
 }
@@ -48,7 +43,8 @@ pub(super) fn group(
     height: f32,
 ) -> Vec<FocusUnit> {
     let refs: Vec<_> = blocks.iter().collect();
-    let scopes = rebook_layout::semantic_list_groups(&refs);
+    let mut scopes = rebook_layout::semantic_list_groups(&refs);
+    scopes.extend(rebook_layout::semantic_paragraph_groups(&refs));
     let mut membership = HashMap::new();
     for (id, scope) in scopes.iter().enumerate() {
         for block in &blocks[scope.clone()] {
@@ -92,6 +88,7 @@ pub(super) fn group(
         let mut range = parts[0].range.clone();
         range.end = parts.last().unwrap().range.end.clone();
         let paint_ranges = parts.iter().flat_map(|p| p.paint_ranges.clone()).collect();
+        let footnotes = parts.iter().flat_map(|p| p.footnotes.iter().cloned()).collect();
         emit(
             ListGroup {
                 range,
@@ -99,6 +96,7 @@ pub(super) fn group(
                 split: must_split(rect.height(), height, false),
                 parts,
                 paint_ranges,
+                footnotes,
             },
             &mut output,
         );
@@ -165,6 +163,131 @@ mod tests {
         let layout = reader.current_scroll_layout().unwrap();
         reader.rebuild_focus_units(&layout);
         reader
+    }
+
+    #[test]
+    fn paragraph_container_focus_includes_all_members_and_titles_but_not_adjacent_prose() {
+        let mut r=reader("<html><body><p>Before.</p><h2>Title</h2><h3>Subtitle</h3><div><p>One.</p><p style='text-align:center'>Two.</p><p style='text-align:right'>Three.</p></div><p>After.</p></body></html>",2000.0);
+        assert_eq!(r.focus_units.len(),3);
+        let u=&r.focus_units[1];
+        assert_eq!(u.list_group.as_ref().unwrap().parts.len(),3);
+        assert!(u.heading_rect.is_some());
+        assert!(u.clipboard_text.contains("One.") && u.clipboard_text.contains("Two.") && u.clipboard_text.contains("Three."));
+        assert!(!u.clipboard_text.contains("Before.") && !u.clipboard_text.contains("After."));
+        assert!(u.structured_activation && u.rectangular_activation);
+        assert_eq!(u.paint_ranges.len(),3);
+        r.focus_anchor=Some(u.list_group.as_ref().unwrap().parts[2].range.start.clone());
+        assert!(r.resize_focus_lists(50.0));
+        assert_eq!(r.focus_units.len(),5);
+        assert!(r.resize_focus_lists(2000.0));
+        assert_eq!(r.focus_units.len(),3);
+    }
+
+    #[test]
+    #[ignore = "requires TORTO_PARAGRAPH_BOOK; reads actual local EPUB without changing it"]
+    fn local_book_paragraph_containers_keep_both_recognition_examples_together() {
+        let path=std::env::var("TORTO_PARAGRAPH_BOOK").unwrap();
+        let publication=rebook_formats::open_file(&path).unwrap();
+        let source=publication.source();
+        let index=source.book().sections.iter().position(|s|s.href.path().ends_with("B9780123735911500140.htm")).unwrap();
+        let section=source.parse_section(index).unwrap();
+        let refs=section.blocks.iter().collect::<Vec<_>>();
+        let groups=rebook_layout::semantic_paragraph_groups(&refs);
+        let mut found=Vec::new();
+        for group in groups {
+            let value=section.blocks[group.clone()].iter().map(|b|if let Block::Text(t)=b {text_block_focus_text(t)}else{String::new()}).collect::<Vec<_>>().join("\n");
+            if value.contains("One hay I may") || value.contains("One day I mayed") {
+                assert_eq!(group.len(),3);
+                let (mut r,_,_)=super::super::semantic_layout::tests::fixture_with_blocks(section.blocks[group.clone()].to_vec());
+                r.scroll_viewport=Some(ScrollViewportState {size:egui::vec2(800.0,2000.0),offset_y:0.0});
+                let layout=r.current_scroll_layout().unwrap(); r.rebuild_focus_units(&layout);
+                assert_eq!(r.focus_units.len(),1);
+                assert_eq!(r.focus_units[0].list_group.as_ref().unwrap().parts.len(),3);
+                found.push(value);
+            }
+        }
+        assert_eq!(found.len(),2);
+        println!("actual section {index}: both three-paragraph examples form separate focus groups");
+    }
+
+    #[test]
+    fn split_paragraph_groups_share_notes_in_source_order_without_copying_to_every_part() {
+        let r=reader("<html><body><p>Before.</p><div><p>One.<a href='#note-one'><sup>1</sup></a></p><p>Two.<a href='#note-two'><sup>2</sup></a></p><p>Three.</p></div><p>After.</p><aside id='note-one' role='doc-footnote'><p>First note.</p></aside><aside id='note-two' role='doc-footnote'><p>Second note.</p></aside></body></html>",50.0);
+        let parts:Vec<_>=r.focus_units.iter().filter(|u|u.list_group.is_some()).collect();
+        assert_eq!(parts.len(),3);
+        assert_eq!(parts[0].popup_footnotes().len(),2);
+        assert_eq!(parts[0].popup_footnotes()[0].number,1);
+        assert_eq!(parts[0].popup_footnotes()[1].number,2);
+        for part in &parts {
+            assert_eq!(part.popup_footnotes().len(),2);
+            assert!(part.footnotes.len()<=1);
+        }
+        assert!(std::ptr::eq(parts[0].popup_footnotes(),parts[2].popup_footnotes()));
+    }
+
+    #[test]
+    #[ignore = "requires TORTO_ALIGNMENT_BOOK; validates the actual Beauty EPUB's centered group"]
+    fn local_beauty_group_keeps_important_center_alignment_through_shaping() {
+        let path=std::env::var("TORTO_ALIGNMENT_BOOK").unwrap();
+        let publication=rebook_formats::open_file(&path).unwrap();
+        let source=publication.source();
+        let index=source.book().sections.iter().position(|s|s.href.path().ends_with("042-045_Sustainable_Products.xhtml")).unwrap();
+        let section=source.parse_section(index).unwrap();
+        let refs=section.blocks.iter().collect::<Vec<_>>();
+        let groups=rebook_layout::semantic_paragraph_groups(&refs);
+        let group=groups.iter().find(|g|section.blocks[(*g).clone()].iter().any(|b|
+            matches!(b,Block::Text(t) if text_block_focus_text(t).contains("Natural ingredients are not necessarily safer for wildlife")))).unwrap();
+        assert_eq!(group.len(),2);
+        let selected=&section.blocks[group.clone()];
+        for block in selected {
+            let Block::Text(t)=block else {panic!()};
+            assert_eq!(t.style.authored_alignment,Some(rebook_publication::TextAlignment::Center));
+        }
+        let mut style=ReaderStyle::default();
+        style.typesetting=rebook_layout::ReaderTypesetting::unified();
+        style.spread=rebook_layout::SpreadMode::Single;
+        let fonts=crate::fonts::embedded_reader_fonts();
+        let mut engine=rebook_layout::LayoutEngine::with_fonts(fonts.iter().cloned());
+        for width in [800,1100] {
+            let layout=engine.layout_blocks(source.as_ref(),selected,LayoutViewport::new(width,600).unwrap(),&style).unwrap();
+            let page=&layout.pages[0];
+            let placement=page.items.iter().find_map(|item|match item {
+                rebook_layout::PageItem::Text(t) if t.text.trim()=="End-of-life" =>Some(t),_=>None,
+            }).unwrap();
+            let display=rebook_renderer::DisplayListCompiler.compile(page);
+            let bounds=display.source_content_bounds(&[placement.source.clone().unwrap()]).unwrap();
+            let expected=f64::from(placement.origin_x+placement.available_width/2.0);
+            assert!(bounds.width()<f64::from(placement.available_width)*0.5);
+            assert!((bounds.center().x-expected).abs()<3.0,"width={width}: {bounds:?} expected center {expected}");
+            println!("Beauty section {index}; width={width}; title center {:.2}; column center {expected:.2}; both members centered",bounds.center().x);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires TORTO_ALIGNMENT_BOOK; validates the actual nested moisturizer container"]
+    fn local_beauty_moisturizer_outer_container_is_one_complete_group() {
+        let publication = rebook_formats::open_file(std::env::var("TORTO_ALIGNMENT_BOOK").unwrap()).unwrap();
+        let source = publication.source();
+        let index = source.book().sections.iter().position(|s| s.href.path().ends_with("060-061_Need_to_Moisturize.xhtml")).unwrap();
+        let section = source.parse_section(index).unwrap();
+        let refs = section.blocks.iter().collect::<Vec<_>>();
+        let groups = rebook_layout::semantic_paragraph_groups(&refs);
+        let group = groups.iter().find(|g| section.blocks[g.start..g.end].iter().any(|b|
+            matches!(b, Block::Text(t) if text_block_focus_text(t).starts_with("HOW DO I CHOOSE A MOISTURIZER?")))).unwrap();
+        assert_eq!(group.len(), 14);
+        let blocks = &section.blocks[group.clone()];
+        assert!(matches!(blocks.last(), Some(Block::Text(t)) if text_block_focus_text(t).contains("Moisturizer texture is adjusted")));
+        let (mut reader, _, _) = super::super::semantic_layout::tests::fixture_with_blocks(blocks.to_vec());
+        reader.scroll_viewport = Some(ScrollViewportState {size: egui::vec2(800.0, 4000.0), offset_y: 0.0});
+        let layout = reader.current_scroll_layout().unwrap();
+        reader.rebuild_focus_units(&layout);
+        assert_eq!(reader.focus_units.len(), 1);
+        assert_eq!(reader.focus_units[0].list_group.as_ref().unwrap().parts.len(), 14);
+        assert!(reader.resize_focus_lists(100.0));
+        assert_eq!(reader.focus_units.len(), 14);
+        let shared = reader.focus_units[0].list_group.as_ref().unwrap();
+        assert!(reader.focus_units.iter().all(|u| u.list_group.as_ref().is_some_and(|g| std::sync::Arc::ptr_eq(g, shared))));
+        println!("Beauty section {index}: all 14 paragraphs form one outer group; short viewport preserves the shared group across 14 steps");
     }
 
     #[test]

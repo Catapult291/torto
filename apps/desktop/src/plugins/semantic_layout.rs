@@ -870,7 +870,7 @@ fn completion_options(roles: &RecognitionRoles) -> Value {
         "properties":{
             "kind":{"type":"string","enum":["quote"]},
             "body":ids,
-            "attribution":{"type":"integer","description":"Immediately following paragraph containing an explicit author or work credit. Required for every new quote."},
+            "attribution":{"type":["integer","null"],"description":"Immediately following paragraph containing an explicit author or work credit. Null is allowed only for a complete authored paragraph group supplied in paragraph_groups."},
             "alignment":{"type":["string","null"],"enum":["start","center","end","justify",null],"description":"Quote-body alignment; null keeps the default."}
         },
         "required":["kind","body","attribution","alignment"]
@@ -905,6 +905,7 @@ fn completion_options(roles: &RecognitionRoles) -> Value {
     if roles.quotes {
         let mut before = quote.clone();
         before["properties"]["kind"]["enum"] = json!(["quote_before"]);
+        before["properties"]["attribution"]["type"] = json!("integer");
         before["properties"]["attribution"]["description"] = json!(
             "Immediately preceding paragraph naming the source and explicitly introducing the excerpt with a colon or terminal reporting cue such as 'writes' or 'as follows'."
         );
@@ -1395,6 +1396,11 @@ fn unified_window_input(
     context: std::ops::Range<usize>,
     candidates: &[citations::WindowCandidate],
 ) -> Value {
+    let refs: Vec<_> = section.blocks.iter().collect();
+    let paragraph_groups: Vec<_> = rebook_layout::semantic_paragraph_groups(&refs).into_iter()
+        .filter(|group| group.start >= context.start && group.end <= context.end
+            && group.clone().any(|id| target.contains(&id)))
+        .map(|group| group.collect::<Vec<_>>()).collect();
     let blocks: Vec<_> = context
         .map(|index| {
             let mut block = section_input_block(section, index);
@@ -1439,6 +1445,9 @@ fn unified_window_input(
         "targets":{"classify_headings":target.clone().filter(|i|headings::candidate(&section.blocks[*i]).is_some()).collect::<Vec<_>>(),"classify_blocks":target.clone().filter(|i|paragraph(&section.blocks[*i]).is_some()).collect::<Vec<_>>(),
             "complete_quote_sources":target.clone().filter(|i|unattributed_quote_body(&section.blocks[*i]).is_some()).collect::<Vec<_>>(),
             "classify_citations":candidates.iter().map(|c|&c.id).collect::<Vec<_>>()}});
+    if !paragraph_groups.is_empty() {
+        input["paragraph_groups"] = json!(paragraph_groups);
+    }
     if config.headings
         && target
             .clone()
@@ -1670,9 +1679,14 @@ fn validate_window(
     context: std::ops::Range<usize>,
 ) -> Result<(), String> {
     let mut used = HashSet::new();
+    let refs: Vec<_> = section.blocks.iter().collect();
+    let paragraph_groups = rebook_layout::semantic_paragraph_groups(&refs);
     for group in groups {
         let ids = proposal_ids(group);
         let valid_ids = consecutive(&ids)
+            && paragraph_groups.iter().all(|range| {
+                !ids.iter().any(|id| range.contains(id)) || range.clone().all(|id| ids.contains(&id))
+            })
             && ids.iter().any(|id| target.contains(id))
             && ids
                 .iter()
@@ -1727,13 +1741,16 @@ fn validate_window(
                 config.quotes
                     && consecutive(body)
                     && text_ids(body)
-                    && attribution.is_some_and(|id| {
-                        body.last().and_then(|last| last.checked_add(1)) == Some(id)
-                            && text_ids(&[id])
+                    && match attribution {
+                        Some(id) => body.last().and_then(|last| last.checked_add(1)) == Some(*id)
+                            && text_ids(&[*id])
                             && quote_sources::credit_like(&text_block_text(
-                                paragraph(&section.blocks[id]).unwrap(),
-                            ))
-                    })
+                                paragraph(&section.blocks[*id]).unwrap(),
+                            )),
+                        None => {
+                            paragraph_groups.iter().any(|group| group.clone().eq(body.iter().copied()))
+                        }
+                    }
             }
             Proposal::Figure { images, captions } => {
                 config.captions

@@ -20,6 +20,7 @@ mod hyphen_cache;
 mod note_spacing;
 mod raster_cache;
 mod semantic_lists;
+mod semantic_paragraphs;
 mod table_captions;
 mod table_shaping;
 mod web_links;
@@ -28,6 +29,7 @@ pub use raster_cache::{
     raster_cache_stats, retire_publication_rasters,
 };
 pub use semantic_lists::semantic_list_groups;
+pub use semantic_paragraphs::semantic_paragraph_groups;
 
 /// Avoid copying blocks without footnotes, especially image-heavy chapters.
 pub fn numbered_semantic_footnotes(block: &Block) -> Cow<'_, Block> {
@@ -103,10 +105,11 @@ fn number_semantic_footnotes_from(block: &mut Block, next: &mut u32) {
     visit(block, next);
 }
 
-/// List introductions and all list items share one numbering scope.
+/// Lists and authored paragraph groups each share one numbering scope.
 pub fn number_list_footnotes(blocks: &mut [Block]) {
     let refs: Vec<_> = blocks.iter().collect();
-    let groups = semantic_list_groups(&refs);
+    let mut groups = semantic_list_groups(&refs);
+    groups.extend(semantic_paragraph_groups(&refs));
     for group in groups {
         let mut next = 0;
         let mut previous_start = 0;
@@ -1555,7 +1558,9 @@ impl LayoutEngine {
             })
             .collect();
         if unified_reflow {
-            for group in semantic_list_groups(&layout_blocks) {
+            let mut groups = semantic_list_groups(&layout_blocks);
+            groups.extend(semantic_paragraph_groups(&layout_blocks));
+            for group in groups {
                 let mut next = 0;
                 let mut previous_start = 0;
                 for block in &mut numbered_blocks[group] {
@@ -3858,7 +3863,11 @@ fn resolve_text_block<'a>(
             block.kind,
             TextBlockKind::Paragraph | TextBlockKind::Blockquote
         );
-        resolved.style.align = if block.kind == TextBlockKind::Blockquote
+        resolved.style.align = if block.style.paragraph_group.is_some()
+            && let Some(alignment @ (TextAlignment::Center | TextAlignment::End)) = block.style.authored_alignment
+        {
+            alignment
+        } else if block.kind == TextBlockKind::Blockquote
             && let Some(alignment) = block.style.semantic_alignment
         {
             if alignment == TextAlignment::Start {
@@ -3895,6 +3904,11 @@ fn resolve_text_block<'a>(
         0.0
     };
     resolved.style.line_height = line_height;
+    if block.style.paragraph_group.is_some()
+        && matches!(resolved.style.align, TextAlignment::Center | TextAlignment::End)
+    {
+        resolved.style.indent = 0.0;
+    }
     match context {
         TextContext::Table => {
             resolved.style.margin_start = 0.0;
@@ -3926,7 +3940,10 @@ fn resolve_text_block<'a>(
                 resolved.style.margin_start_fraction = 0.0;
             }
             TextBlockKind::QuoteAttribution => {
-                resolved.style.align = TextAlignment::End;
+                resolved.style.align = if block.style.paragraph_group.is_some() {
+                    block.style.authored_alignment.filter(|a| matches!(a, TextAlignment::Center | TextAlignment::End))
+                        .unwrap_or(TextAlignment::End)
+                } else { TextAlignment::End };
                 resolved.style.margin_start = 0.0;
                 resolved.style.margin_start_fraction = 0.0;
             }
@@ -7473,6 +7490,21 @@ mod tests {
 
             let resolved = resolve_text_block(&block, &style, TextContext::Flow);
             assert_eq!(resolved.style.align, TextAlignment::Justify);
+        }
+    }
+
+    #[test]
+    fn authored_group_alignment_survives_ai_quote_and_attribution_alignment() {
+        let style=ReaderStyle {typesetting:ReaderTypesetting::unified(),..Default::default()};
+        for kind in [TextBlockKind::Paragraph,TextBlockKind::Blockquote,TextBlockKind::QuoteAttribution] {
+            for alignment in [TextAlignment::Center,TextAlignment::End] {
+                let block=TextBlock {kind,content:vec![],source:None,style:rebook_publication::BlockStyle {
+                    paragraph_group:Some(7),authored_alignment:Some(alignment),semantic_alignment:Some(TextAlignment::Start),indent:32.0,..Default::default()
+                }};
+                let resolved=resolve_text_block(&block,&style,TextContext::Flow);
+                assert_eq!(resolved.style.align,alignment,"{kind:?}");
+                assert_eq!(resolved.style.indent,0.0);
+            }
         }
     }
 

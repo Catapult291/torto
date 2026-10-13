@@ -72,6 +72,34 @@ fn validate(groups: &[Proposal], section: &Section) -> Result<(), String> {
 }
 
 #[test]
+fn authored_container_is_sent_whole_and_can_become_an_unattributed_quote() {
+    let mut s=section(vec![text("intro","The following is an excerpt:"),text("a","First borrowed line"),text("b","Second borrowed line"),text("after","Narration resumes.")]);
+    for b in &mut s.blocks[1..3] { if let Block::Text(t)=b { t.style.paragraph_group=Some(17); } }
+    let input=unified_window_input(&s,&RecognitionRoles::default(),1..3,0..4,&[]);
+    assert_eq!(input["paragraph_groups"],json!([[1,2]]));
+    assert_eq!(wire::decode(&wire::encode(&input)),input);
+    let group=Proposal::Quote {body:vec![1,2],attribution:None,alignment:Some(QuoteAlignment::Start)};
+    assert!(validate(&[group.clone()],&s).is_ok());
+    assert!(validate(&[Proposal::Quote {body:vec![1],attribution:None,alignment:None}],&s).is_err());
+    assert!(validate(&[Proposal::Quote {body:vec![0,1,2],attribution:None,alignment:None}],&s).is_err());
+    if let Block::Text(t)=&mut s.blocks[1] {t.style.authored_alignment=Some(rebook_publication::TextAlignment::Center);}
+    if let Block::Text(t)=&mut s.blocks[2] {t.style.authored_alignment=Some(rebook_publication::TextAlignment::End);}
+    let old_sources:Vec<_>=s.blocks[1..3].iter().map(|b|source(b).cloned()).collect();
+    let a=annotation(&group,&s);
+    compose(&mut s.blocks,&a);
+    let Block::Quote(q)=&s.blocks[1] else {panic!("group becomes a quote")};
+    assert_eq!(q.body.len(),2);
+    assert!(q.attribution.is_none());
+    assert_eq!(q.body.iter().map(|t|t.source.clone()).collect::<Vec<_>>(),old_sources);
+    assert_eq!(q.body[0].style.authored_alignment,Some(rebook_publication::TextAlignment::Center));
+    assert_eq!(q.body[1].style.authored_alignment,Some(rebook_publication::TextAlignment::End));
+    assert_eq!(q.body[0].style.paragraph_group,Some(17));
+    assert_eq!(s.blocks.len(),3);
+    let schema=completion_options(&RecognitionRoles::default());
+    assert!(jsonschema::validator_for(&schema["output_schema"]).unwrap().is_valid(&json!({"groups":[group],"citations":[],"formulas":[]})));
+}
+
+#[test]
 fn protected_semantics_are_not_classification_targets() {
     let mut quote = text("q", "Previously recognized quotation");
     if let Block::Text(text) = &mut quote {
@@ -1080,7 +1108,7 @@ fn semantic_request_sends_json_schema_and_structured_instructions() {
                     .collect::<std::collections::BTreeSet<_>>(),
                 std::collections::BTreeSet::from(["a", "al", "d", "k"]),
             );
-            assert_eq!(item["properties"]["a"]["type"], json!("integer"));
+            assert_eq!(item["properties"]["a"]["type"], json!(["integer", "null"]));
             assert!(wire_text(&request["messages"][0]).starts_with("# AI layout"));
             let instructions = wire_text(&request["messages"][0]);
             assert!(!instructions.contains("Compact JSON transport"));

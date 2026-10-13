@@ -194,11 +194,15 @@ impl GpuState {
             .ok_or_else(|| "当前 GPU 不支持窗口 Surface".to_owned())?;
         surface_config.format = format;
         surface_config.usage = TextureUsages::RENDER_ATTACHMENT;
-        surface_config.view_formats = vec![format];
+        surface_config.view_formats = super::egui_surface::view_formats(format);
         surface_config.desired_maximum_frame_latency = 1;
         surface.configure(&device, &surface_config);
 
-        let egui_renderer = Renderer::new(&device, format, RendererOptions::default());
+        let egui_renderer = Renderer::new(
+            &device,
+            super::egui_surface::paint_format(format),
+            RendererOptions::default(),
+        );
         // Compile this tiny compositor with the other startup pipelines, rather
         // than on the user's first scroll or first selection after opening.
         let layer_renderer = Some(LayerRenderer::new(&device));
@@ -621,7 +625,10 @@ impl GpuState {
         // the body texture avoids an extra full-window screenshot/copy/present.
         let view = frame
             .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+            .create_view(&wgpu::TextureViewDescriptor {
+                format: Some(super::egui_surface::paint_format(self.surface_config.format)),
+                ..Default::default()
+            });
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {

@@ -1254,6 +1254,9 @@ impl DesktopReader {
         // The image preview is above the chat, TOC and reader menus. Handle its
         // dismissal before any underlying panel can consume Escape.
         if self.image_preview.is_some() {
+            if self.image_preview.as_ref().is_some_and(|preview| preview.motion.is_closing()) {
+                return;
+            }
             if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
                 || (!ctx.text_edit_focused()
                     && ctx.input_mut(|input| {
@@ -1636,7 +1639,7 @@ impl DesktopReader {
         let can_open = self
             .focus_units
             .get(self.focus_unit_index)
-            .is_some_and(|unit| !unit.footnotes.is_empty());
+            .is_some_and(|unit| !unit.popup_footnotes().is_empty());
         if can_open {
             self.ui.focus_footnotes_visible = true;
             self.ui.focus_footnote_scroll_delta = 0.0;
@@ -2785,7 +2788,7 @@ impl DesktopReader {
         if self.is_focus_mode() {
             self.focus_units
                 .get(self.focus_unit_index)
-                .map_or(&[], |unit| unit.footnotes.as_slice())
+                .map_or(&[], |unit| unit.popup_footnotes())
         } else {
             &self.classic_footnotes
         }
@@ -5132,6 +5135,7 @@ impl DesktopReader {
         self.selected_image = None;
         self.image_pointer_state = ImagePointerState::Idle;
         self.image_preview = Some(super::ImagePreview {
+            motion: super::media_preview::PreviewMotion::new(ctx),
             formula: None,
             texture,
             image: color_image,
@@ -5144,6 +5148,7 @@ impl DesktopReader {
 
     pub(super) fn copy_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) {
         if self.media_preview_copy(ctx) { return; }
+        if self.image_preview.as_ref().is_some_and(|preview| preview.motion.is_closing()) { return; }
         let text_edit_focused = ctx.text_edit_focused();
         let preview = self.preview_is_open();
         if !preview && (text_edit_focused || interaction_blocked) {
@@ -5331,13 +5336,18 @@ impl DesktopReader {
     }
 
     fn close_image_preview(&mut self, ctx: &egui::Context) {
+        if let Some(preview) = &mut self.image_preview {
+            preview.motion.close(ctx);
+        }
+    }
+
+    fn finish_closing_image_preview(&mut self) {
         self.image_preview = None;
         // Opening the preview clears the image selection used by the border.
         // Restore it from the current focus unit without moving the reader.
         if self.is_focus_mode() {
             self.sync_focus_selected_image();
         }
-        ctx.request_repaint();
     }
 
     fn image_preview_overlay(&mut self, ctx: &egui::Context) {
@@ -5345,6 +5355,14 @@ impl DesktopReader {
         let Some(preview) = self.image_preview.as_mut() else {
             return;
         };
+        let opacity = preview.motion.opacity(ctx);
+        if preview.motion.is_closing() && opacity <= f32::EPSILON {
+            self.finish_closing_image_preview();
+            // The selection border was painted before this overlay. Draw it once
+            // after releasing the popup, then let the reader return to idle.
+            ctx.request_repaint();
+            return;
+        }
         let screen = crate::ui::overlay_rect(ctx);
         let available = Vec2::new(
             (screen.width() - IMAGE_PREVIEW_MARGIN * 2.0).max(1.0),
@@ -5353,7 +5371,7 @@ impl DesktopReader {
         let fit_scale = preview_fit_scale(preview.source_size, available);
 
         let wheel_delta = ctx.input(preview_wheel_delta);
-        if wheel_delta != 0.0 {
+        if wheel_delta != 0.0 && !preview.motion.is_closing() {
             let factor = zoom_from_wheel(preview.zoom, wheel_delta) / preview.zoom;
             let pointer = ctx
                 .input(|input| input.pointer.hover_pos())
@@ -5367,8 +5385,9 @@ impl DesktopReader {
         let image_rect = Rect::from_center_size(screen.center() + preview.pan, display_size);
         let texture_id = preview.texture.id();
         let zoom_percent = fit_scale * preview.zoom * 100.0;
-        let interaction =
-            show_image_preview_area(ctx, screen, image_rect, texture_id, zoom_percent);
+        let interaction = show_image_preview_area(
+            ctx, screen, image_rect, texture_id, zoom_percent, opacity, !preview.motion.is_closing(),
+        );
         close |= interaction.close;
 
         if interaction.reset {
@@ -6621,10 +6640,12 @@ fn show_image_preview_area(
     image_rect: Rect,
     texture_id: TextureId,
     zoom_percent: f32,
+    opacity: f32,
+    interactive: bool,
 ) -> ImagePreviewInteraction {
     let backdrop_screen = ctx.content_rect();
     #[cfg(target_os = "windows")]
-    crate::app::window_chrome::dim_controls(ctx, 190.0 / 255.0);
+    crate::app::window_chrome::dim_controls(ctx, 190.0 / 255.0 * opacity);
     let mut interaction = ImagePreviewInteraction {
         close: false,
         reset: false,
@@ -6637,6 +6658,9 @@ fn show_image_preview_area(
         .constrain(false)
         .default_size(backdrop_screen.size())
         .show(ctx, |ui| {
+            if !interactive { ui.disable(); }
+            // Disabling interaction must not add egui's disabled-widget dimming.
+            ui.set_opacity(opacity);
             ui.set_clip_rect(backdrop_screen);
             // The backdrop only owns clicks used to close the preview. Registering it for
             // dragging as well competes with the image's drag response on the same layer.
@@ -8238,6 +8262,11 @@ mod reference_suggestion_label_tests {
                 );
                 output.textures_delta.clear();
             };
+            let finish_fade = |reader: &mut DesktopReader| {
+                let now = ctx.input(|i| i.time);
+                let mut output = ctx.run_ui(egui::RawInput { time: Some(now + 0.2), ..Default::default() }, |_| reader.image_preview_overlay(&ctx));
+                output.textures_delta.clear();
+            };
             frame(&mut reader, egui::Key::Num0);
             assert_eq!(reader.image_preview.is_some(), !typing);
             if typing {
@@ -8250,10 +8279,12 @@ mod reference_suggestion_label_tests {
             assert!((reader.image_preview.as_ref().unwrap().zoom - 1.0).abs() < 0.001);
             assert_eq!(reader.focus_unit_index, index);
             frame(&mut reader, egui::Key::Num0);
+            finish_fade(&mut reader);
             assert!(reader.image_preview.is_none());
             frame(&mut reader, egui::Key::Num0);
             assert!(reader.image_preview.is_some());
             frame(&mut reader, egui::Key::Escape);
+            finish_fade(&mut reader);
             assert!(reader.image_preview.is_none());
         }
     }
@@ -8300,6 +8331,8 @@ mod reference_suggestion_label_tests {
                                 ),
                                 TextureId::default(),
                                 100.0,
+                                1.0,
+                                true,
                             );
                         }
                         window_chrome::paint_controls(&ctx);
@@ -8353,6 +8386,45 @@ mod reference_suggestion_label_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn image_preview_fades_pixels_and_releases_texture_without_idle_repaints() {
+        let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let mut initial = ctx.run_ui(egui::RawInput { time: Some(0.0), screen_rect: Some(screen), ..Default::default() }, |_| {});
+        initial.textures_delta.clear();
+        reader.open_color_image_preview(&ctx, egui::ColorImage::filled([100, 100], Color32::WHITE), "fade-test");
+        let texture = reader.image_preview.as_ref().unwrap().texture.id();
+        let mut frame = |time, close| {
+            let mut output = ctx.run_ui(egui::RawInput { time: Some(time), screen_rect: Some(screen), ..Default::default() }, |_| {
+                if close { reader.close_image_preview(&ctx); }
+                reader.image_preview_overlay(&ctx);
+            });
+            let freed = output.textures_delta.free.clone();
+            output.textures_delta.clear();
+            (output, freed)
+        };
+        frame(0.0, false);
+        let alpha = |output: &egui::FullOutput| {
+            output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Mesh(mesh) if mesh.texture_id == texture => Some(mesh.vertices[0].color.a()),
+                _ => None,
+            }).expect("preview image is painted")
+        };
+        let opening = frame(0.09, false).0;
+        assert!((i32::from(alpha(&opening)) - 128).abs() <= 1);
+        assert_eq!(alpha(&frame(0.22, false).0), 255);
+        assert_eq!(alpha(&frame(0.23, true).0), 255, "closing must not apply disabled-widget dimming");
+        let closing = frame(0.32, false).0;
+        assert!((i32::from(alpha(&closing)) - 128).abs() <= 1);
+        let finished = frame(0.44, false);
+        assert!(finished.1.contains(&texture));
+        frame(0.7, false);
+        let idle = frame(0.9, false).0;
+        assert_eq!(idle.viewport_output[&egui::ViewportId::ROOT].repaint_delay, std::time::Duration::MAX);
+        assert!(reader.image_preview.is_none());
     }
 
     #[test]
@@ -10166,6 +10238,9 @@ mod reference_suggestion_label_tests {
                     ]);
                 }
             }
+            let now = ctx.input(|i| i.time);
+            let mut output = ctx.run_ui(egui::RawInput { time: Some(now + 0.2), ..Default::default() }, |ui| reader.image_preview_overlay(ui.ctx()));
+            output.textures_delta.clear();
             assert!(reader.image_preview.is_none(), "preview must close");
             assert_eq!(reader.focus_unit_index, index);
             assert_eq!(reader.focus_target_offset, target_offset);

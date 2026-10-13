@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 
 const KEYS: &[(&str, &str)] = &[
     ("groups", "g"),
+    ("paragraph_groups", "pg"),
     ("citations", "c"),
     ("formulas", "f"),
     ("kind", "k"),

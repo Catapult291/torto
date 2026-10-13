@@ -16,12 +16,15 @@ use roxmltree::{Document, Node};
 use thiserror::Error;
 
 mod font_size;
+mod font_faces;
+pub use font_faces::FontTraits;
 mod image_context;
 #[cfg(test)]
 mod media_context_tests;
 mod media_semantics;
 mod nested_media;
 mod paragraph_lists;
+mod paragraph_groups;
 mod style_query;
 mod table_captions;
 use font_size::FontSize;
@@ -295,9 +298,24 @@ pub fn parse_section_with_hints_and_image_classifier(
 pub fn parse_section_with_image_metadata(
     xml: &str,
     descriptor: &SpineItem,
+    load_stylesheet: impl FnMut(&PublicationUrl) -> Option<String>,
+    is_decorative_separator_image: impl FnMut(&PublicationUrl) -> bool,
+    image_dimensions: impl FnMut(&PublicationUrl) -> Option<[u32; 2]>,
+    hints: SectionParseHints,
+) -> Result<Section, HtmlError> {
+    parse_section_with_resource_metadata(xml, descriptor, load_stylesheet,
+        is_decorative_separator_image, image_dimensions, |_| None, hints)
+}
+
+/// Resource metadata stays in the parsing worker; fonts are queried only for
+/// families used by the current document and never retained as rendering assets.
+pub fn parse_section_with_resource_metadata(
+    xml: &str,
+    descriptor: &SpineItem,
     mut load_stylesheet: impl FnMut(&PublicationUrl) -> Option<String>,
     mut is_decorative_separator_image: impl FnMut(&PublicationUrl) -> bool,
     mut image_dimensions: impl FnMut(&PublicationUrl) -> Option<[u32; 2]>,
+    mut font_metadata: impl FnMut(&PublicationUrl) -> Option<FontTraits>,
     hints: SectionParseHints,
 ) -> Result<Section, HtmlError> {
     #[cfg(debug_assertions)]
@@ -308,7 +326,7 @@ pub fn parse_section_with_image_metadata(
     })?;
     #[cfg(debug_assertions)]
     let document_finished = profile_started.elapsed();
-    let styles = StyleSheet::from_document(&document, &descriptor.href, &mut load_stylesheet);
+    let styles = StyleSheet::from_document_with_fonts(&document, &descriptor.href, &mut load_stylesheet, &mut font_metadata);
     #[cfg(debug_assertions)]
     let styles_finished = profile_started.elapsed();
     let root = document
@@ -662,6 +680,9 @@ impl<'a> ReadingIrParser<'a> {
         if self.try_parse_structural_quote(container)? {
             return Ok(());
         }
+        let group_start = self.blocks.len();
+        let group_candidate = !self.inside_quote && !self.inside_note_definition
+            && paragraph_groups::candidate(container);
         let style = self.styles.block_style(container, BlockStyle::default());
         let text_style = self
             .styles
@@ -759,6 +780,9 @@ impl<'a> ReadingIrParser<'a> {
             index += 1;
         }
         self.push_collected_text_block(TextBlockKind::Paragraph, style, collector);
+        if group_candidate {
+            paragraph_groups::mark(&mut self.blocks[group_start..], container.range().start as u64 + 1);
+        }
         Ok(())
     }
 
@@ -3442,6 +3466,9 @@ struct StyleSheet {
     cascaded_cache: RefCell<NodeStyleCache>,
     next_order: usize,
     root_font_size: Option<f32>,
+    font_faces: font_faces::FontFaces,
+    font_cache: RefCell<font_faces::FontStateCache>,
+    has_font_families: bool,
 }
 
 struct StyleRule {
@@ -3449,6 +3476,7 @@ struct StyleRule {
     specificity: u16,
     order: usize,
     declarations: Vec<(String, String)>,
+    important_declarations: Vec<(String, String)>,
 }
 
 struct SimpleSelector {
@@ -3458,10 +3486,20 @@ struct SimpleSelector {
 }
 
 impl StyleSheet {
+    #[cfg(test)]
     fn from_document(
         document: &Document<'_>,
         base: &PublicationUrl,
         load_stylesheet: &mut impl FnMut(&PublicationUrl) -> Option<String>,
+    ) -> Self {
+        Self::from_document_with_fonts(document, base, load_stylesheet, &mut |_| None)
+    }
+
+    fn from_document_with_fonts(
+        document: &Document<'_>,
+        base: &PublicationUrl,
+        load_stylesheet: &mut impl FnMut(&PublicationUrl) -> Option<String>,
+        font_metadata: &mut impl FnMut(&PublicationUrl) -> Option<FontTraits>,
     ) -> Self {
         let mut sheet = Self::default();
         for node in document.descendants().filter(Node::is_element) {
@@ -3472,7 +3510,7 @@ impl StyleSheet {
                         .filter(Node::is_text)
                         .filter_map(|text| text.text())
                         .collect::<String>();
-                    sheet.add_css(&css);
+                    sheet.add_css_with_base(&css, base);
                 }
                 "link"
                     if attribute_local(node, "rel").is_some_and(|rel| {
@@ -3487,11 +3525,22 @@ impl StyleSheet {
                         continue;
                     };
                     if let Some(css) = load_stylesheet(&href) {
-                        sheet.add_css(&css);
+                        sheet.add_css_with_base(&css, &href);
                     }
                 }
                 _ => {}
             }
+        }
+        sheet.has_font_families |= document.descendants().filter(Node::is_element)
+            .any(|n| attribute_local(n, "style").is_some_and(|s| {
+                let (normal, important) = split_declarations(s);
+                normal.iter().chain(&important).any(|(name,_)| name == "font-family" || name == "font")
+            }));
+        if !sheet.font_faces.is_empty() {
+            let used = document.descendants().filter(Node::is_element).filter_map(|n|
+                sheet.cascaded_properties(n).get("font-family").and_then(|v| font_faces::primary_family(v)))
+                .collect::<HashSet<_>>();
+            sheet.font_faces.prepare(&used, font_metadata);
         }
         // The root's own rem units refer to the initial font size, not itself.
         sheet.root_font_size = sheet
@@ -3502,8 +3551,14 @@ impl StyleSheet {
         sheet
     }
 
+    #[cfg(test)]
     fn add_css(&mut self, css: &str) {
+        self.add_css_with_base(css, &PublicationUrl::parse("stylesheet.css").unwrap());
+    }
+
+    fn add_css_with_base(&mut self, css: &str, base: &PublicationUrl) {
         self.cascaded_cache.get_mut().clear();
+        self.font_cache.get_mut().clear();
         let css = strip_css_comments(css);
         let mut cursor = 0;
         while let Some(relative_open) = css[cursor..].find('{') {
@@ -3512,8 +3567,12 @@ impl StyleSheet {
                 break;
             };
             let prelude = css[cursor..open].trim();
-            if !prelude.starts_with('@') {
-                let declarations = declarations(&css[open + 1..close]).collect::<Vec<_>>();
+            if prelude.eq_ignore_ascii_case("@font-face") {
+                self.font_faces.add(&css[open + 1..close], base);
+            } else if !prelude.starts_with('@') {
+                let (declarations, important_declarations) = split_declarations(&css[open + 1..close]);
+                self.has_font_families |= declarations.iter().chain(&important_declarations)
+                    .any(|(name,_)| name == "font-family" || name == "font");
                 for raw_selector in prelude.split(',') {
                     let Some(selector) = SimpleSelector::parse(raw_selector) else {
                         continue;
@@ -3524,6 +3583,7 @@ impl StyleSheet {
                         selector,
                         order: self.next_order,
                         declarations: declarations.clone(),
+                        important_declarations: important_declarations.clone(),
                     });
                 }
                 self.next_order = self.next_order.saturating_add(1);
@@ -3909,6 +3969,10 @@ impl StyleSheet {
             self.root_font_size.unwrap_or(1.0)
         };
         apply_text_properties(style, &properties, inherited_size, root_size);
+        if let Some(traits) = self.font_traits(node) {
+            style.bold = traits.bold;
+            style.italic = traits.italic;
+        }
         if let Some(language) = attribute_local(node, "lang") {
             style.language = TextLanguage::from_bcp47(language);
         }
@@ -3921,12 +3985,18 @@ impl StyleSheet {
         let matching = self.rule_index.matching(node, &self.rules);
 
         let mut properties = HashMap::new();
-        for rule in matching {
+        for rule in &matching {
             insert_declarations(&mut properties, rule.declarations.iter().cloned());
         }
-        if let Some(inline) = attribute_local(node, "style") {
-            insert_declarations(&mut properties, declarations(inline));
+        let (inline, inline_important) = attribute_local(node, "style")
+            .map(split_declarations).unwrap_or_default();
+        insert_declarations(&mut properties, inline);
+        // Importance precedes specificity and inline author styles. Retain the
+        // indexed cascade's sorted order within each priority layer.
+        for rule in &matching {
+            insert_declarations(&mut properties, rule.important_declarations.iter().cloned());
         }
+        insert_declarations(&mut properties, inline_important);
         let properties = Rc::new(properties);
         self.cascaded_cache
             .borrow_mut()
@@ -4167,6 +4237,12 @@ fn insert_declarations(
     declarations: impl IntoIterator<Item = (String, String)>,
 ) {
     for (name, value) in declarations {
+        if name == "font" {
+            if let Some(expanded) = font_faces::expand_shorthand(&value) {
+                insert_declarations(properties, expanded);
+            }
+            continue;
+        }
         // Invalid declarations must not erase an earlier usable font size.
         if name == "font-size" && FontSize::parse(&value).is_none() {
             continue;
@@ -4269,18 +4345,29 @@ fn axis_sides(value: &str) -> Option<(&str, &str)> {
     }
 }
 
-fn declarations(style: &str) -> impl Iterator<Item = (String, String)> + '_ {
+fn declarations_with_priority(style: &str) -> impl Iterator<Item = (String, String, bool)> + '_ {
     style.split(';').filter_map(|declaration| {
         let (name, value) = declaration.split_once(':')?;
+        let (value, important) = value.rsplit_once('!')
+            .filter(|(_, suffix)| suffix.trim().eq_ignore_ascii_case("important"))
+            .map_or((value, false), |(value, _)| (value, true));
         Some((
             name.trim().to_ascii_lowercase(),
-            value
-                .trim()
-                .trim_end_matches("!important")
-                .trim()
-                .to_ascii_lowercase(),
+            value.trim().to_ascii_lowercase(),
+            important,
         ))
     })
+}
+
+type CssDeclarations = Vec<(String, String)>;
+
+fn split_declarations(style: &str) -> (CssDeclarations, CssDeclarations) {
+    let mut normal = Vec::new();
+    let mut important = Vec::new();
+    for (name, value, priority) in declarations_with_priority(style) {
+        if priority { important.push((name, value)); } else { normal.push((name, value)); }
+    }
+    (normal, important)
 }
 
 fn css_length(value: &str) -> Option<f32> {

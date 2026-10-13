@@ -165,6 +165,7 @@ fn round_trip_preserves_styles_structural_groups_and_source_anchors() {
       <p id="body">Ruby <ruby>base<rt>annotation</rt></ruby> <a href="chapter.xhtml#title"><sup>1</sup></a>
       <img src="../Images/cover.png" width="12" height="12" alt="inline"/></p>
       <table><caption>Table 1. Values</caption><tr><th>Heading</th><td colspan="2">Value</td></tr></table>
+      <div><p id="group-one" style="text-align:center">First grouped line</p><p id="group-two" style="text-align:right">Second grouped line</p></div>
       <figure><img src="../Images/cover.png"/><figcaption>Figure 1. Image</figcaption></figure></body></html>"#;
     let mut entries = minimal_entries();
     let position = entries
@@ -177,6 +178,13 @@ fn round_trip_preserves_styles_structural_groups_and_source_anchors() {
     let section = source.parse_section(0).unwrap();
     assert!(!section.anchors.is_empty());
     assert!(section.blocks.iter().any(|b| matches!(b, Block::Table(_))));
+    let grouped: Vec<_> = section.blocks.iter().filter_map(|b| match b {
+        Block::Text(t) if t.style.paragraph_group.is_some() => Some(t), _ => None,
+    }).collect();
+    assert_eq!(grouped.len(), 2);
+    assert_eq!(grouped[0].style.paragraph_group, grouped[1].style.paragraph_group);
+    assert_eq!(grouped[0].style.authored_alignment, Some(rebook_publication::TextAlignment::Center));
+    assert_eq!(grouped[1].style.authored_alignment, Some(rebook_publication::TextAlignment::End));
     let digest = [42; 32];
     let path = temp.0.join("section.bin");
     write(&path, &digest, &section).unwrap();

@@ -541,6 +541,7 @@ fn formula_copy_uses_latex_and_ordinary_images_still_copy_pixels() {
     assert!(blocked.platform_output.commands.is_empty());
     let pixels = reader.selected_image.as_ref().unwrap().color_image();
     reader.image_preview = Some(ImagePreview {
+        motion: super::super::media_preview::PreviewMotion::new(&ctx),
         formula: Some(r"x^2".into()),
         texture: ctx.load_texture(
             "formula-copy-test",

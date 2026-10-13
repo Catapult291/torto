@@ -11,6 +11,7 @@ mod continuations;
 mod cover;
 mod epub;
 mod fb2;
+mod font_metadata;
 mod html_context;
 mod kf8;
 mod markup;

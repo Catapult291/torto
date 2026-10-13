@@ -19,6 +19,55 @@ use std::{
 const INDEX_BUDGET: usize = 2 * 1024 * 1024;
 const PIXEL_BUDGET: usize = 32 * 1024 * 1024;
 
+/// Match the settings dialog's 180 ms fade, retaining pixels until dismissal ends.
+/// Use an absolute deadline so returning to an unfocused window finishes the fade
+/// without leaving a paused animation requesting frames indefinitely.
+pub(super) struct PreviewMotion {
+    opened_at: f64,
+    closing: Option<(f64, f32)>,
+}
+
+impl PreviewMotion {
+    const DURATION: f64 = 0.18;
+
+    pub(super) fn new(ctx: &egui::Context) -> Self {
+        Self {
+            opened_at: ctx.input(|i| i.time),
+            closing: None,
+        }
+    }
+
+    pub(super) fn is_closing(&self) -> bool {
+        self.closing.is_some()
+    }
+
+    fn opacity_at(&self, now: f64) -> f32 {
+        match self.closing {
+            Some((started, from)) => {
+                from * (1.0 - ((now - started) / Self::DURATION).clamp(0.0, 1.0) as f32)
+            }
+            None => ((now - self.opened_at) / Self::DURATION).clamp(0.0, 1.0) as f32,
+        }
+    }
+
+    pub(super) fn close(&mut self, ctx: &egui::Context) {
+        if !self.is_closing() {
+            let now = ctx.input(|i| i.time);
+            self.closing = Some((now, self.opacity_at(now)));
+            ctx.request_repaint();
+        }
+    }
+
+    pub(super) fn opacity(&self, ctx: &egui::Context) -> f32 {
+        let now = ctx.input(|i| i.time);
+        let started = self.closing.map_or(self.opened_at, |(time, _)| time);
+        if now < started + Self::DURATION && ctx.input(|i| i.focused) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+        self.opacity_at(now)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Target {
     section: usize,
@@ -184,7 +233,23 @@ fn authored_link(
             continue;
         }
         let value = plain(text);
-        for reference in media_references::references(&value)
+        // Authored source offsets count text scalars, without display placeholders
+        // for inline images/math. Mask notes in this same flattened coordinate space.
+        let mut reference_text = value.as_bytes().to_vec();
+        let mut offset = 0;
+        for run in text.content.iter().flat_map(Inline::text_runs) {
+            let end = offset + run.text.len();
+            if run.style.link_role != rebook_publication::LinkRole::Normal
+                || run.style.inline_role != rebook_publication::InlineRole::Normal
+                || run.style.baseline != rebook_publication::TextBaseline::Normal
+                || run.style.suppress_media_references
+            {
+                reference_text[offset..end].fill(0);
+            }
+            offset = end;
+        }
+        let reference_text = std::str::from_utf8(&reference_text).expect("masked whole text runs preserve UTF-8");
+        for reference in media_references::references(reference_text)
             .into_iter()
             .filter(|r| &r.key == key)
         {
@@ -789,6 +854,8 @@ impl Worker {
 }
 
 struct Preview {
+    motion: PreviewMotion,
+    content_motion: Option<PreviewMotion>,
     origin: SourceRange,
     key: MediaKey,
     texture: Option<egui::TextureHandle>,
@@ -827,6 +894,7 @@ impl super::DesktopReader {
         let Some(active) = &self.media_preview.active else {
             return false;
         };
+        if active.motion.is_closing() { return true; }
         if ctx.input_mut(|i| i.consume_shortcut(&self.shortcuts.copy)) {
             ctx.copy_text(active.captions.join("\n"));
         }
@@ -843,6 +911,8 @@ impl super::DesktopReader {
         self.ui.wheel_accumulator = 0.0;
         self.media_preview.restore_parent = self.ui.focus_footnotes_visible;
         self.media_preview.active = Some(Preview {
+            motion: PreviewMotion::new(ctx),
+            content_motion: None,
             origin,
             key,
             texture: None,
@@ -868,6 +938,7 @@ impl super::DesktopReader {
         active.loading = true;
         active.texture = None;
         active.caption_textures.clear();
+        active.content_motion = None;
         active.error = None;
         active.pan = egui::Vec2::ZERO;
         active.zoom = 1.0;
@@ -885,7 +956,10 @@ impl super::DesktopReader {
         ctx.request_repaint();
     }
     pub(super) fn close_media_preview(&mut self, ctx: &egui::Context) {
-        self.media_preview.active = None;
+        let Some(active) = &mut self.media_preview.active else { return };
+        if active.motion.is_closing() { return; }
+        active.motion.close(ctx);
+        if let Some(motion) = &mut active.content_motion { motion.close(ctx); }
         if let Some(worker) = &self.media_preview.worker {
             worker.generation.fetch_add(1, Ordering::Release);
             worker.pending.store(None);
@@ -896,6 +970,9 @@ impl super::DesktopReader {
     pub(super) fn media_preview_keyboard(&mut self, ctx: &egui::Context) -> bool {
         if self.media_preview.active.is_none() {
             return false;
+        }
+        if self.media_preview.active.as_ref().is_some_and(|active| active.motion.is_closing()) {
+            return true;
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             self.close_media_preview(ctx);
@@ -952,6 +1029,7 @@ impl super::DesktopReader {
                 let Some(active) = &mut self.media_preview.active else {
                     return;
                 };
+                if active.motion.is_closing() { return; }
                 active.loading = false;
                 if completion.revision != self.source.content_revision() {
                     active.error =
@@ -960,6 +1038,7 @@ impl super::DesktopReader {
                 }
                 match completion.result {
                     Ok(ready) => {
+                        active.content_motion = Some(PreviewMotion::new(ctx));
                         active.size = egui::vec2(ready.size[0] as f32, ready.size[1] as f32);
                         active.texture = Some(ctx.load_texture(
                             "media-preview",
@@ -993,18 +1072,28 @@ impl super::DesktopReader {
         let Some(active) = &mut self.media_preview.active else {
             return;
         };
+        let opacity = active.motion.opacity(ctx);
+        if active.motion.is_closing() && opacity <= f32::EPSILON {
+            self.media_preview.active = None;
+            // The parent footnote popup is earlier in the frame's paint order.
+            ctx.request_repaint();
+            return;
+        }
+        let content_opacity = active.content_motion.as_ref().map_or(1.0, |motion| motion.opacity(ctx));
         let screen = crate::ui::overlay_rect(ctx);
         let available = screen.shrink(32.0);
         let mut close = false;
         let mut navigate = None;
         #[cfg(target_os = "windows")]
-        crate::app::window_chrome::dim_controls(ctx, 190.0 / 255.0);
+        crate::app::window_chrome::dim_controls(ctx, 190.0 / 255.0 * opacity);
         egui::Area::new("reader-media-preview".into())
             .order(egui::Order::Tooltip)
             .fade_in(false)
             .fixed_pos(ctx.content_rect().min)
             .constrain(false)
             .show(ctx, |ui| {
+                if active.motion.is_closing() { ui.disable(); }
+                ui.set_opacity(opacity);
                 ui.set_clip_rect(ctx.content_rect());
                 let (bounds, backdrop) =
                     ui.allocate_exact_size(ctx.content_rect().size(), egui::Sense::click());
@@ -1025,6 +1114,7 @@ impl super::DesktopReader {
                     if available
                         .contains(ctx.input(|i| i.pointer.hover_pos()).unwrap_or(screen.min))
                         && wheel != 0.0
+                        && !active.motion.is_closing()
                     {
                         active.zoom = (active.zoom * (wheel * 0.002).exp()).clamp(1.0, 16.0);
                     }
@@ -1033,7 +1123,8 @@ impl super::DesktopReader {
                     let limit = (size - available.size()).max(egui::Vec2::ZERO) * 0.5;
                     active.pan = active.pan.clamp(-limit, limit);
                     let paper = egui::Rect::from_center_size(available.center() + active.pan, size);
-                    let painter = ui.painter().with_clip_rect(available);
+                    let mut painter = ui.painter().with_clip_rect(available);
+                    painter.multiply_opacity(content_opacity);
                     painter.rect_filled(paper, 0.0, egui::Color32::WHITE);
                     let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
                     let mut top = paper.top();

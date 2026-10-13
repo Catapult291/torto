@@ -5,6 +5,36 @@ use rebook_publication::{
 use std::sync::atomic::AtomicUsize;
 
 #[test]
+fn preview_motion_reverses_continuously_and_stops_scheduling_when_idle_or_unfocused() {
+    let ctx = egui::Context::default();
+    let mut motion = PreviewMotion { opened_at: 0.0, closing: None };
+    let frame = |motion: &mut PreviewMotion, time, focused, close| {
+        let mut opacity = 0.0;
+        let mut output = ctx.run_ui(egui::RawInput { time: Some(time), focused, ..Default::default() }, |_| {
+            if close { motion.close(&ctx); }
+            opacity = motion.opacity(&ctx);
+        });
+        output.textures_delta.clear();
+        (opacity, output.viewport_output[&egui::ViewportId::ROOT].repaint_delay)
+    };
+    assert_eq!(frame(&mut motion, 0.0, true, false).0, 0.0);
+    let halfway = frame(&mut motion, 0.09, true, false);
+    assert!((halfway.0 - 0.5).abs() < 0.001);
+    assert!(halfway.1 <= std::time::Duration::from_millis(16));
+    assert_eq!(frame(&mut motion, 0.09, true, true).0, halfway.0);
+    assert!((frame(&mut motion, 0.18, true, false).0 - 0.25).abs() < 0.001);
+    assert_eq!(frame(&mut motion, 0.30, true, false).0, 0.0);
+    frame(&mut motion, 0.5, true, false);
+    assert_eq!(frame(&mut motion, 0.7, true, false).1, std::time::Duration::MAX);
+    motion = PreviewMotion { opened_at: 0.7, closing: None };
+    frame(&mut motion, 0.72, false, false);
+    assert_eq!(frame(&mut motion, 0.74, false, false).1, std::time::Duration::MAX);
+    assert_eq!(frame(&mut motion, 1.0, true, false).0, 1.0);
+    frame(&mut motion, 1.2, true, false);
+    assert_eq!(frame(&mut motion, 1.4, true, false).1, std::time::Duration::MAX);
+}
+
+#[test]
 fn media_modal_rejects_stale_pixels_and_restores_parent_state_on_escape() {
     let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
     reader.ui.focus_footnotes_visible = true;
@@ -27,6 +57,8 @@ fn media_modal_rejects_stale_pixels_and_restores_parent_state_on_escape() {
     };
     let key = media_references::references("Figure 4.4")[0].key.clone();
     reader.media_preview.active = Some(Preview {
+        motion: PreviewMotion { opened_at: 0.0, closing: None },
+        content_motion: None,
         origin,
         key,
         texture: None,
@@ -140,7 +172,14 @@ fn media_modal_rejects_stale_pixels_and_restores_parent_state_on_escape() {
         assert!((image.center().x - caption.center().x).abs() < 0.01);
         (image, caption)
     };
-    let normal = geometry(frame(&mut reader, vec![]));
+    let normal_shapes = frame(&mut reader, vec![]);
+    let alpha = |id| normal_shapes.iter().find_map(|shape| match &shape.shape {
+        egui::Shape::Mesh(mesh) if mesh.texture_id == id => Some(mesh.vertices[0].color.a()),
+        _ => None,
+    }).unwrap();
+    assert_eq!(alpha(image_id), alpha(caption_id), "media and caption fade together");
+    assert!((1..255).contains(&alpha(image_id)), "async media content fades in when ready");
+    let normal = geometry(normal_shapes);
     let fitted = normal.0.union(normal.1).size();
     let available = crate::ui::overlay_rect(&ctx).shrink(32.0).size();
     assert!(normal.0.width() > 320.0, "small media should expand to the window");
@@ -180,7 +219,13 @@ fn media_modal_rejects_stale_pixels_and_restores_parent_state_on_escape() {
         },
     );
     output.textures_delta.clear();
+    assert!(reader.media_preview.active.as_ref().unwrap().motion.is_closing());
+    assert!(reader.preview_is_open(), "retain input ownership during fade-out");
+    let now = ctx.input(|i| i.time);
+    let mut output = ctx.run_ui(egui::RawInput { time: Some(now + 0.2), ..Default::default() }, |_| reader.media_preview_overlay(&ctx));
     assert!(reader.media_preview.active.is_none());
+    assert!(!output.textures_delta.free.is_empty(), "release preview and caption textures after fading");
+    output.textures_delta.clear();
     assert!(reader.ui.focus_footnotes_visible);
     assert_eq!(
         reader.ui.focus_footnote_scroll_positions[&scroll_key],
@@ -403,6 +448,67 @@ fn cancelling_a_lookup_does_not_scan_or_decode_the_book() {
     assert_eq!(source.parses.load(Ordering::Relaxed) - before, 1);
     assert_eq!(source.resources.load(Ordering::Relaxed), 0);
 }
+
+#[test]
+fn adjacent_superscript_note_preserves_media_hit_number_source_and_authored_target() {
+    let source = source(&[
+        "<html xmlns:epub='http://www.idpf.org/2007/ops'><body><p>At <a href='https://example.com'>the website</a>, shown in <a href='s1.xhtml#f13'>Fig. 11.13</a><a epub:type='noteref' href='#fn2'><sup>2</sup></a>.</p></body></html>",
+        "<html><body><figure id='f13'><img src='a.png'/><figcaption>Figure 11.13 Target caption.</figcaption></figure></body></html>",
+    ]);
+    let mut style = ReaderStyle::default();
+    style.typesetting.mode = rebook_layout::TypesettingMode::Unified;
+    style.spread = SpreadMode::Single;
+    style.website_icons = true;
+    for focus in [false, true] {
+        style.focus_footnote_icons = focus;
+        let layout = LayoutEngine::with_fonts(crate::fonts::embedded_reader_fonts().iter().cloned()).layout_section(source.as_ref(), &source.sections[0], LayoutViewport::new(600, 400).unwrap(), &style).unwrap();
+        let display = rebook_renderer::DisplayListCompiler.compile(&layout.pages[0]);
+        let mut found = 0;
+        for item in &layout.pages[0].items {
+            let rebook_layout::PageItem::Text(text) = item else { continue };
+            for (rect, key) in rebook_renderer::text_media_reference_rects(text) {
+                assert_eq!(key.number, "11.13", "the superscript is a separate note, not part of the figure number");
+                let at = rect.center();
+                let hit = display.media_reference_at(at.x as f32, at.y as f32).unwrap();
+                assert_eq!(hit.key, key);
+                let mut request = job(source.clone(), 0, "Figure 11.13");
+                request.origin = hit.source;
+                let target = Index::default().resolve(&request, &|| true).unwrap();
+                assert_eq!(target.section, 1);
+                found += 1;
+            }
+        }
+        assert!(found > 0);
+    }
+    assert_eq!(source.resources.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn unverified_translation_reference_cannot_borrow_a_nearby_links_shaped_run() {
+    let source = source(&["<html><body><p>See Figure 1. This original paragraph has enough ordinary prose to keep all translated source offsets within its range and does not mention any tables.</p></body></html>"]);
+    let mut section = source.sections[0].clone();
+    let Block::Text(block) = &mut section.blocks[0] else { panic!("paragraph") };
+    let original = block.content.clone();
+    block.content = vec![Inline::Text(rebook_publication::TextRun {
+        text: "See Figure 1. Translation invents Table 99.".into(),
+        style: Default::default(),
+        link: None,
+    })];
+    media_references::restrict_translated_links(&mut block.content, &original);
+    let mut style = ReaderStyle::default();
+    style.typesetting.mode = rebook_layout::TypesettingMode::Unified;
+    style.spread = SpreadMode::Single;
+    let layout = LayoutEngine::with_fonts(crate::fonts::embedded_reader_fonts().iter().cloned()).layout_section(source.as_ref(), &section, LayoutViewport::new(600, 400).unwrap(), &style).unwrap();
+    let mut keys = Vec::new();
+    for page in &layout.pages {
+        for item in &page.items {
+            let rebook_layout::PageItem::Text(text) = item else { continue };
+            keys.extend(rebook_renderer::text_media_reference_rects(text).into_iter().map(|(_, key)| key));
+        }
+    }
+    assert!(!keys.is_empty());
+    assert!(keys.iter().all(|key| key.kind == MediaKind::Figure && key.number == "1"), "uncolored Table 99 must not acquire invisible click geometry: {keys:?}");
+}
 #[test]
 #[ignore = "requires TORTO_MEDIA_BOOK, optionally TORTO_MEDIA_KEY and TORTO_MEDIA_PNG"]
 fn local_book_media_preview() {
@@ -444,6 +550,36 @@ fn local_book_media_preview() {
         style: ReaderStyle::default(),
         ctx: egui::Context::default(),
     };
+    // Exercise the real body's shaped click range, including neighboring note
+    // markers and website placeholders, rather than looking up the label alone.
+    if let Some(body) = section.blocks.iter().flat_map(text_blocks).find(|text| {
+        text.kind != rebook_publication::TextBlockKind::Caption
+            && media_references::caption_label(&plain(text)).is_none()
+            && media_references::inline_references(&text.content).iter().any(|r| r.key == request.key && r.range.start > 0)
+    }) {
+        let mut click_section = section.clone();
+        click_section.blocks = vec![Block::Text(body.clone())];
+        let mut style = ReaderStyle::default();
+        style.typesetting.mode = rebook_layout::TypesettingMode::Unified;
+        style.focus_footnote_icons = true;
+        style.spread = SpreadMode::Single;
+        let layout = LayoutEngine::with_fonts(crate::fonts::embedded_reader_fonts().iter().cloned()).layout_section(request.source.as_ref(), &click_section, LayoutViewport::new(900, 600).unwrap(), &style).unwrap();
+        let mut hits = Vec::new();
+        for page in &layout.pages {
+            let display = rebook_renderer::DisplayListCompiler.compile(page);
+            for item in &page.items {
+                let rebook_layout::PageItem::Text(text) = item else { continue };
+                for (rect, key) in rebook_renderer::text_media_reference_rects(text) {
+                    println!("actual body media hit: {key:?}");
+                    if key == request.key {
+                        let at = rect.center();
+                        hits.push(display.media_reference_at(at.x as f32, at.y as f32).unwrap());
+                    }
+                }
+            }
+        }
+        request.origin = hits.first().expect("the original body reference must remain clickable").source.clone();
+    }
     let resolved = Index::default().resolve(&request, &|| true).unwrap();
     assert_eq!(resolved.block, selected.block);
     let mut count = 0;

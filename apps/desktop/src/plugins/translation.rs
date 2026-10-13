@@ -1681,8 +1681,12 @@ fn normalize_rtl_translation(block: &mut TextBlock) {
     }
     if block.style.direction == TextDirection::Rtl {
         block.style.direction = TextDirection::Ltr;
-        block.style.align = TextAlignment::Start;
-        block.style.authored_alignment = Some(TextAlignment::Start);
+        if block.style.paragraph_group.is_none()
+            || !matches!(block.style.authored_alignment, Some(TextAlignment::Center | TextAlignment::End))
+        {
+            block.style.align = TextAlignment::Start;
+            block.style.authored_alignment = Some(TextAlignment::Start);
+        }
         block.style.semantic_alignment = None;
         block.style.logical_alignment = false;
     }
@@ -1812,6 +1816,9 @@ fn replacement_content(text: &str, style: TextStyle, original: Option<&[Inline]>
         if let Inline::Text(run) = inline {
             run.style.display_writing_system = Some(rebook_publication::WritingSystem::Unknown);
         }
+    }
+    if has_source {
+        rebook_publication::media_references::restrict_translated_links(&mut content, original);
     }
     content
 }
@@ -2433,6 +2440,32 @@ fn best_marker_match(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn translated_prose_cannot_invent_media_links_but_keeps_source_references() {
+        let original = vec![Inline::Text(TextRun { text: "Each kana represents a sound. See Figure 11.1.".into(), style: TextStyle::default(), link: None })];
+        let translated = replacement_content("每个假名代表一个声音，见图 11.1。另见表一。", TextStyle::default(), Some(&original));
+        let refs = rebook_publication::media_references::inline_references(&translated);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].key.number, "11.1");
+        assert_eq!(refs[0].key.kind, rebook_publication::media_references::MediaKind::Figure);
+    }
+
+    #[test]
+    fn translated_container_members_keep_alignment_and_group_identity() {
+        use rebook_publication::{TextAlignment,TextDirection};
+        for align in [TextAlignment::Center,TextAlignment::End] {
+            let original=TextBlock {kind:TextBlockKind::Paragraph,content:vec![],source:None,
+                style:BlockStyle {direction:TextDirection::Rtl,align,authored_alignment:Some(align),paragraph_group:Some(17),..Default::default()}};
+            for mode in [TranslationMode::Replace,TranslationMode::Bilingual] {
+                let translated=translated_quote_text(original.clone(),Some(&"译文".to_owned()),mode);
+                let block=translated.last().unwrap();
+                assert_eq!(block.style.paragraph_group,Some(17));
+                assert_eq!(block.style.align,align);
+                assert_eq!(block.style.authored_alignment,Some(align));
+            }
+        }
+    }
 
     #[test]
     fn only_rtl_translation_changes_alignment_and_bilingual_keeps_original() {

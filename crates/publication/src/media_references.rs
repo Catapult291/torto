@@ -114,6 +114,15 @@ pub fn references(text: &str) -> Vec<MediaReference> {
         if start >= end {
             continue;
         }
+        // Classifiers after a Chinese numeral belong to prose, e.g. 代表一个,
+        // rather than the label 表一. Keep real labels such as 表一中 and 图五所示.
+        if text[start..end]
+            .chars()
+            .any(|c| "一二三四五六七八九十百零〇".contains(c))
+            && text[end..].starts_with(['个', '種', '种', '次', '些', '般', '旦'])
+        {
+            continue;
+        }
         out.push(MediaReference {
             range: whole.start()..end,
             key: MediaKey {
@@ -194,15 +203,86 @@ pub fn is_citation(text: &str) -> bool {
         .all(|c| c.is_whitespace() || "()（）[]［］,，、;；.&".contains(c))
 }
 
+fn reference_text(content: &[Inline]) -> String {
+    let mut text = String::new();
+    for inline in content {
+        match inline {
+            Inline::Text(run)
+                if !run.style.suppress_media_references
+                    && run.style.inline_role == InlineRole::Normal
+                    && run.style.link_role == LinkRole::Normal
+                    && run.style.baseline == crate::TextBaseline::Normal
+                    && !run
+                        .link
+                        .as_ref()
+                        .is_some_and(|href| href.website_url().is_some()) =>
+            {
+                text.push_str(&run.text)
+            }
+            // Preserve byte offsets and prevent a note from extending 11.13.
+            Inline::Text(run) => text.extend(std::iter::repeat_n('\0', run.text.len())),
+            _ => text.push('\0'),
+        }
+    }
+    text
+}
+
+/// Source byte ranges with note/image/external-link boundaries respected.
+pub fn inline_references(content: &[Inline]) -> Vec<MediaReference> {
+    link_references(&reference_text(content))
+}
+
+/// Retain source-backed media references after translation without asking the
+/// model for extra markup or scanning any other chapter/resource.
+pub fn restrict_translated_links(content: &mut Vec<Inline>, original: &[Inline]) {
+    let source_refs = inline_references(original);
+    if source_refs.is_empty() {
+        for inline in content {
+            if let Inline::Text(run) = inline {
+                run.style.suppress_media_references = true;
+            }
+        }
+        return;
+    }
+    let refs: Vec<_> = inline_references(content)
+        .into_iter()
+        .filter(|r| source_refs.iter().any(|source| source.key == r.key))
+        .collect();
+    let mut offset = 0;
+    let mut result = Vec::with_capacity(content.len());
+    for inline in std::mem::take(content) {
+        let Inline::Text(run) = inline else {
+            offset += 1;
+            result.push(inline);
+            continue;
+        };
+        let len = run.text.len();
+        let mut cuts = vec![0, len];
+        for reference in &refs {
+            for end in [reference.range.start, reference.range.end] {
+                if end > offset && end < offset + len {
+                    cuts.push(end - offset);
+                }
+            }
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        for pair in cuts.windows(2) {
+            let mut part = run.clone();
+            part.text = run.text[pair[0]..pair[1]].into();
+            part.style.suppress_media_references = !refs
+                .iter()
+                .any(|r| r.range.start <= offset + pair[0] && r.range.end >= offset + pair[1]);
+            result.push(Inline::Text(part));
+        }
+        offset += len;
+    }
+    *content = result;
+}
+
 /// Link appearance is applied only by unified layout, after caption normalization.
 pub fn style_links(content: &mut Vec<Inline>, color: Rgba) {
-    let text: String = content
-        .iter()
-        .map(|i| match i {
-            Inline::Text(r) => r.text.clone(),
-            _ => "\0".into(),
-        })
-        .collect();
+    let text = reference_text(content);
     let refs = link_references(&text);
     if refs.is_empty() {
         return;
@@ -217,6 +297,7 @@ pub fn style_links(content: &mut Vec<Inline>, color: Rgba) {
         };
         let len = run.text.len();
         if run.style.inline_citation != 0
+            || run.style.suppress_media_references
             || run.style.inline_role != InlineRole::Normal
             || run.style.link_role != LinkRole::Normal
             || run
@@ -258,6 +339,89 @@ pub fn style_links(content: &mut Vec<Inline>, color: Rgba) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn content(text: &str) -> Vec<Inline> {
+        vec![Inline::Text(TextRun {
+            text: text.into(),
+            style: Default::default(),
+            link: None,
+        })]
+    }
+
+    #[test]
+    fn chinese_classifiers_do_not_create_table_or_figure_references() {
+        for text in ["代表一个声音", "图一般而言", "见表一种结果", "代表一些字符"]
+        {
+            assert!(references(text).is_empty(), "{text}");
+        }
+        assert_eq!(references("表一中列出了数据")[0].key.number, "1");
+        assert_eq!(references("图五所示")[0].key.number, "5");
+    }
+
+    #[test]
+    fn adjacent_note_markers_do_not_extend_media_numbers() {
+        let mut content = content("See Fig. 11.13");
+        content.push(Inline::Text(TextRun {
+            text: "2".into(),
+            style: crate::TextStyle {
+                link_role: LinkRole::FootnoteReference,
+                baseline: crate::TextBaseline::Superscript,
+                ..Default::default()
+            },
+            link: Some(crate::PublicationUrl::parse("chapter.xhtml#fn2").unwrap()),
+        }));
+        let references = inline_references(&content);
+        assert_eq!(references[0].key.number, "11.13");
+        style_links(
+            &mut content,
+            Rgba {
+                red: 45,
+                green: 104,
+                blue: 210,
+                alpha: 255,
+            },
+        );
+        assert_eq!(inline_references(&content)[0].key.number, "11.13");
+        assert_eq!(content.last().unwrap().text_runs()[0].text, "2");
+    }
+
+    #[test]
+    fn translated_links_require_the_same_source_kind_and_number() {
+        let original = content("See Figure 11.1 and Table 1.");
+        let mut translated = content("代表一个声音。见图 11.1、表一，以及图 9.9 和表 11.1。");
+        restrict_translated_links(&mut translated, &original);
+        let found = inline_references(&translated);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].key.number, "11.1");
+        assert_eq!(found[1].key.number, "1");
+        style_links(
+            &mut translated,
+            Rgba {
+                red: 45,
+                green: 104,
+                blue: 210,
+                alpha: 255,
+            },
+        );
+        let linked: String = translated
+            .iter()
+            .flat_map(Inline::text_runs)
+            .filter(|run| run.style.color.blue > run.style.color.red)
+            .map(|run| run.text.as_str())
+            .collect();
+        assert_eq!(linked, "图 11.1表一");
+        assert_eq!(
+            translated
+                .iter()
+                .flat_map(Inline::text_runs)
+                .map(|run| run.text.as_str())
+                .collect::<String>(),
+            "代表一个声音。见图 11.1、表一，以及图 9.9 和表 11.1。"
+        );
+        let mut invented = content("见图 11.1 与表一。");
+        restrict_translated_links(&mut invented, &content("There are two examples."));
+        assert!(inline_references(&invented).is_empty());
+    }
     #[test]
     fn multilingual_numbers_and_continuations() {
         let found = references("如图 ４.４，Fig. C.1; Figures 1.2a and 1.2b; 见图五、七E");

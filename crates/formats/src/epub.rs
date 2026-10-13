@@ -10,8 +10,8 @@ use flate2::read::DeflateDecoder;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use rebook_html::{
-    SectionParseHints, parse_section_with_hints_and_image_classifier,
-    parse_section_with_image_metadata,
+    SectionParseHints,
+    parse_section_with_resource_metadata,
 };
 use rebook_publication::{
     Book, BookSource, Metadata, PublicationError, PublicationId, PublicationUrl, RenditionLayout,
@@ -235,11 +235,13 @@ impl BookSource for EpubPublication {
             .archive
             .read_content_xml(href)
             .map_err(EpubError::into_publication_error)?;
-        parse_section_with_hints_and_image_classifier(
+        parse_section_with_resource_metadata(
             &xml,
             &descriptor,
             |href| self.archive.read_stylesheet(href).ok(),
             |_| false,
+            |_| None,
+            |href| self.font_traits(href),
             SectionParseHints::default(),
         )
         .map(Some)
@@ -284,12 +286,13 @@ impl EpubPublication {
         }
 
         let xml = self.archive.read_content_xml(&descriptor.href)?;
-        let mut section = parse_section_with_image_metadata(
+        let mut section = parse_section_with_resource_metadata(
             &xml,
             descriptor,
             |href| self.archive.read_stylesheet(href).ok(),
             |href| self.is_decorative_separator_image(href),
             |href| crate::html_context::image_dimensions(&self.archive.read(href).ok()?),
+            |href| self.font_traits(href),
             self.html_context.hints(descriptor),
         )?;
         self.html_context.mark_note_references(&mut section);
@@ -302,6 +305,13 @@ impl EpubPublication {
     fn is_decorative_separator_image(&self, href: &PublicationUrl) -> bool {
         self.html_context
             .is_separator_image(href, || self.archive.read(href).ok())
+    }
+
+    fn font_traits(&self, href: &PublicationUrl) -> Option<rebook_html::FontTraits> {
+        self.html_context.font_traits(href, || {
+            (self.archive.entries.get(href.path())?.size <= crate::font_metadata::MAX_FONT_BYTES as u64)
+                .then(|| self.archive.read(href).ok()).flatten()
+        })
     }
 }
 

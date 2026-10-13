@@ -985,6 +985,7 @@ struct PendingTocNavigation {
 }
 
 struct ImagePreview {
+    motion: media_preview::PreviewMotion,
     formula: Option<String>,
     texture: egui::TextureHandle,
     image: egui::ColorImage,
@@ -1081,9 +1082,6 @@ impl FocusFootnote {
             return &self.text;
         }
         let text = self.text.trim();
-        if rebook_publication::media_references::is_citation(text) {
-            return text;
-        }
         for (open, close) in [('(', ')'), ('（', '）'), ('[', ']'), ('［', '］')] {
             if let Some(inner) = text.strip_prefix(open).and_then(|s| s.strip_suffix(close)) {
                 return inner.trim();
@@ -2033,6 +2031,10 @@ fn image_caption_scroll_bounds(unit: &FocusUnit, viewport_height: f32) -> Option
 }
 
 impl FocusUnit {
+    fn popup_footnotes(&self) -> &[FocusFootnote] {
+        self.list_group.as_ref().map_or(&self.footnotes, |group| &group.footnotes)
+    }
+
     fn fitting_caption(&self, height: f32) -> Option<egui::Rect> {
         let caption = self.caption_rect?;
         let image = self.image_rect?;

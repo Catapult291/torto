@@ -20,6 +20,7 @@ image.workspace = true
 kurbo.workspace = true
 libchm.workspace = true
 quick-xml.workspace = true
+read-fonts.workspace = true
 rebook-html = { path = "../html" }
 rebook-layout = { path = "../layout" }
 rebook-renderer = { path = "../renderer" }

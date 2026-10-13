@@ -2789,12 +2789,23 @@ fn shaped_text_regions(text: &TextPlacement) -> impl Iterator<Item = TextRegion>
     // Only actual links participate. Caption labels retain their neutral, bold
     // presentation, and external/work references cannot acquire invisible hits.
     // Hit testing follows the link color, independently of decorative underlines.
-    let links: Vec<_> = text.layout.lines().skip(text.lines.start).take(text.lines.len())
-        .flat_map(|line| line.items()).filter_map(|item| {
-            let PositionedLayoutItem::GlyphRun(run) = item else { return None };
-            let brush = run.style().brush;
-            (brush.color.blue > brush.color.red).then(|| run.run().text_range())
-        }).collect();
+    let mut links = Vec::new();
+    let mut excluded = Vec::new();
+    // A shaped run can contain several brushes. Its whole text_range is not
+    // the range of an individual colored/footnote GlyphRun. Inspect clusters
+    // once per underlying line run so a website icon cannot mask a nearby figure
+    // or make unrelated, uncolored text acquire clickable media geometry.
+    for cluster in text.layout.lines().skip(text.lines.start).take(text.lines.len())
+        .flat_map(|line| line.runs()).flat_map(|run| run.clusters())
+    {
+        let brush = cluster.style().brush;
+        if brush.footnote_reference || brush.baseline != rebook_publication::TextBaseline::Normal {
+            excluded.push(cluster.text_range());
+        } else if brush.color.blue > brush.color.red {
+            links.push(cluster.text_range());
+        }
+    }
+    links.sort_unstable_by_key(|range| range.start);
     text.source_spans
         .iter()
         .map(|span| (span.range.clone(), &span.source))
@@ -2805,10 +2816,42 @@ fn shaped_text_regions(text: &TextPlacement) -> impl Iterator<Item = TextRegion>
                 .map(|source| (text.source_text_start..text.text.len(), source)),
         )
         .filter_map(move |(range, source)| {
+            // Collapsed footnotes remain adjacent in shaped text (11.13 + 1).
+            // Mask their byte ranges before parsing, preserving source offsets.
+            let mut media_text = std::borrow::Cow::Borrowed(text.text[range.clone()].as_bytes());
+            if !links.is_empty() {
+                for blocked in text.citations.iter().map(|c| &c.range).chain(&excluded) {
+                    let start = blocked.start.max(range.start);
+                    let end = blocked.end.min(range.end);
+                    if start < end {
+                        media_text.to_mut()[start - range.start..end - range.start].fill(0);
+                    }
+                }
+            }
+            let media_text = std::str::from_utf8(&media_text).expect("whole citation byte ranges preserve UTF-8");
+            let media_references = if links.is_empty() {
+                Vec::new().into()
+            } else {
+                rebook_publication::media_references::link_references(media_text)
+                    .into_iter().map(|mut reference| {
+                        reference.range.start += range.start;
+                        reference.range.end += range.start;
+                        reference
+                    })
+                    .filter(|r| {
+                        let mut covered = r.range.start;
+                        for link in &links {
+                            if link.end <= covered { continue; }
+                            if link.start > covered { return false; }
+                            covered = link.end;
+                            if covered >= r.range.end { return true; }
+                        }
+                        false
+                    })
+                    .collect()
+            };
             let region = ShapedTextRegion {
-                media_references: rebook_publication::media_references::link_references(&text.text[range.clone()])
-                    .into_iter().map(|mut r| { r.range.start += range.start; r.range.end += range.start; r })
-                    .filter(|r| links.iter().any(|link| link.start < r.range.end && link.end > r.range.start)).collect(),
+                media_references,
                 citations: Arc::clone(&text.citations),
                 layout: Arc::clone(&text.layout),
                 text: Arc::clone(&text.text),

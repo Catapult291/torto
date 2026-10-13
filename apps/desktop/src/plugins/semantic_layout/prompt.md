@@ -20,7 +20,7 @@ Reject numbers that interrupt a continuing sentence or argument. Increasing numb
 Keep the title unchanged. Do not infer heading levels.
 
 ## Quotations
-Require a standalone borrowed excerpt and an explicit author or work credit in the supplied text.
+Require a standalone borrowed excerpt and an explicit author or work credit in the supplied text, except for the complete authored paragraph groups described below.
 A named work alone can be a credit. Do not infer a source from memory.
 Italics, quotation marks, verse, centering and chapter-opening position do not prove a quotation.
 Reject narrative dialogue, interview answers, speaker names, anonymous sayings, footnote numbers and incidental mentions of people as credits.
@@ -33,7 +33,11 @@ A continuation of quoted speech is not a credit.
 - `quote_inline`: extract the terminal credit under the Schema rules. Copy visible credit text without formatting tags.
   Only this type may split text.
 If the credit association is uncertain, omit the whole new quote.
-For prose/dialogue, use `start` or `justify`, even when the original is centered.
+`paragraph_groups` lists complete authored containers of ordinary paragraphs. Classify their content together using the surrounding narration; a container alone does not prove a quotation.
+For a complete supplied group that clearly contains a borrowed excerpt, `quote` may use every member ID as `body` with `attribution: null` when no credit is supplied. Never invent a credit or select only a fragment of such a group.
+Examples, recognition output, algorithms, logical derivations and ordinary grouped prose remain paragraph groups; return no quote for them. Do not turn their individual lines into headings.
+Keep each member's authored center/end alignment, including when classifying it as a quote; use `alignment: null` for mixed alignment.
+For prose/dialogue outside authored paragraph groups, use `start` or `justify`, even when the original is centered.
 Use `center` for intentionally lineated compact verse or a balanced dedication, not automatic wrapping.
 Use `end` only for clear trailing-edge intent. Use `null` to leave alignment unspecified.
 For existing `quote_missing_attribution` blocks, add only the source credit:

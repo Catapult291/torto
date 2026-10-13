@@ -126,13 +126,36 @@ mod tests {
             .collect();
         matching.sort_by_key(|rule| (rule.specificity, rule.order));
         let mut properties = Properties::new();
-        for rule in matching {
+        for rule in &matching {
             insert_declarations(&mut properties, rule.declarations.iter().cloned());
         }
-        if let Some(inline) = attribute_local(node, "style") {
-            insert_declarations(&mut properties, crate::declarations(inline));
+        let (inline, inline_important) = attribute_local(node, "style")
+            .map(crate::split_declarations).unwrap_or_default();
+        insert_declarations(&mut properties, inline);
+        for rule in &matching {
+            insert_declarations(&mut properties, rule.important_declarations.iter().cloned());
         }
+        insert_declarations(&mut properties, inline_important);
         properties
+    }
+
+    #[test]
+    fn important_priority_precedes_specificity_inline_styles_and_shorthand_order() {
+        let document=Document::parse("<html><body><p id='target' class='center high' style='text-align:right; margin-left:9px; color:blue ! IMPORTANT; font-size:invalid !important'>Text</p><p class='center'>Other</p></body></html>").unwrap();
+        let mut sheet=StyleSheet::default();
+        sheet.add_css(".center {text-align:center !important; margin:1px 2px ! important; color:red !important; font-size:20px !important} #target.high {text-align:left; margin-left:8px; color:green} p {font-size:invalid !important}");
+        let target=document.descendants().find(|n| n.attribute("id")==Some("target")).unwrap();
+        let props=sheet.cascaded_properties(target);
+        assert_eq!(props.get("text-align").unwrap(),"center");
+        assert_eq!(props.get("margin-left").unwrap(),"2px");
+        assert_eq!(props.get("color").unwrap(),"blue");
+        assert_eq!(props.get("font-size").unwrap(),"20px");
+        assert_eq!(*props,linear_properties(&sheet,target));
+        sheet.add_css("#target {text-align:right !important; margin-left:3px !important} .high {text-align:justify !important}");
+        let props=sheet.cascaded_properties(target);
+        assert_eq!(props.get("text-align").unwrap(),"right");
+        assert_eq!(props.get("margin-left").unwrap(),"3px");
+        assert_eq!(*props,linear_properties(&sheet,target));
     }
 
     #[test]

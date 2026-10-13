@@ -21,10 +21,17 @@ fn chars(block: &Block) -> usize {
 pub(crate) fn semantic_units(section: &Section, range: Range<usize>) -> Vec<Range<usize>> {
     let media = |b: &Block| matches!(b, Block::Image(_) | Block::Table(_) | Block::Figure(_));
     let caption = |b: &Block| matches!(b, Block::Text(t) if t.kind == TextBlockKind::Caption);
+    let refs: Vec<_> = section.blocks.iter().collect();
+    let mut group_ends = vec![0; section.blocks.len()];
+    for group in rebook_layout::semantic_paragraph_groups(&refs) {
+        if group.start >= range.start && group.end <= range.end {
+            group_ends[group.start] = group.end;
+        }
+    }
     let mut units = Vec::new();
     let mut start = range.start;
     while start < range.end {
-        let mut end = start + 1;
+        let mut end = group_ends[start].max(start + 1);
         while end < range.end {
             let a = &section.blocks[end - 1];
             let b = &section.blocks[end];
@@ -99,5 +106,13 @@ mod tests {
         let mut s = s;
         s.blocks.swap(1, 2);
         assert_eq!(fixed_batches(&s, 0..3), vec![0..1, 1..3]);
+    }
+
+    #[test]
+    fn authored_paragraph_groups_are_atomic_even_above_the_character_budget() {
+        let mut s=section(vec![text("before", &"a".repeat(4900)),text("one", &"b".repeat(3000)),text("two", &"c".repeat(3000)),text("after","End")]);
+        for b in &mut s.blocks[1..3] { if let Block::Text(t)=b {t.style.paragraph_group=Some(7);} }
+        assert_eq!(fixed_batches(&s,0..4),vec![0..1,1..3,3..4]);
+        assert_eq!(semantic_units(&s,0..4),vec![0..1,1..3,3..4]);
     }
 }

@@ -29,9 +29,13 @@ pub struct HtmlContext {
     headings: HashMap<String, Vec<PublicationUrl>>,
     note_sections: HashSet<String>,
     separator_images: Mutex<HashMap<String, bool>>,
+    font_metadata: crate::font_metadata::FontMetadataCache,
 }
 
 impl HtmlContext {
+    pub(crate) fn font_traits<B: AsRef<[u8]>>(&self, href: &PublicationUrl, load: impl FnOnce() -> Option<B>) -> Option<rebook_html::FontTraits> {
+        self.font_metadata.get(href, load)
+    }
     pub fn new(toc: &[TocEntry], navigation_documents: Vec<PublicationUrl>) -> Self {
         let mut context = Self {
             navigation_documents,

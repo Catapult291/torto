@@ -1080,6 +1080,10 @@ impl Default for Rgba {
 /// Renderer-independent inline presentation and semantic subset.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TextStyle {
+    /// Display-only provenance: translated prose may only link media numbers
+    /// present in its source. Never persist this restriction into authored IR.
+    #[serde(skip)]
+    pub suppress_media_references: bool,
     /// Recognized inline bibliographic citation, numbered within its source paragraph.
     /// The text run retains the original text; only layout collapses its presentation.
     #[serde(default)]
@@ -1131,6 +1135,7 @@ pub struct TextStyle {
 impl Default for TextStyle {
     fn default() -> Self {
         Self {
+            suppress_media_references: false,
             inline_citation: 0,
             footnote_number: 0,
             display_writing_system: None,
@@ -1268,6 +1273,10 @@ pub struct BlockStyle {
     /// Absent for legacy paragraph lists and older serialized content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub list_group: Option<u64>,
+    /// Source-local identity of an authored container of ordinary paragraphs.
+    /// Retains paragraph boundaries and individual alignment after DOM flattening.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paragraph_group: Option<u64>,
     /// Source text scalars occupied by an inferred, already authored list marker.
     /// Inline marker images have zero source length. Retain the original content
     /// so saved locations, selections and translations use unchanged offsets.
@@ -1310,6 +1319,7 @@ impl Default for BlockStyle {
     fn default() -> Self {
         Self {
             reference_owner: None,
+            paragraph_group: None,
             direction: TextDirection::Auto,
             logical_alignment: true,
             list_group: None,

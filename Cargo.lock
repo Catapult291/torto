@@ -4367,6 +4367,7 @@ dependencies = [
  "kurbo",
  "libchm",
  "quick-xml",
+ "read-fonts 0.45.0",
  "rebook-html",
  "rebook-layout",
  "rebook-publication",

@@ -1,5 +1,8 @@
 mod application;
 mod clipboard;
+#[cfg(test)]
+mod egui_alpha_tests;
+mod egui_surface;
 mod gpu;
 mod reader_layers;
 #[cfg(test)]

@@ -33,6 +33,9 @@ fn numbered_prefix(value: &str) -> bool {
 pub(super) fn candidate(block: &Block) -> Option<()> {
     let numeric = number(block).is_some();
     let block = paragraph(block)?;
+    if block.style.paragraph_group.is_some() {
+        return None;
+    }
     let value = text_block_text(block);
     let value = value.trim();
     if value.is_empty() || value.chars().count() > MAX_CHARS {
