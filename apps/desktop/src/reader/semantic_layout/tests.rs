@@ -1646,6 +1646,7 @@ fn splitting_adjacent_paragraphs_keeps_previous_paragraph_geometry_stable() {
                     text: text.into(),
                     style: TextStyle {
                         keyword_size_scale,
+                        inline_size_scale: keyword_size_scale,
                         ..Default::default()
                     },
                     link: None,
@@ -1741,6 +1742,7 @@ fn splitting_and_restoring_visible_paragraph_keeps_all_previous_lines_on_screen(
             text: text.into(),
             style: TextStyle {
                 keyword_size_scale,
+                inline_size_scale: keyword_size_scale,
                 ..Default::default()
             },
             link: None,

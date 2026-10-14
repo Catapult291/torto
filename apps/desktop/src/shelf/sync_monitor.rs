@@ -52,9 +52,7 @@ impl MonitorState {
             refresh = token.is_some() && token != self.schedule.derived_token;
             self.schedule.derived_token = token;
             if refresh {
-                self.schedule.request(SyncMode::Full {
-                    force_statistics: false,
-                });
+                self.schedule.request(SyncMode::Derived);
             }
         }
         let mode = if self.running {
@@ -229,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn derived_changes_queue_full_sync_during_running_work() {
+    fn derived_changes_queue_scoped_sync_during_running_work() {
         let mut state = MonitorState {
             schedule: SyncSchedule::default(),
             running: true,
@@ -245,12 +243,7 @@ mod tests {
         );
         state.running = false;
         let decision = state.observe(probe(None, Some("changed")), now, 0).unwrap();
-        assert_eq!(
-            decision.mode,
-            Some(SyncMode::Full {
-                force_statistics: false
-            })
-        );
+        assert_eq!(decision.mode, Some(SyncMode::Derived));
     }
 
     #[test]

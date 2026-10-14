@@ -51,6 +51,7 @@ pub(crate) enum Icon {
     Send,
     Server,
     Settings,
+    SquarePen,
     Sun,
     Trash2,
     Type,
@@ -59,7 +60,7 @@ pub(crate) enum Icon {
 
 impl Icon {
     #[cfg(test)]
-    const ALL: [Self; 44] = [
+    const ALL: [Self; 45] = [
         Self::Chart,
         Self::AlertCircle,
         Self::BookOpen,
@@ -100,6 +101,7 @@ impl Icon {
         Self::Send,
         Self::Server,
         Self::Settings,
+        Self::SquarePen,
         Self::Sun,
         Self::Trash2,
         Self::Type,
@@ -148,6 +150,7 @@ impl Icon {
             Self::Send => asset!("send"),
             Self::Server => asset!("server"),
             Self::Settings => asset!("settings"),
+            Self::SquarePen => asset!("square-pen"),
             Self::Sun => asset!("sun"),
             Self::Trash2 => asset!("trash-2"),
             Self::Type => asset!("type"),

@@ -1556,7 +1556,7 @@ pub(super) fn validate_translation_image_placeholders(
 
 fn push_translation_style_markup(output: &mut String, run: &TextRun) {
     let mut closing = Vec::new();
-    if let Some(scale) = run.style.keyword_size_scale {
+    if let Some(scale) = translation_size_scale(run.style) {
         let scale = super::numbers::size_attribute(scale);
         output.push_str(&format!("<t-size scale=\"{scale}\">"));
         closing.push("</t-size>");
@@ -1616,6 +1616,15 @@ fn push_translation_style_markup(output: &mut String, run: &TextRun) {
     for close in closing.into_iter().rev() {
         output.push_str(close);
     }
+}
+
+fn translation_size_scale(style: TextStyle) -> Option<f32> {
+    let scale = if style.inline_size_scale.is_some() {
+        Some(style.size_scale)
+    } else {
+        style.keyword_size_scale
+    };
+    scale.filter(|value| value.is_finite() && *value > 0.0)
 }
 
 /// A translated RTL paragraph uses LTR left alignment; other source styles stay intact.
@@ -1824,9 +1833,9 @@ fn replacement_content(text: &str, style: TextStyle, original: Option<&[Inline]>
 }
 
 fn restore_source_sizes(styled: &mut [(String, TextStyle)], original: &[Inline]) {
-    let mut scales = std::collections::HashMap::<u32, Option<f32>>::new();
+    let mut scales = std::collections::HashMap::<u32, Option<(f32, Option<f32>)>>::new();
     for run in original.iter().flat_map(Inline::text_runs) {
-        if let Some(scale) = run.style.keyword_size_scale {
+        if let Some(scale) = translation_size_scale(run.style) {
             let key = super::numbers::size_attribute(scale)
                 .parse::<f32>()
                 .expect("formatted scale parses")
@@ -1834,19 +1843,20 @@ fn restore_source_sizes(styled: &mut [(String, TextStyle)], original: &[Inline])
             scales
                 .entry(key)
                 .and_modify(|saved| {
-                    if *saved != Some(scale) {
+                    if *saved != Some((scale, run.style.inline_size_scale)) {
                         *saved = None;
                     }
                 })
-                .or_insert(Some(scale));
+                .or_insert(Some((scale, run.style.inline_size_scale)));
         }
     }
     for (_, style) in styled {
         if let Some(scale) = style.keyword_size_scale
-            && let Some(Some(original)) = scales.get(&scale.to_bits())
+            && let Some(Some((original, local))) = scales.get(&scale.to_bits())
         {
             style.keyword_size_scale = Some(*original);
             style.size_scale = *original;
+            style.inline_size_scale = *local;
         }
     }
 }
@@ -2014,6 +2024,12 @@ fn neutral_translation_style(fallback: TextStyle, original: &[Inline]) -> TextSt
         .any(|size| size != style.keyword_size_scale)
     {
         style.keyword_size_scale = None;
+    }
+    if original.iter().flat_map(Inline::text_runs)
+        .filter(|run| run.style.baseline == TextBaseline::Normal)
+        .any(|run| run.style.inline_size_scale != style.inline_size_scale)
+    {
+        style.inline_size_scale = None;
     }
     style.bold = false;
     style.italic = false;
@@ -3564,6 +3580,37 @@ mod tests {
             Some(&original),
         );
         assert!(matches!(&translated[0], Inline::Text(run) if run.style.size_scale == 0.8889));
+    }
+
+    #[test]
+    fn translation_preserves_local_size_ratios_without_applying_block_sizes() {
+        let base = 8.0 / 9.0;
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            source: None,
+            style: Default::default(),
+            content: [
+                ("body", base, Some(base), None),
+                ("small", base * 0.85, Some(base), Some(0.85)),
+                ("tiny", base * 0.5, None, Some(0.5)),
+            ].into_iter().map(|(text, size_scale, keyword_size_scale, inline_size_scale)| {
+                Inline::Text(TextRun {
+                    text: text.into(), link: None,
+                    style: TextStyle { size_scale, keyword_size_scale, inline_size_scale, ..Default::default() },
+                })
+            }).collect(),
+        };
+        let markup = translation_text(&block);
+        assert_eq!(markup, "<t-size scale=\"0.8889\">body</t-size><t-size scale=\"0.7556\">small</t-size><t-size scale=\"0.4444\">tiny</t-size>");
+        let translated = replacement_content(&markup, TextStyle::default(), Some(&block.content));
+        for (original, translated) in block.content.iter().zip(&translated) {
+            let (Inline::Text(original), Inline::Text(translated)) = (original, translated) else { panic!("text"); };
+            assert_eq!(original.style.inline_size_scale, translated.style.inline_size_scale);
+            assert_eq!(original.style.size_scale.to_bits(), translated.style.size_scale.to_bits());
+        }
+        assert_eq!(translated.len(), 3);
+        let legacy = replacement_content("unmarked translation", TextStyle::default(), Some(&block.content));
+        assert!(matches!(&legacy[0], Inline::Text(run) if run.style.inline_size_scale.is_none()));
     }
 
     #[test]

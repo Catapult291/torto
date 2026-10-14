@@ -12,6 +12,8 @@ mod cover;
 mod epub;
 mod fb2;
 mod font_metadata;
+#[cfg(test)]
+mod font_size_tests;
 mod html_context;
 mod kf8;
 mod markup;

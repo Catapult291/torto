@@ -6,6 +6,7 @@ use super::{
     node_text, starts_with_caption_identifier,
 };
 
+mod structure;
 #[cfg(test)]
 mod tests;
 
@@ -81,14 +82,10 @@ fn standalone_caption_text(node: Node<'_, '_>) -> bool {
 }
 
 fn annotation(node: Node<'_, '_>, scoped: bool) -> Option<bool> {
-    if !matches!(node.tag_name().name(), "p" | "div" | "caption")
-        || node.descendants().skip(1).any(|child| {
-            child.is_element()
-                && matches!(child.tag_name().name(), "table" | "div" | "p" | "figure")
-        })
-    {
-        return None;
+    if structure::note_parts(node).is_some() {
+        return Some(true);
     }
+    let node = structure::leaf(node)?;
     let text = node_text(node);
     if text.trim().is_empty() {
         return None;
@@ -98,22 +95,6 @@ fn annotation(node: Node<'_, '_>, scoped: bool) -> Option<bool> {
     }
     if !scoped {
         return None;
-    }
-    let lower = text.trim_start().to_ascii_lowercase();
-    if [
-        "note:",
-        "notes:",
-        "source:",
-        "sources:",
-        "注：",
-        "注:",
-        "来源：",
-        "来源:",
-    ]
-    .iter()
-    .any(|prefix| lower.starts_with(prefix))
-    {
-        return Some(true);
     }
     let named = attribute_local(node, "class").is_some_and(|classes| {
         classes.split_ascii_whitespace().any(|class| {
@@ -137,7 +118,7 @@ fn carrier(node: Node<'_, '_>) -> bool {
     }
     if !matches!(
         node.tag_name().name(),
-        "div" | "p" | "figure" | "html" | "body"
+        "div" | "p" | "figure" | "section" | "article" | "html" | "body"
     ) {
         return false;
     }
@@ -294,6 +275,13 @@ impl ReadingIrParser<'_> {
         node: Node<'_, '_>,
         is_note: bool,
     ) -> Vec<TextBlock> {
+        if is_note && let Some(parts) = structure::note_parts(node) {
+            self.queue_node_anchors(node);
+            return parts
+                .into_iter()
+                .flat_map(|part| self.parse_table_annotation_nodes(&[part], true))
+                .collect();
+        }
         self.parse_table_annotation_nodes(&[node], is_note)
     }
 
@@ -305,22 +293,21 @@ impl ReadingIrParser<'_> {
         let node = nodes[0];
         let start = self.blocks.len();
         let style = self.styles.block_style(node, BlockStyle::default());
+        let text_kind = if is_note {
+            TextBlockKind::Paragraph
+        } else {
+            TextBlockKind::Caption
+        };
         let mut collector = InlineCollector::new(false);
         for (index, node) in nodes.iter().copied().enumerate() {
             self.queue_node_anchors(node);
             self.queue_descendant_anchors(node);
             if index > 0 {
-                collector.push_text(
-                    " ",
-                    self.styles
-                        .text_style_for_block(node, TextBlockKind::Caption),
-                    None,
-                );
+                collector.push_text(" ", self.styles.text_style_for_block(node, text_kind), None);
             }
             collect_table_cell_inline(
                 node,
-                self.styles
-                    .text_style_for_block(node, TextBlockKind::Caption),
+                self.styles.text_style_for_block(node, text_kind),
                 None,
                 &InlineParseContext::new(&self.section_href, &self.styles, &self.footnote_links)
                     .with_inline_images(true),
@@ -348,7 +335,7 @@ impl ReadingIrParser<'_> {
         &mut self,
         nodes: &[Node<'_, '_>],
     ) -> Result<Option<usize>, HtmlError> {
-        let scoped = nodes[0].parent().is_some_and(semantic_table_container);
+        let scoped = nodes[0].parent().is_some_and(structure::scoped);
         let mut index = 0;
         let mut before_nodes = Vec::new();
         while index < nodes.len() {
@@ -358,6 +345,15 @@ impl ReadingIrParser<'_> {
                 continue;
             }
             if let Some(note) = annotation(node, scoped) {
+                if !note && let Some(current) = structure::number(&node_text(node)) {
+                    if before_nodes.iter().any(|(previous, previous_note)| {
+                        !previous_note
+                            && structure::number(&node_text(*previous))
+                                .is_some_and(|number| number != current)
+                    }) {
+                        return Ok(None);
+                    }
+                }
                 before_nodes.push((node, note));
                 index += 1;
             } else if before_nodes.len() == 1
@@ -382,11 +378,21 @@ impl ReadingIrParser<'_> {
         }
         if !scoped
             && !before_nodes.is_empty()
-            && nodes[0]
-                .prev_siblings()
-                .skip(1)
-                .find(|node| !ignorable(*node))
-                .is_some_and(carrier)
+            && structure::previous_visible(nodes[0]).is_some_and(carrier)
+            && !before_nodes
+                .iter()
+                .any(|(caption, _)| structure::targets(*caption, nodes[index]))
+            && !self
+                .blocks
+                .last()
+                .and_then(structure::previous_number)
+                .is_some_and(|previous| {
+                    before_nodes.iter().any(|(caption, note)| {
+                        !note
+                            && structure::number(&node_text(*caption))
+                                .is_some_and(|current| current != previous)
+                    })
+                })
         {
             return Ok(None);
         }
@@ -400,7 +406,24 @@ impl ReadingIrParser<'_> {
                 index += 1;
                 continue;
             }
-            if let Some(note) = annotation(node, scoped) {
+            let note = annotation(node, scoped)
+                .or_else(|| structure::marker_note(node, media).then_some(true));
+            if let Some(note) = note {
+                if !note && let Some(next) = structure::following_carrier(node) {
+                    let current_number = before_nodes
+                        .iter()
+                        .filter(|(_, note)| !note)
+                        .find_map(|(node, _)| structure::number(&node_text(*node)));
+                    let suffix = current_number.is_none() && structure::suffix_pattern(node)
+                        || current_number.is_some()
+                            && structure::number(&node_text(node)) == current_number;
+                    if structure::targets(node, next) || !structure::targets(node, media) && !suffix
+                    {
+                        // Leave a new title for the next grid. Notes already
+                        // collected below this grid keep their current owner.
+                        break;
+                    }
+                }
                 after_nodes.push((node, note));
                 index += 1;
                 end = index;
@@ -408,16 +431,11 @@ impl ReadingIrParser<'_> {
                 break;
             }
         }
-        // Between two unscoped carriers, a label could belong to either one.
-        if !scoped && index < nodes.len() && carrier(nodes[index]) {
-            after_nodes.clear();
-            end = nodes.iter().position(|node| *node == media).unwrap() + 1;
-        }
         if before_nodes.is_empty() && after_nodes.is_empty() {
             return Ok(None);
         }
         // Do not infer image tables from a generic caption class alone.
-        if !media.descendants().any(|node| node.has_tag_name("table"))
+        if !structure::native(media)
             && !before_nodes.iter().chain(&after_nodes).any(|(node, _)| {
                 table_label(&node_text(*node)) || has_table_caption_semantics(*node)
             })
@@ -497,15 +515,14 @@ impl ReadingIrParser<'_> {
             table.before = before;
             table.after.extend(after);
             self.blocks.push(Block::Table(table));
-        } else if parsed.len() == 1
-            && matches!(parsed[0], Block::Image(_))
-            && (before.is_empty() || after.is_empty())
-        {
+        } else if parsed.len() == 1 && matches!(parsed[0], Block::Image(_)) {
             let Block::Image(image) = parsed.remove(0) else {
                 unreachable!()
             };
             let position = if before.is_empty() {
                 CaptionPosition::After
+            } else if !after.is_empty() {
+                CaptionPosition::Split(before.len())
             } else {
                 CaptionPosition::Before
             };

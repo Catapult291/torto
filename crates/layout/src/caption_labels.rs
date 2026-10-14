@@ -1,5 +1,74 @@
 //! Presentation-only normalization of numbered figure and table captions.
-use rebook_publication::{Inline, TextRun};
+use rebook_publication::{Inline, TextBlock, TextRun, TextStyle};
+
+pub(super) fn has_hard_break(content: &[Inline]) -> bool {
+    content.iter().any(|inline| match inline {
+        Inline::Break => true,
+        Inline::Text(run) => run.text.contains(['\n', '\r']),
+        Inline::Ruby(run) => run.base.iter().any(|run| run.text.contains(['\n', '\r'])),
+        _ => false,
+    })
+}
+
+fn has_numbered_label(content: &[Inline]) -> bool {
+    let mut text = String::new();
+    for inline in content {
+        match inline {
+            Inline::Text(run) => text.push_str(&run.text),
+            Inline::Ruby(run) => {
+                for run in &run.base {
+                    text.push_str(&run.text);
+                }
+            }
+            Inline::Break => text.push('\n'),
+            // A label cannot span an image or formula.
+            Inline::Image(_) | Inline::Math(_) => text.push('\u{fffc}'),
+        }
+    }
+    text.lines().any(|line| {
+        let prefix = line.split('\u{fffc}').next().unwrap_or_default();
+        label(prefix).is_some() || table_label_only(prefix)
+    })
+}
+
+pub(super) fn preserve_group_bold(captions: &[TextBlock]) -> bool {
+    let compound = captions
+        .iter()
+        .filter(|caption| {
+            caption.content.iter().any(|inline| {
+                matches!(inline, Inline::Image(_) | Inline::Math(_))
+                    || inline
+                        .text_runs()
+                        .iter()
+                        .any(|run| !run.text.trim().is_empty())
+            })
+        })
+        .take(2)
+        .count()
+        > 1;
+    (compound
+        || captions
+            .iter()
+            .any(|caption| has_hard_break(&caption.content)))
+        && !captions
+            .iter()
+            .any(|caption| has_numbered_label(&caption.content))
+}
+
+pub(super) fn preserve_single_bold(content: &[Inline]) -> bool {
+    has_hard_break(content) && !has_numbered_label(content)
+}
+
+pub(super) fn neutral_emphasis(style: &mut TextStyle, preserve_bold: bool) {
+    if !preserve_bold {
+        style.bold = false;
+    }
+    style.italic = false;
+    style.underline = false;
+    style.emphasis = false;
+    style.alternate_voice = false;
+    style.citation = false;
+}
 
 /// A table caption containing its identifier and optional punctuation only.
 pub(super) fn table_label_only(text: &str) -> bool {
@@ -302,6 +371,83 @@ mod tests {
                 expected,
                 "normalizing twice cannot duplicate the gap"
             );
+        }
+    }
+
+    #[test]
+    fn unnumbered_hard_breaks_keep_only_authored_bold_in_unified_captions() {
+        let style = crate::ReaderStyle {
+            typesetting: crate::ReaderTypesetting::unified(),
+            ..Default::default()
+        };
+        let heading = Inline::Text(TextRun {
+            text: "Raw materials".into(),
+            link: None,
+            style: TextStyle {
+                bold: true,
+                italic: true,
+                underline: true,
+                emphasis: true,
+                citation: true,
+                ..Default::default()
+            },
+        });
+        for separator in [Inline::Break, run("\n")] {
+            let block = TextBlock {
+                kind: TextBlockKind::Caption,
+                content: vec![heading.clone(), separator, run("Explanatory prose.")],
+                style: Default::default(),
+                source: None,
+            };
+            let resolved = crate::resolve_text_block(&block, &style, crate::TextContext::Flow);
+            assert_eq!(bold(&resolved.content), "Raw materials");
+            assert!(resolved.content.iter().flat_map(Inline::text_runs).all(
+                |run| !run.style.italic
+                    && !run.style.underline
+                    && !run.style.emphasis
+                    && !run.style.citation
+            ));
+            assert_eq!(bold(&block.content), "Raw materials");
+        }
+        let block = TextBlock {
+            kind: TextBlockKind::Caption,
+            content: vec![
+                heading,
+                run(" Explanatory prose that might wrap naturally."),
+            ],
+            style: Default::default(),
+            source: None,
+        };
+        assert!(
+            bold(&crate::resolve_text_block(&block, &style, crate::TextContext::Flow).content)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn numbered_lines_disable_the_exception_even_after_a_hard_break() {
+        for label in [
+            "Figure 4.4 Description.",
+            "图四 说明。",
+            "表 3.1 内容。",
+            "3.1",
+            "IV",
+        ] {
+            assert!(!preserve_single_bold(&[
+                run("A title"),
+                Inline::Break,
+                run(label)
+            ]));
+            let block = |content| TextBlock {
+                kind: TextBlockKind::Caption,
+                content,
+                style: Default::default(),
+                source: None,
+            };
+            assert!(!preserve_group_bold(&[
+                block(vec![run("A title"), Inline::Break, run("Prose")]),
+                block(vec![run(label)]),
+            ]));
         }
     }
     #[test]

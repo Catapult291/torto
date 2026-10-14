@@ -39,7 +39,10 @@ impl SyncSchedule {
     }
 
     pub fn started(&mut self, mode: SyncMode) {
-        if matches!(mode, SyncMode::Full { .. }) || self.queued == Some(SyncMode::Reading) {
+        if matches!(mode, SyncMode::Full { .. })
+            || self.queued == Some(SyncMode::Reading)
+            || mode == SyncMode::Derived && self.queued == Some(SyncMode::Derived)
+        {
             self.queued = None;
         }
         self.pending_since = None;
@@ -58,6 +61,8 @@ impl SyncSchedule {
                 force_statistics: previous || next,
             },
             (Some(full @ SyncMode::Full { .. }), _) => full,
+            (_, full @ SyncMode::Full { .. }) => full,
+            (Some(SyncMode::Derived), _) | (_, SyncMode::Derived) => SyncMode::Derived,
             (_, mode) => mode,
         });
     }
@@ -70,6 +75,15 @@ impl SyncSchedule {
     ) -> Option<SyncMode> {
         if now < self.retry_after {
             return None;
+        }
+        // A stream of local derived changes must not postpone remote discovery.
+        if now.duration_since(self.last_full) >= FULL_CHECK_INTERVAL
+            && self.queued == Some(SyncMode::Derived)
+        {
+            self.queued = None;
+            return Some(SyncMode::Full {
+                force_statistics: false,
+            });
         }
         if let Some(mode) = self.queued.take() {
             return Some(mode);
@@ -131,6 +145,33 @@ impl SyncSchedule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_work_coalesces_but_cannot_starve_full_discovery() {
+        let mut schedule = SyncSchedule::default();
+        let now = schedule.last_full;
+        schedule.request(SyncMode::Derived);
+        schedule.request(SyncMode::Reading);
+        assert_eq!(schedule.next(now, 0, None), Some(SyncMode::Derived));
+        schedule.completed(SyncMode::Derived, true, now);
+        schedule.request(SyncMode::Derived);
+        assert_eq!(
+            schedule.next(now + FULL_CHECK_INTERVAL, 0, None),
+            Some(SyncMode::Full {
+                force_statistics: false
+            })
+        );
+        schedule.request(SyncMode::Full {
+            force_statistics: true,
+        });
+        schedule.request(SyncMode::Derived);
+        assert_eq!(
+            schedule.next(now + FULL_CHECK_INTERVAL, 0, None),
+            Some(SyncMode::Full {
+                force_statistics: true
+            })
+        );
+    }
 
     #[test]
     fn reading_sync_debounces_but_continuous_turns_cannot_starve_it() {

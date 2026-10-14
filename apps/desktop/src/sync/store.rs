@@ -14,6 +14,8 @@ use super::protocol::{
     PROTOCOL_VERSION, ProgressState, compare_clocks,
 };
 
+mod annotation_merge;
+
 const DATABASE_FILE: &str = "sync-v1.sqlite3";
 const DATABASE_SCHEMA_VERSION: u32 = 2;
 
@@ -160,48 +162,18 @@ impl SyncStore {
 
     pub(crate) fn merge_annotations(&self, annotations: &[AnnotationState]) -> SyncResult<usize> {
         let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
-        let mut changed = 0;
-        for incoming in annotations {
-            incoming_ranges_are_valid(incoming)?;
-            tick(
-                &transaction,
-                &self.device_id,
-                Some(incoming.updated_at.wall_time_ms),
-            )?;
-            match read_annotation(&transaction, &incoming.id)? {
-                None => {
-                    write_annotation(&transaction, incoming)?;
-                    changed += 1;
-                }
-                Some(current) => match compare_clocks(&current.clock, &incoming.clock) {
-                    ClockOrder::Before => {
-                        write_annotation(&transaction, incoming)?;
-                        changed += 1;
-                    }
-                    ClockOrder::After | ClockOrder::Equal => {}
-                    ClockOrder::Concurrent => {
-                        let (winner, loser) = if incoming.updated_at > current.updated_at {
-                            (incoming, &current)
-                        } else {
-                            (&current, incoming)
-                        };
-                        if loser.deleted_at.is_none() && loser.conflict_of.is_none() {
-                            let mut conflict = loser.clone();
-                            conflict.id = conflict_id(loser);
-                            conflict.conflict_of = Some(incoming.id.clone());
-                            if read_annotation(&transaction, &conflict.id)?.is_none() {
-                                write_annotation(&transaction, &conflict)?;
-                            }
-                        }
-                        write_annotation(&transaction, winner)?;
-                        changed += 1;
-                    }
-                },
-            }
-        }
+        let transaction = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = annotation_merge::merge(&transaction, &self.device_id, annotations)?;
         transaction.commit()?;
         Ok(changed)
+    }
+
+    fn compact_annotation_conflicts(&self, book_id: &str) -> SyncResult<usize> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let removed = annotation_merge::compact(&transaction, &self.device_id, book_id)?;
+        transaction.commit()?;
+        Ok(removed)
     }
 
     pub(crate) fn save_progress(&self, book_id: &str, locator: &LocatorV1) -> SyncResult<()> {
@@ -643,6 +615,10 @@ fn mark_reading_changed(
 }
 
 impl HighlightRepository for SyncStore {
+    fn compact_conflicts(&self, book_id: &str) -> HighlightResult<usize> {
+        self.compact_annotation_conflicts(book_id)
+    }
+
     fn highlights_for_book(&self, book_id: &str) -> HighlightResult<Vec<StoredHighlight>> {
         self.annotations_for_book(book_id).map(|annotations| {
             annotations

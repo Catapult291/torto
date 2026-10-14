@@ -618,7 +618,11 @@ impl ShelfFeature {
                         authors: book.authors.clone(),
                         file_name: book.file_name.clone(),
                         path: book.path.clone(),
-                        cover_bytes: book.cover_bytes.clone(),
+                        cover_bytes: if mode == SyncMode::Derived {
+                            None
+                        } else {
+                            book.cover_bytes.clone()
+                        },
                         added_at: book.added_at,
                     })
                     .collect()
@@ -849,7 +853,7 @@ impl ShelfFeature {
         self.sync
             .schedule
             .completed_with_limit(task.mode, success, Instant::now(), message.rate_limit);
-        if matches!(task.mode, SyncMode::Full { .. })
+        if matches!(task.mode, SyncMode::Full { .. } | SyncMode::Derived)
             || message
                 .result
                 .as_ref()
@@ -1087,6 +1091,11 @@ impl ShelfFeature {
                         .layout(egui::Layout::right_to_left(egui::Align::Center)),
                     |ui| {
                         ui.set_clip_rect(ui.clip_rect().intersect(actions_rect));
+                        if interaction_blocked {
+                            // The modal backdrop dims this entire action row.
+                            // Keep disabled actions inert without fading them twice.
+                            ui.visuals_mut().disabled_alpha = 1.0;
+                        }
                         let settings = icon_button(ui, Icon::Settings);
                         if self.sync.settings.enabled
                             && self

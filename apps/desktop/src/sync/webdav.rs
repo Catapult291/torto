@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use quick_xml::Reader;
-use quick_xml::events::Event;
+#[cfg(test)]
+use quick_xml::{Reader, events::Event};
 use reqwest::header::{
     CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, HeaderName, HeaderValue, IF_MATCH,
     IF_NONE_MATCH, LOCATION, RANGE,
@@ -43,6 +43,7 @@ pub(crate) struct WebDavClient {
     next_request: Arc<tokio::sync::Mutex<tokio::time::Instant>>,
     cooldown_until: Arc<AtomicU64>,
     cooldown_loaded: Arc<tokio::sync::OnceCell<()>>,
+    listings: Arc<std::sync::Mutex<super::listing::ListingCache>>,
 }
 
 impl WebDavClient {
@@ -101,6 +102,9 @@ impl WebDavClient {
             next_request: Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now())),
             cooldown_until: Arc::new(AtomicU64::new(0)),
             cooldown_loaded: Arc::new(tokio::sync::OnceCell::new()),
+            listings: Arc::new(std::sync::Mutex::new(
+                super::listing::ListingCache::default(),
+            )),
         })
     }
 
@@ -179,6 +183,9 @@ impl WebDavClient {
     }
 
     pub(crate) fn invalidate_object(&self, path: &str) -> SyncResult<()> {
+        if let Ok(mut listings) = self.listings.lock() {
+            listings.invalidate(path);
+        }
         self.cache.as_ref().map_or(Ok(()), |(store, account)| {
             store.cache_remove(account, &format!("object:{path}"))
         })
@@ -199,6 +206,9 @@ impl WebDavClient {
     }
 
     fn remember_object(&self, path: &str, object: &RemoteObject) -> SyncResult<()> {
+        if let Ok(mut listings) = self.listings.lock() {
+            listings.invalidate(path);
+        }
         if self.cache.is_none() {
             return Ok(());
         }
@@ -258,6 +268,14 @@ impl WebDavClient {
 
     pub(crate) async fn get_optional(&self, path: &str) -> SyncResult<Option<RemoteObject>> {
         let cached = self.cached_object(path)?;
+        if let Some(object) = &cached
+            && self
+                .listings
+                .lock()
+                .is_ok_and(|listing| listing.matches(path, object.etag.as_deref()))
+        {
+            return Ok(cached);
+        }
         let mut request = self.request(Method::GET, self.url(path)?);
         if let Some(etag) = cached.as_ref().and_then(|object| object.etag.as_ref()) {
             request = request.header(IF_NONE_MATCH, etag);
@@ -612,22 +630,42 @@ impl WebDavClient {
         let method = Method::from_bytes(b"PROPFIND")?;
         let body = r#"<?xml version="1.0" encoding="utf-8" ?>
             <d:propfind xmlns:d="DAV:"><d:prop><d:getetag/></d:prop></d:propfind>"#;
+        let directory = self.url(path)?;
         let request = self
-            .request(method, self.url(path)?)
+            .request(method, directory.clone())
             .header(DEPTH, HeaderValue::from_static("1"))
             .header(CONTENT_TYPE, "application/xml; charset=utf-8")
             .body(body);
         let response = self.send(request).await?;
         if response.status() == StatusCode::NOT_FOUND {
+            if let Ok(mut cache) = self.listings.lock() {
+                cache.replace(path, vec![]);
+            }
             return Ok(Vec::new());
         }
         let response = response.error_for_status()?;
         let xml = response.text().await?;
-        let mut names = parse_propfind_hrefs(&xml, &self.root)?
+        let entries: Vec<_> = super::listing::parse(&xml, &directory)?
             .into_iter()
-            .filter_map(|href| href.path_segments()?.next_back().map(str::to_owned))
-            .filter_map(|name| self.logical_json_file_name(name))
+            .filter(|(href, _)| {
+                href.origin() == directory.origin()
+                    && href
+                        .path()
+                        .strip_prefix(directory.path())
+                        .is_some_and(|tail| !tail.is_empty() && !tail.contains('/'))
+            })
+            .filter_map(|(href, tag)| {
+                self.logical_json_file_name(href.path_segments()?.next_back()?.to_owned())
+                    .map(|name| (name, tag))
+            })
+            .collect();
+        let mut names = entries
+            .iter()
+            .map(|(name, _)| name.clone())
             .collect::<Vec<_>>();
+        if let Ok(mut cache) = self.listings.lock() {
+            cache.replace(path, entries);
+        }
         names.sort();
         names.dedup();
         Ok(names)
@@ -716,6 +754,7 @@ fn content_range_start(value: &str) -> Option<u64> {
         .ok()
 }
 
+#[cfg(test)]
 fn parse_propfind_hrefs(xml: &str, base: &Url) -> SyncResult<Vec<Url>> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
@@ -747,6 +786,83 @@ mod tests {
 
     use super::*;
     use crate::sync::CloudProviderKind;
+
+    #[test]
+    fn fresh_directory_etags_skip_unchanged_gets_but_changes_and_missing_tags_fetch() {
+        let server = crate::sync::FakeWebDav::start();
+        let database =
+            std::env::temp_dir().join(format!("torto-etag-{}.sqlite3", uuid::Uuid::new_v4()));
+        let store = SyncStore::open_at(database.clone(), "etag-device").unwrap();
+        let mut settings = SyncSettings::new_device();
+        settings.provider = CloudProviderKind::Custom;
+        settings.base_url = server.base_url();
+        settings.username = "reader".into();
+        let client = WebDavClient::new(&settings, "secret".into())
+            .unwrap()
+            .with_store(store, "etag-account".into());
+        let path = "state/book/devices/peer.json";
+        let physical = format!("/dav/Rebook/v1/{path}");
+        server
+            .objects
+            .lock()
+            .unwrap()
+            .insert(physical.clone(), (b"first".to_vec(), "\"v1\"".into()));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            assert_eq!(
+                client.get_optional(path).await.unwrap().unwrap().bytes,
+                b"first"
+            );
+            server.requests.lock().unwrap().clear();
+            assert_eq!(
+                client.list_json_files("state/book/devices/").await.unwrap(),
+                vec!["peer.json"]
+            );
+            assert_eq!(
+                client.get_optional(path).await.unwrap().unwrap().bytes,
+                b"first"
+            );
+            assert_eq!(
+                server.requests.lock().unwrap().len(),
+                1,
+                "unchanged state needs PROPFIND only"
+            );
+            server
+                .objects
+                .lock()
+                .unwrap()
+                .insert(physical.clone(), (b"second".to_vec(), "\"v2\"".into()));
+            client.list_json_files("state/book/devices/").await.unwrap();
+            assert_eq!(
+                client.get_optional(path).await.unwrap().unwrap().bytes,
+                b"second"
+            );
+            server.omit_listing_etags();
+            client.list_json_files("state/book/devices/").await.unwrap();
+            server.requests.lock().unwrap().clear();
+            assert_eq!(
+                client.get_optional(path).await.unwrap().unwrap().bytes,
+                b"second"
+            );
+            assert_eq!(
+                server.requests.lock().unwrap()[0].0,
+                "GET",
+                "missing validator must still revalidate"
+            );
+            server.objects.lock().unwrap().remove(&physical);
+            assert!(
+                client
+                    .list_json_files("state/book/devices/")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(client.get_optional(path).await.unwrap().is_none());
+        });
+        server.stop();
+        drop(client);
+        std::fs::remove_file(database).unwrap();
+    }
 
     #[test]
     fn rate_limit_survives_client_restart_and_blocks_all_request_kinds() {

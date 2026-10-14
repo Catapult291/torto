@@ -62,6 +62,124 @@ fn table() -> TableBlock {
 }
 
 #[test]
+fn unnumbered_compound_captions_preserve_local_bold_for_figure_and_table_previews() {
+    let source = EmptySource(Book {
+        id: PublicationId::new("caption-bold").unwrap(),
+        metadata: Metadata::default(),
+        cover: None,
+        sections: vec![],
+        table_of_contents: vec![],
+    });
+    let style = ReaderStyle {
+        typesetting: ReaderTypesetting::unified(),
+        ..Default::default()
+    };
+    let mut title = text("Raw materials", TextBlockKind::Caption);
+    title.style.authored_alignment = Some(crate::TextAlignment::End);
+    let Inline::Text(run) = &mut title.content[0] else {
+        unreachable!()
+    };
+    run.style.bold = true;
+    run.style.italic = true;
+    let prose = text(
+        "Impacts associated with obtaining raw materials.",
+        TextBlockKind::Caption,
+    );
+    let captions = vec![title.clone(), prose.clone()];
+    let mut engine = LayoutEngine::new();
+    for width in [90.0, 640.0] {
+        let mut table = table();
+        table.after = captions.clone();
+        let view = presentation(&table, true);
+        let figure = engine
+            .shape_figure_captions(&source, &captions, &style, width, true)
+            .unwrap();
+        let table = engine
+            .shape_captions_with_join(
+                &source,
+                &view.after,
+                &style,
+                width,
+                true,
+                view.join
+                    .filter(|(before, _)| !before)
+                    .map(|(_, index)| index),
+            )
+            .unwrap();
+        for shaped in [&figure, &table] {
+            let runs: Vec<_> = shaped
+                .iter()
+                .flat_map(|(_, block)| block.content.iter().flat_map(Inline::text_runs))
+                .collect();
+            assert_eq!(
+                runs.iter()
+                    .filter(|run| run.style.bold)
+                    .map(|run| run.text.as_str())
+                    .collect::<String>(),
+                "Raw materials"
+            );
+            assert!(runs.iter().all(|run| !run.style.italic));
+            assert!(
+                shaped
+                    .iter()
+                    .any(|(_, block)| block.style.align == crate::TextAlignment::End)
+            );
+        }
+    }
+    assert_eq!(
+        captions,
+        vec![title, prose],
+        "layout must not change the source caption styles"
+    );
+}
+
+#[test]
+fn a_numbered_group_clears_bold_from_unnumbered_hard_break_continuations() {
+    let source = EmptySource(Book {
+        id: PublicationId::new("caption-numbered-bold").unwrap(),
+        metadata: Metadata::default(),
+        cover: None,
+        sections: vec![],
+        table_of_contents: vec![],
+    });
+    let style = ReaderStyle {
+        typesetting: ReaderTypesetting::unified(),
+        ..Default::default()
+    };
+    let mut continuation = text("A bold subtitle", TextBlockKind::Caption);
+    let Inline::Text(run) = &mut continuation.content[0] else {
+        unreachable!()
+    };
+    run.style.bold = true;
+    continuation.content.push(Inline::Break);
+    continuation
+        .content
+        .extend(text("Continuation prose.", TextBlockKind::Caption).content);
+    for label in ["Figure 1. Description.", "表 3.1 内容。"] {
+        let captions = [text(label, TextBlockKind::Caption), continuation.clone()];
+        let shaped = LayoutEngine::new()
+            .shape_figure_captions(&source, &captions, &style, 640.0, true)
+            .unwrap();
+        assert!(
+            shaped[1]
+                .1
+                .content
+                .iter()
+                .flat_map(Inline::text_runs)
+                .all(|run| !run.style.bold)
+        );
+        assert!(
+            shaped[0]
+                .1
+                .content
+                .iter()
+                .flat_map(Inline::text_runs)
+                .any(|run| run.style.bold)
+        );
+    }
+}
+
+#[test]
 fn joined_captions_respect_distinct_author_alignments_and_source_ranges() {
     let source = EmptySource(Book {
         id: PublicationId::new("caption-join-alignment").unwrap(),

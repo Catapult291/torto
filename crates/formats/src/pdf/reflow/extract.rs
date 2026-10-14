@@ -353,14 +353,36 @@ impl Device<'_> for Extractor {
             }
         }
         let bounds = transform.transform_rect_bbox(path.bounding_box());
+        let visible = self
+            .clips
+            .last()
+            .map_or(bounds, |clip| bounds.intersect(*clip));
+        let matrix = transform.as_coeffs();
+        if rectangular_clip(path)
+            && ((matrix[1].abs() < 1e-8 && matrix[2].abs() < 1e-8)
+                || (matrix[0].abs() < 1e-8 && matrix[3].abs() < 1e-8))
+            && rect_is_finite(visible)
+            && visible.width() > 8.0
+            && visible.height() > 8.0
+            && visible.area() < self.page.width * self.page.height * 0.8
+            // Keep one overflow sentinel so dense pages skip the new grouping
+            // path, without retaining/scanning unbounded decorative rectangles.
+            && self.page.enclosures.len() <= 128
+            && !self.page.enclosures.iter().any(|old| {
+                old.iter().zip(array(visible)).all(|(a, b)| (*a - b).abs() < 0.1)
+            })
+        {
+            self.page.enclosures.push(array(visible));
+        }
         // Ignore page backgrounds and tiny ornament strokes. Curved/vector art
         // remains authoritative as an image if it cannot become semantic text.
         if curved
-            && bounds.width() > 4.0
-            && bounds.height() > 4.0
-            && bounds.area() < self.page.width * self.page.height * 0.8
+            && rect_is_finite(visible)
+            && visible.width() > 4.0
+            && visible.height() > 4.0
+            && visible.area() < self.page.width * self.page.height * 0.8
         {
-            self.page.graphics.push(array(bounds));
+            self.page.graphics.push(array(visible));
         }
     }
 }

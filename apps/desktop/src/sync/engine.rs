@@ -19,6 +19,7 @@ use super::webdav::WebDavClient;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SyncMode {
     Reading,
+    Derived,
     Full { force_statistics: bool },
 }
 
@@ -87,6 +88,51 @@ where
     let device = settings.device_id.clone();
     if mode == SyncMode::Reading {
         return sync_changed_reading(&webdav, &store, &settings, &mut progress).await;
+    }
+    if mode == SyncMode::Derived {
+        let mut report = sync_changed_reading(&webdav, &store, &settings, &mut progress).await?;
+        let ids = local_books
+            .into_iter()
+            .map(|book| book.id)
+            .collect::<Vec<_>>();
+        let client = webdav.clone();
+        let ids =
+            tokio::task::spawn_blocking(move || super::derived::pending_book_ids(&client, ids))
+                .await??;
+        if ids.is_empty() {
+            return Ok(report);
+        }
+        let directory = cache_dir.join("derived");
+        let mut data = prepare_derived_data(&webdav, ids, &directory, |stage, completed, total| {
+            progress(SyncProgress::Stage {
+                stage,
+                completed,
+                total,
+            });
+        })
+        .await?;
+        report.derived_operations = data.operation_count();
+        let uploads = data.upload_bytes();
+        let downloads = data.download_bytes();
+        data.execute(
+            &webdav,
+            &directory,
+            SyncStage::Uploading,
+            0,
+            uploads,
+            &mut progress,
+        )
+        .await?;
+        data.execute(
+            &webdav,
+            &directory,
+            SyncStage::Downloading,
+            0,
+            downloads,
+            &mut progress,
+        )
+        .await?;
+        return Ok(report);
     }
     let report = run_sync_with_store(
         settings,
@@ -1002,6 +1048,93 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn unchanged_reading_sync_lists_each_book_without_getting_peer_states_again() {
+        let server = FakeWebDav::start();
+        let settings = test_settings(server.base_url(), "ETag sync");
+        let database = test_database("etag-reading");
+        let store = SyncStore::open_at(database.clone(), settings.device_id.clone()).unwrap();
+        let client = WebDavClient::new(&settings, "secret".into())
+            .unwrap()
+            .with_store(store.clone(), super::super::account_key(&settings));
+        let mut ids = BTreeSet::new();
+        for i in 0..75 {
+            let id = format!("{i:064x}");
+            ids.insert(id.clone());
+            for device in [
+                settings.device_id.as_str(),
+                "peer-a",
+                "peer-b",
+                "peer-c",
+                "peer-d",
+            ] {
+                let state = DeviceBookState {
+                    version: PROTOCOL_VERSION,
+                    book_id: id.clone(),
+                    device_id: device.into(),
+                    updated_at: super::super::protocol::HybridTimestamp {
+                        wall_time_ms: 0,
+                        counter: 0,
+                        device_id: device.into(),
+                    },
+                    progress: None,
+                    annotations: vec![],
+                };
+                server.objects.lock().unwrap().insert(
+                    format!("/dav/Rebook/v1/state/{id}/devices/{device}.json"),
+                    (
+                        serde_json::to_vec(&state).unwrap(),
+                        format!("\"{i}-{device}\""),
+                    ),
+                );
+            }
+        }
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            sync_reading_data(
+                &client,
+                &store,
+                &settings,
+                ids.clone(),
+                &mut SyncReport::default(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+            assert_eq!(server.requests.lock().unwrap().len(), 375);
+            server.requests.lock().unwrap().clear();
+            // A fresh client must reuse persisted objects only after fresh listing validation.
+            let next = WebDavClient::new(&settings, "secret".into())
+                .unwrap()
+                .with_store(store.clone(), super::super::account_key(&settings));
+            sync_reading_data(
+                &next,
+                &store,
+                &settings,
+                ids,
+                &mut SyncReport::default(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        });
+        let requests = server.requests.lock().unwrap().clone();
+        assert_eq!(
+            requests.len(),
+            75,
+            "75 books with 300 peer states require only 75 listings: {requests:?}"
+        );
+        assert!(requests.iter().all(|r| r.0 == "PROPFIND"));
+        println!(
+            "unchanged reading sync: 375 requests on first fetch, {} on repeat with directory validators",
+            requests.len()
+        );
+        server.stop();
+        drop(client);
+        drop(store);
+        fs::remove_file(database).unwrap();
+    }
+
+    #[test]
     fn remote_etag_cache_survives_client_recreation_and_detects_changes() {
         let server = FakeWebDav::start();
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1486,6 +1619,7 @@ pub(super) mod tests {
         range_requests: Arc<AtomicU64>,
         pub(crate) requests: Arc<Mutex<Vec<(String, String, Option<String>)>>>,
         fail_next_put: Arc<AtomicBool>,
+        listing_etags: Arc<AtomicBool>,
         handle: Option<thread::JoinHandle<()>>,
     }
 
@@ -1504,6 +1638,8 @@ pub(super) mod tests {
             let thread_requests = Arc::clone(&requests);
             let fail_next_put = Arc::new(AtomicBool::new(false));
             let thread_fail = Arc::clone(&fail_next_put);
+            let listing_etags = Arc::new(AtomicBool::new(true));
+            let thread_listing_etags = Arc::clone(&listing_etags);
             let handle = thread::spawn(move || {
                 while thread_running.load(Ordering::Acquire) {
                     match listener.accept() {
@@ -1514,6 +1650,7 @@ pub(super) mod tests {
                                 &thread_range_requests,
                                 &thread_requests,
                                 &thread_fail,
+                                &thread_listing_etags,
                             );
                         }
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -1530,12 +1667,17 @@ pub(super) mod tests {
                 range_requests,
                 requests,
                 fail_next_put,
+                listing_etags,
                 handle: Some(handle),
             }
         }
 
         pub(crate) fn base_url(&self) -> String {
             format!("http://{}/dav", self.address)
+        }
+
+        pub(crate) fn omit_listing_etags(&self) {
+            self.listing_etags.store(false, Ordering::Relaxed);
         }
 
         fn paths(&self) -> Vec<String> {
@@ -1567,6 +1709,7 @@ pub(super) mod tests {
         range_requests: &AtomicU64,
         requests: &Mutex<Vec<(String, String, Option<String>)>>,
         fail_next_put: &AtomicBool,
+        listing_etags: &AtomicBool,
     ) {
         stream.set_nonblocking(false).unwrap();
         stream
@@ -1669,7 +1812,13 @@ pub(super) mod tests {
                 for href in hrefs {
                     responses.push_str("<d:response><d:href>");
                     responses.push_str(&href);
-                    responses.push_str("</d:href></d:response>");
+                    responses.push_str("</d:href>");
+                    if listing_etags.load(Ordering::Relaxed) {
+                        responses.push_str("<d:propstat><d:prop><d:getetag>");
+                        responses.push_str(&objects[&href].1);
+                        responses.push_str("</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>");
+                    }
+                    responses.push_str("</d:response>");
                 }
                 let xml = format!(
                     "<?xml version=\"1.0\"?><d:multistatus xmlns:d=\"DAV:\">{responses}</d:multistatus>"

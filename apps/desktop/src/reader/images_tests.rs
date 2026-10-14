@@ -103,6 +103,23 @@ fn interest(request: &DeferredRaster, visible: bool, distance: f64) -> Interest 
     }
 }
 
+// UI cache probes deliberately return None on lock contention. Parallel tests
+// must allow a later frame to observe residency instead of treating one busy
+// probe as lost pixels. Keep the timeout so real failures still fail the test.
+fn when_available<T>(mut probe: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(value) = probe() {
+            return value;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "image stayed unavailable across later probes"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 #[test]
 fn visible_work_precedes_prefetch_and_completion_wakes_the_ui() {
     let (source, requests) = fixture("viewport-priority", 3);
@@ -135,7 +152,7 @@ fn visible_work_precedes_prefetch_and_completion_wakes_the_ui() {
     release.send(()).unwrap();
     woke.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(loader.drain());
-    assert!(requests[1].ready().is_some());
+    let _ = when_available(|| requests[1].ready());
     assert!(requests[0].ready().is_none());
     assert!(requests[2].ready().is_none());
     *source.gate.lock().unwrap() = None;
@@ -274,14 +291,21 @@ fn painting_uses_only_visible_ready_blobs_and_preserves_geometry_and_hits() {
     let pending_scene = desktop.page_scene();
     assert!(pending_scene.images.is_empty());
     let retained = desktop.page_scenes.values().next().unwrap().clone();
-    for request in &requests {
-        request.load(source.as_ref()).unwrap();
-    }
-    let ready_scene = desktop.page_scene();
+    let ready = requests
+        .iter()
+        .map(|request| {
+            request.load(source.as_ref()).unwrap();
+            when_available(|| request.ready())
+        })
+        .collect::<Vec<_>>();
+    let ready_scene = when_available(|| {
+        let scene = desktop.page_scene();
+        (scene.images.len() == 1).then_some(scene)
+    });
     assert_eq!(ready_scene.images.len(), 1);
     assert_eq!(
         ready_scene.images[0].data.id(),
-        requests[0].ready().unwrap().blob.unwrap().id()
+        ready[0].blob.as_ref().unwrap().id()
     );
     assert!(ready_scene.refresh_image_atlas);
     assert!(Arc::ptr_eq(
@@ -289,24 +313,30 @@ fn painting_uses_only_visible_ready_blobs_and_preserves_geometry_and_hits() {
         desktop.page_scenes.values().next().unwrap()
     ));
     desktop.scroll_viewport.as_mut().unwrap().offset_y = 1150.0;
-    let next_scene = desktop.page_scene();
+    let next_scene = when_available(|| {
+        let scene = desktop.page_scene();
+        (scene.images.len() == 1).then_some(scene)
+    });
     assert_eq!(next_scene.images.len(), 1);
     assert_eq!(
         next_scene.images[0].data.id(),
-        requests[1].ready().unwrap().blob.unwrap().id()
+        ready[1].blob.as_ref().unwrap().id()
     );
-    let images = page.paint_image_layer_in(
-        &mut VelloScene::new(&mut scene),
-        0.0,
-        Some(Rect::new(0.0, 150.0, 400.0, 500.0)),
-    );
+    let images = when_available(|| {
+        let images = page.paint_image_layer_in(
+            &mut VelloScene::new(&mut scene),
+            0.0,
+            Some(Rect::new(0.0, 150.0, 400.0, 500.0)),
+        );
+        (images.len() == 1).then_some(images)
+    });
     assert_eq!(images.len(), 1);
-    assert_eq!(
-        images[0].data.id(),
-        requests[0].ready().unwrap().blob.unwrap().id()
-    );
+    assert_eq!(images[0].data.id(), ready[0].blob.as_ref().unwrap().id());
     assert_eq!(page.image_bounds(), bounds);
-    assert!(!page.image_at(50.0, 150.0).unwrap().pixels.is_empty());
+    let _ = when_available(|| {
+        page.image_at(50.0, 150.0)
+            .filter(|hit| !hit.pixels.is_empty())
+    });
     assert_eq!(page.raster_allocations().count(), 0);
 }
 

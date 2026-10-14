@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use rebook_publication::{Block, BookSource, RenditionLayout, SourceRange};
 use rebook_reader::ReaderVisibleTextFragment;
+use crate::async_task::TaskResult;
 
 use super::chat_autocomplete::{
     ChatReference, ChatReferenceKind, build_chat_prompt_with_references,
@@ -64,6 +65,27 @@ impl DesktopReader {
 
     pub(crate) fn complete_pdf_native(&mut self, message: super::PdfNativeTaskMessage) {
         match message {
+            super::PdfNativeTaskMessage::Availability { book_id, job, message } => {
+                if book_id != self.book_id
+                    || self.pdf_ocr.availability_task.in_flight(message.id).is_none_or(|active| active != &job)
+                    || self.pdf_ocr.availability_task.complete(message.id).is_none()
+                {
+                    return;
+                }
+                if self.pdf_ocr.available || self.pdf_ocr.task.is_pending()
+                    || self.pdf_ocr.native_task.is_pending() || self.pdf_ocr.original_task.is_pending()
+                {
+                    return;
+                }
+                match message.result {
+                    Ok(true) => {
+                        self.persist_progress();
+                        self.reopen_requested = Some(self.source_path.clone());
+                    }
+                    Ok(false) => {},
+                    Err(error) => tracing::warn!(%error, "failed to refresh selected PDF text result"),
+                }
+            }
             super::PdfNativeTaskMessage::Progress {
                 book_id,
                 job,
@@ -204,6 +226,23 @@ impl DesktopReader {
         runtime: &tokio::runtime::Runtime,
         proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
     ) {
+        if let Some(request) = self.pdf_ocr.availability_task.take_pending() {
+            let proxy = proxy.clone();
+            let book_id = self.book_id.clone();
+            let job = request.payload;
+            let id = request.id;
+            let worker = runtime.spawn(async move {
+                let probe_book = book_id.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::plugins::pdf_native::selected_result_available(&probe_book)
+                        .map_err(|error| error.to_string())
+                }).await.map_err(|error| error.to_string()).and_then(|result| result);
+                let _ = proxy.send_event(UserEvent::ReaderPdfNative(super::PdfNativeTaskMessage::Availability {
+                    book_id, job, message: TaskResult { id, result },
+                }));
+            });
+            self.pdf_ocr.availability_task.attach_worker(worker);
+        }
         let tick_started = std::time::Instant::now();
         self.tick_semantic_layout(runtime, proxy);
         if tick_started.elapsed().as_millis() >= 100 {
@@ -798,17 +837,13 @@ impl DesktopReader {
         if self.format != rebook_formats::BookFormat::Pdf
             || self.pdf_ocr.available
             || self.pdf_ocr.task.is_pending()
+            || self.pdf_ocr.native_task.is_pending()
+            || self.pdf_ocr.original_task.is_pending()
+            || self.pdf_ocr.availability_task.is_pending()
         {
             return;
         }
-        match crate::plugins::pdf_ocr_result_available(&self.book_id) {
-            Ok(true) => {
-                self.persist_progress();
-                self.reopen_requested = Some(self.source_path.clone());
-            }
-            Ok(_) => {}
-            Err(error) => tracing::warn!(%error, "failed to refresh synced PDF OCR result"),
-        }
+        self.pdf_ocr.availability_task.begin(uuid::Uuid::new_v4().to_string());
     }
 
     pub(super) fn toggle_pdf_ocr_view(&mut self) -> bool {
@@ -1203,6 +1238,7 @@ impl DesktopReader {
         }
         self.search.status = self.language.text("正在搜索…", "Searching…").into();
         self.search.results.clear();
+        self.search.cards.clear();
         self.focused_mark = None;
         self.search.task.begin(SearchTask {
             source: Arc::clone(&self.source),
@@ -1217,6 +1253,7 @@ impl DesktopReader {
         };
         match message.result {
             Ok(results) => {
+                self.search.cards.clear();
                 self.search.status = if results.is_empty() {
                     self.language
                         .text("没有找到匹配内容", "No matches found")
@@ -1236,6 +1273,7 @@ impl DesktopReader {
             }
             Err(error) => {
                 self.search.results.clear();
+                self.search.cards.clear();
                 self.search.status = error;
             }
         }
@@ -2276,12 +2314,14 @@ impl DesktopReader {
         }
     }
 
-    pub(super) fn clear_chat(&mut self) {
+    pub(super) fn start_new_chat(&mut self) {
         if !self.chat.task.is_pending() {
-            self.chat.paste_task.cancel();
-            self.chat.messages.clear();
-            self.chat.pending_annotation_actions.clear();
-            self.chat.error = None;
+            let web_search_enabled = self.chat.web_search_enabled;
+            self.chat = super::ChatUiState::default();
+            self.chat.web_search_enabled = web_search_enabled;
+            self.chat.move_cursor_to_end = true;
+            self.chat_markdown = super::chat_markdown::ChatMarkdownState::default();
+            self.ui.assistant_keyboard_focus = true;
         }
     }
 
@@ -2891,17 +2931,70 @@ fn translated_toc_labels(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn synced_pdf_refresh_coalesces_and_only_reopens_for_current_ready_result() {
+        let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+        reader.format = rebook_formats::BookFormat::Pdf;
+        reader.pdf_ocr.available = false;
+        reader.refresh_synced_pdf_ocr();
+        let job = reader.pdf_ocr.availability_task.active().unwrap().clone();
+        reader.refresh_synced_pdf_ocr();
+        assert_eq!(reader.pdf_ocr.availability_task.active(), Some(&job));
+        let request = reader.pdf_ocr.availability_task.take_pending().unwrap();
+        reader.complete_pdf_native(super::super::PdfNativeTaskMessage::Availability {
+            book_id: reader.book_id.clone(), job: "old reader".into(),
+            message: TaskResult { id: request.id, result: Ok(true) },
+        });
+        assert!(reader.reopen_requested.is_none());
+        assert!(reader.pdf_ocr.availability_task.is_pending());
+        reader.complete_pdf_native(super::super::PdfNativeTaskMessage::Availability {
+            book_id: reader.book_id.clone(), job,
+            message: TaskResult { id: request.id, result: Ok(false) },
+        });
+        assert!(reader.reopen_requested.is_none());
+        assert!(!reader.pdf_ocr.availability_task.is_pending());
+        reader.refresh_synced_pdf_ocr();
+        let request = reader.pdf_ocr.availability_task.take_pending().unwrap();
+        reader.complete_pdf_native(super::super::PdfNativeTaskMessage::Availability {
+            book_id: reader.book_id.clone(), job: request.payload,
+            message: TaskResult { id: request.id, result: Ok(true) },
+        });
+        assert_eq!(reader.reopen_requested, Some(reader.source_path.clone()));
+        reader.pdf_ocr.available = true;
+        reader.refresh_synced_pdf_ocr();
+        assert!(!reader.pdf_ocr.availability_task.is_pending());
+    }
+
+    #[test]
+    #[ignore = "requires TORTO_TEST_EXPIRED_NATIVE_BOOK; verifies selected local cache without changing it"]
+    fn local_expired_native_does_not_refresh_from_other_ocr_result() {
+        let id = std::env::var("TORTO_TEST_EXPIRED_NATIVE_BOOK").unwrap();
+        assert_eq!(crate::plugins::pdf_native::selected(&id), crate::plugins::pdf_native::TextSource::Native);
+        assert!(crate::plugins::pdf_native::open(&id).unwrap().is_none());
+        assert!(crate::plugins::pdf_ocr_result_available(&id).unwrap());
+        assert!(!crate::plugins::pdf_native::selected_result_available(&id).unwrap());
+    }
+
     fn pasted_image() -> crate::plugins::chat_media::PendingChatImage {
         crate::plugins::chat_media::PendingChatImage::from_clipboard(1, 1, 1, vec![7; 4]).unwrap()
     }
 
     #[test]
-    fn cleared_chat_rejects_old_paste_without_clearing_new_request() {
+    fn new_chat_resets_draft_and_rejects_old_paste_without_clearing_new_request() {
         let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
         let session_id = reader.chat.session_id;
+        reader.chat.input = "old draft".into();
+        reader.chat.pending_images.push(pasted_image());
+        reader.chat.web_search_enabled = Some(true);
         let old = reader.chat.paste_task.begin(0);
         reader.chat.paste_task.take_pending();
-        reader.clear_chat();
+        reader.start_new_chat();
+        assert_ne!(reader.chat.session_id, session_id);
+        assert!(reader.chat.input.is_empty());
+        assert!(reader.chat.pending_images.is_empty());
+        assert_eq!(reader.chat.web_search_enabled, Some(true));
+        assert!(reader.chat.move_cursor_to_end);
+        let current_session_id = reader.chat.session_id;
         let current = reader.chat.paste_task.begin(0);
         reader.chat.paste_task.take_pending();
         reader.complete_chat_paste(super::super::ChatPasteMessage {
@@ -2912,7 +3005,7 @@ mod tests {
         assert!(reader.chat.pending_images.is_empty());
         assert!(reader.chat.paste_task.is_pending());
         reader.complete_chat_paste(super::super::ChatPasteMessage {
-            session_id,
+            session_id: current_session_id,
             id: current,
             result: Ok(vec![pasted_image()]),
         });

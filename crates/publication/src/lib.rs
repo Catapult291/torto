@@ -944,6 +944,8 @@ pub enum CaptionPosition {
     Before,
     #[default]
     After,
+    /// A leading caption group and trailing notes, split at this source index.
+    Split(usize),
 }
 
 /// Searchable and selectable text attached to one fixed-layout image page.
@@ -1110,10 +1112,14 @@ pub struct TextStyle {
     pub underline: bool,
     /// Scale relative to the reader's base font size.
     pub size_scale: f32,
-    /// Computed CSS keyword size, retained when unified layout replaces other
-    /// authored sizes. Independent of semantic heading and baseline defaults.
+    /// Computed CSS keyword size from the source. Unified layout does not use
+    /// this absolute size to override its semantic block sizes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keyword_size_scale: Option<f32>,
+    /// Authored inline size relative to its containing text block. Block-level
+    /// and inherited container sizes are excluded, as are baseline defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_size_scale: Option<f32>,
     pub color: Rgba,
     /// Vertical placement relative to the surrounding text baseline.
     #[serde(default)]
@@ -1147,6 +1153,7 @@ impl Default for TextStyle {
             underline: false,
             size_scale: 1.0,
             keyword_size_scale: None,
+            inline_size_scale: None,
             color: Rgba::BLACK,
             baseline: TextBaseline::Normal,
             link_role: LinkRole::Normal,

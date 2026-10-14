@@ -50,6 +50,15 @@ pub(crate) fn select(book_id: &str, source: TextSource) -> io::Result<()> {
     crate::persistence::write_json_atomic(&directory(book_id)?.join("text-source.json"), &source)
 }
 
+/// Match the loader's source selection and cache-version validation. An OCR
+/// result cannot make an expired, selected native generation available.
+pub(crate) fn selected_result_available(book_id: &str) -> io::Result<bool> {
+    match selected(book_id) {
+        TextSource::Native => open(book_id).map(|source| source.is_some()),
+        TextSource::Ocr => super::pdf_ocr::pdf_ocr_result_available(book_id),
+    }
+}
+
 pub(crate) fn open(book_id: &str) -> io::Result<Option<ReflowSource>> {
     let root = directory(book_id)?;
     let bytes = match fs::read(root.join("current.json")) {
@@ -508,6 +517,34 @@ mod tests {
             ),
         ]
     }
+    #[test]
+    fn selected_result_availability_rejects_expired_native_despite_cached_ocr() {
+        let id = uuid::Uuid::new_v4().to_string();
+        import(&id, fixture(&id)).unwrap();
+        select(&id, TextSource::Native).unwrap();
+        assert!(selected_result_available(&id).unwrap());
+        let root = directory(&id).unwrap();
+        let ocr_root = crate::smoke::project_dirs().unwrap().data_local_dir().join("pdf-ocr").join(&id);
+        fs::create_dir_all(&ocr_root).unwrap();
+        crate::persistence::write_json_atomic(&ocr_root.join("document.json"), &serde_json::json!({
+            "version": 1, "book_id": id,
+            "provider": crate::plugins::PdfOcrProviderKind::PaddleOcr,
+            "model": "test", "view_mode": PdfOcrViewMode::Reflow,
+            "pages": [{"markdown": "A cached OCR paragraph."}], "resources": [],
+        })).unwrap();
+        assert!(super::super::pdf_ocr::pdf_ocr_result_available(&id).unwrap());
+        let mut current: Current = serde_json::from_slice(&fs::read(root.join("current.json")).unwrap()).unwrap();
+        current.version = pdf_reflow::VERSION - 1;
+        crate::persistence::write_json_atomic(&root.join("current.json"), &current).unwrap();
+        assert!(!selected_result_available(&id).unwrap(), "unselected OCR must not trigger a reopen loop");
+        select(&id, TextSource::Ocr).unwrap();
+        assert!(selected_result_available(&id).unwrap());
+        fs::remove_file(ocr_root.join("document.json")).unwrap();
+        assert!(!selected_result_available(&id).unwrap());
+        fs::remove_dir_all(ocr_root).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn native_sync_exports_reused_resource_once_without_changing_manifest() {
         let id = uuid::Uuid::new_v4().to_string();

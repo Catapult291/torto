@@ -19,6 +19,182 @@ fn parse(body: &str) -> Section {
 
 const GRID: &str = "<table><tr><td>Value</td><td>42</td></tr></table>";
 
+fn plain(text: &TextBlock) -> String {
+    text.content
+        .iter()
+        .flat_map(|inline| inline.text_runs())
+        .map(|run| run.text.as_str())
+        .collect()
+}
+
+#[test]
+fn consecutive_numbered_tables_keep_their_titles_and_trailing_notes_without_classes() {
+    for class in ["", "unexpected-publisher-name", "tablecaption"] {
+        let section = parse(&format!(
+            "<p class='{class}'>Table 1. First</p>{GRID}<p class='{class}'>Table 2. Objectives</p>{GRID}<p id='source'>Source: Chapanis (1995).</p><p>Following discussion.</p>"
+        ));
+        let [Block::Table(first), Block::Table(second), Block::Text(_)] = &section.blocks[..]
+        else {
+            panic!("{:?}", section.blocks);
+        };
+        assert_eq!(plain(&first.before[0]), "Table 1. First");
+        assert!(first.after.is_empty());
+        assert_eq!(plain(&second.before[0]), "Table 2. Objectives");
+        assert_eq!(plain(&second.after[0]), "Source: Chapanis (1995).");
+        assert_eq!(second.after[0].kind, TextBlockKind::Paragraph);
+        assert_eq!(
+            section.anchors[0].source,
+            second.after[0].source.as_ref().unwrap().start
+        );
+    }
+}
+
+#[test]
+fn sources_stay_with_previous_grid_when_another_numbered_grid_follows() {
+    let section = parse(&format!(
+        "<p>Table 1. First</p>{GRID}<p>Source: First author.</p><p>TABLE 2</p><p>Second results</p>{GRID}<p>Notes: Rounded values.</p>"
+    ));
+    let [Block::Table(first), Block::Table(second)] = &section.blocks[..] else {
+        panic!("{:?}", section.blocks);
+    };
+    assert_eq!(plain(&first.after[0]), "Source: First author.");
+    assert_eq!(plain(&second.before[0]), "TABLE 2 Second results");
+    assert_eq!(plain(&second.after[0]), "Notes: Rounded values.");
+}
+
+#[test]
+fn unscoped_sources_accept_textual_prefixes_and_stop_at_body_or_media() {
+    for prefix in [
+        "Source:",
+        "Sources :",
+        "NOTE:",
+        "Notes：",
+        "Abbreviations:",
+        "来源：",
+        "资料来源:",
+        "注：",
+        "注释：",
+    ] {
+        let section = parse(&format!(
+            "{GRID}<p>{prefix} Values.</p><p>Ordinary discussion.</p>{GRID}"
+        ));
+        let [Block::Table(table), Block::Text(_), Block::Table(_)] = &section.blocks[..] else {
+            panic!("{prefix}: {:?}", section.blocks);
+        };
+        assert_eq!(table.after.len(), 1);
+        assert!(
+            table.after[0]
+                .content
+                .iter()
+                .flat_map(|inline| inline.text_runs())
+                .all(|run| (run.style.size_scale - 1.0).abs() < 0.0001)
+        );
+    }
+}
+
+#[test]
+fn independent_note_container_preserves_paragraphs_alignment_and_source_ranges() {
+    let section = parse(&format!(
+        "{GRID}<footer id='notes'><p id='source' style='text-align:right'>Source: First author.</p><p id='continuation'>Unmarked continuation.</p><p id='note'>Note: Rounded values.</p></footer><p>Ordinary discussion.</p>"
+    ));
+    let [Block::Table(table), Block::Text(_)] = &section.blocks[..] else {
+        panic!("{:?}", section.blocks);
+    };
+    assert_eq!(table.after.len(), 3);
+    assert_eq!(
+        table.after[0].style.authored_alignment,
+        Some(TextAlignment::End)
+    );
+    for (caption, expected) in table.after.iter().zip([
+        "Source: First author.",
+        "Unmarked continuation.",
+        "Note: Rounded values.",
+    ]) {
+        assert_eq!(plain(caption), expected);
+        assert!(caption.source.is_some());
+        assert_eq!(caption.kind, TextBlockKind::Paragraph);
+    }
+    assert_ne!(table.after[0].source, table.after[1].source);
+    assert_eq!(section.anchors.len(), 4);
+}
+
+#[test]
+fn matching_table_superscripts_confirm_definitions_but_unknown_markers_stay_independent() {
+    let grid = "<table><tr><td>Value<sup>a</sup></td><td>42</td></tr></table>";
+    let section = parse(&format!(
+        "{grid}<p><sup>a</sup>Measured value.</p><p><sup>b</sup>Ordinary prose.</p>"
+    ));
+    let [Block::Table(table), Block::Text(_)] = &section.blocks[..] else {
+        panic!("{:?}", section.blocks);
+    };
+    assert_eq!(table.after.len(), 1);
+    assert_eq!(plain(&table.after[0]), "aMeasured value.");
+}
+
+#[test]
+fn explicit_target_resolves_middle_title_without_captioning_the_previous_grid() {
+    let section = parse(
+        "<table id='first'><tr><td>A</td></tr></table><p><a href='#second'>Table 2. Results</a></p><table id='second'><tr><td>B</td></tr></table>",
+    );
+    let [Block::Table(first), Block::Table(second)] = &section.blocks[..] else {
+        panic!("{:?}", section.blocks);
+    };
+    assert!(first.after.is_empty());
+    assert_eq!(plain(&second.before[0]), "Table 2. Results");
+}
+
+#[test]
+fn repeated_post_table_titles_and_explicit_previous_targets_keep_source_order() {
+    let section = parse(&format!(
+        "{GRID}<p>Table 1. First</p>{GRID}<p>Table 2. Second</p><p>Following discussion.</p>"
+    ));
+    let [Block::Table(first), Block::Table(second), Block::Text(_)] = &section.blocks[..] else {
+        panic!("{:?}", section.blocks);
+    };
+    assert_eq!(plain(&first.after[0]), "Table 1. First");
+    assert_eq!(plain(&second.after[0]), "Table 2. Second");
+    let section = parse(
+        "<table id='first'><tr><td>A</td></tr></table><p><a href='#first'>Table 1. Results</a></p><table id='second'><tr><td>B</td></tr></table>",
+    );
+    let [Block::Table(first), Block::Table(second)] = &section.blocks[..] else {
+        panic!("{:?}", section.blocks);
+    };
+    assert_eq!(first.after.len(), 1);
+    assert!(second.before.is_empty());
+}
+
+#[test]
+fn image_table_keeps_leading_title_and_trailing_source_inside_one_group() {
+    let section = parse(
+        "<p>Table 4. Results</p><div><p><img src='table.png'/></p></div><p>Source: First author.</p><p>Following discussion.</p>",
+    );
+    let [Block::Figure(figure), Block::Text(_)] = &section.blocks[..] else {
+        panic!("{:?}", section.blocks);
+    };
+    assert_eq!(figure.caption_position, CaptionPosition::Split(1));
+    assert_eq!(plain(&figure.captions[0]), "Table 4. Results");
+    assert_eq!(plain(&figure.captions[1]), "Source: First author.");
+}
+
+#[test]
+fn unrelated_existing_semantic_blocks_stop_annotation_collection() {
+    for barrier in [
+        "<h2>Note: A new section</h2>",
+        "<aside role='doc-footnote' id='n'><p>Note: Book footnote.</p></aside>",
+        "<blockquote><p>Source: A quotation.</p></blockquote>",
+        "<p><img src='figure.png'/></p>",
+    ] {
+        let section = parse(&format!(
+            "{GRID}<p>Source: First author.</p>{barrier}<p>Ordinary discussion.</p>"
+        ));
+        let Block::Table(table) = &section.blocks[0] else {
+            panic!("table");
+        };
+        assert_eq!(table.after.len(), 1, "{barrier}");
+        assert!(section.blocks.len() >= 3, "{barrier}");
+    }
+}
+
 #[test]
 fn split_table_number_and_title_in_pagination_wrapper_are_captions() {
     let title =

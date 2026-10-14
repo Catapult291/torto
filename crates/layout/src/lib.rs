@@ -2034,9 +2034,21 @@ impl LayoutEngine {
             style.margin_after = 0.0;
             images.push((self.load_raster(source, image)?, style, image));
         }
-        let captions = self.shape_figure_captions(
+        let split = match caption_position {
+            CaptionPosition::Before => figure_captions.len(),
+            CaptionPosition::After => 0,
+            CaptionPosition::Split(index) => index.min(figure_captions.len()),
+        };
+        let before_captions = self.shape_figure_captions(
             source,
-            figure_captions,
+            &figure_captions[..split],
+            reader_style,
+            (content_width - media_start_offset).max(1.0),
+            unified_reflow,
+        )?;
+        let after_captions = self.shape_figure_captions(
+            source,
+            &figure_captions[split..],
             reader_style,
             (content_width - media_start_offset).max(1.0),
             unified_reflow,
@@ -2055,8 +2067,8 @@ impl LayoutEngine {
             .iter()
             .map(|(raster, style, _)| paginator.image_display_size(raster, *style).1)
             .sum::<f32>();
-        let caption_height = captions
-            .iter()
+        let caption_height = before_captions
+            .iter().chain(&after_captions)
             .map(|(prepared, resolved)| {
                 prepared_text_height(prepared)
                     + resolved.style.margin_before.max(0.0)
@@ -2064,10 +2076,10 @@ impl LayoutEngine {
             })
             .sum::<f32>();
         let internal_image_gaps = caption_gap * images.len().saturating_sub(1) as f32;
-        let image_caption_gap = if images.is_empty() || captions.is_empty() {
+        let image_caption_gap = if images.is_empty() {
             0.0
         } else {
-            caption_gap
+            caption_gap * (usize::from(!before_captions.is_empty()) + usize::from(!after_captions.is_empty())) as f32
         };
         paginator.prepare_group(
             image_height + caption_height + internal_image_gaps + image_caption_gap,
@@ -2096,27 +2108,18 @@ impl LayoutEngine {
             }
             Ok(())
         };
-        let push_captions = |paginator: &mut Paginator| -> Result<(), LayoutError> {
-            for (prepared, resolved) in &captions {
-                paginator.push_text(prepared, resolved.as_ref())?;
-            }
-            Ok(())
-        };
-        match caption_position {
-            CaptionPosition::Before => {
-                push_captions(paginator)?;
-                if !captions.is_empty() && !images.is_empty() {
-                    paginator.add_semantic_spacing(caption_gap);
-                }
-                push_images(paginator, self)?;
-            }
-            CaptionPosition::After => {
-                push_images(paginator, self)?;
-                if !captions.is_empty() && !images.is_empty() {
-                    paginator.add_semantic_spacing(caption_gap);
-                }
-                push_captions(paginator)?;
-            }
+        for (prepared, resolved) in &before_captions {
+            paginator.push_text(prepared, resolved.as_ref())?;
+        }
+        if !before_captions.is_empty() && !images.is_empty() {
+            paginator.add_semantic_spacing(caption_gap);
+        }
+        push_images(paginator, self)?;
+        if !after_captions.is_empty() && !images.is_empty() {
+            paginator.add_semantic_spacing(caption_gap);
+        }
+        for (prepared, resolved) in &after_captions {
+            paginator.push_text(prepared, resolved.as_ref())?;
         }
         paginator.ensure_minimum_spacing(outer_gap);
         Ok(())
@@ -2196,6 +2199,7 @@ impl LayoutEngine {
         Ok(rasters)
     }
 
+    #[cfg(test)]
     fn shape_figure_caption<'a>(
         &mut self,
         source: &dyn BookSource,
@@ -2205,19 +2209,50 @@ impl LayoutEngine {
         unified_reflow: bool,
         compound_caption: bool,
     ) -> Result<(PreparedText, Cow<'a, TextBlock>), LayoutError> {
+        self.shape_caption_with_emphasis(
+            source,
+            caption,
+            reader_style,
+            content_width,
+            unified_reflow,
+            compound_caption,
+            None,
+        )
+    }
+
+    fn shape_caption_with_emphasis<'a>(
+        &mut self,
+        source: &dyn BookSource,
+        caption: &'a TextBlock,
+        reader_style: &ReaderStyle,
+        content_width: f32,
+        unified_reflow: bool,
+        compound_caption: bool,
+        preserve_bold: Option<bool>,
+    ) -> Result<(PreparedText, Cow<'a, TextBlock>), LayoutError> {
         let note = caption.kind != TextBlockKind::Caption;
         let mut resolved = if unified_reflow && note {
             let mut text = caption.clone();
             text.kind = TextBlockKind::Caption;
-            let mut resolved =
-                resolve_text_block(&text, reader_style, TextContext::Flow).into_owned();
+            let mut resolved = resolve_text_block_with_caption_emphasis(
+                &text,
+                reader_style,
+                TextContext::Flow,
+                preserve_bold,
+            )
+            .into_owned();
             resolved.style.align = caption
                 .style
                 .authored_alignment
                 .unwrap_or(TextAlignment::Start);
             Cow::Owned(resolved)
         } else {
-            resolve_text_block(caption, reader_style, TextContext::Flow)
+            resolve_text_block_with_caption_emphasis(
+                caption,
+                reader_style,
+                TextContext::Flow,
+                preserve_bold,
+            )
         };
         let authored_alignment = caption_authored_alignment(caption, compound_caption);
         if unified_reflow && !note {
@@ -2278,6 +2313,7 @@ impl LayoutEngine {
             .take(2)
             .count()
             > 1;
+        let preserve_bold = caption_labels::preserve_group_bold(captions);
         let mut index = 0;
         while index < captions.len() {
             let caption = &captions[index];
@@ -2295,9 +2331,18 @@ impl LayoutEngine {
                             || caption.style.logical_alignment == title.style.logical_alignment)
                 })
             {
-                let label = resolve_text_block(caption, reader_style, TextContext::Flow);
-                let title =
-                    resolve_text_block(&captions[index + 1], reader_style, TextContext::Flow);
+                let label = resolve_text_block_with_caption_emphasis(
+                    caption,
+                    reader_style,
+                    TextContext::Flow,
+                    Some(preserve_bold),
+                );
+                let title = resolve_text_block_with_caption_emphasis(
+                    &captions[index + 1],
+                    reader_style,
+                    TextContext::Flow,
+                    Some(preserve_bold),
+                );
                 let mut combined = title.into_owned();
                 combined.style.align =
                     caption_authored_alignment(&captions[index + 1], compound_caption)
@@ -2341,13 +2386,14 @@ impl LayoutEngine {
                 shaped.push((prepared, Cow::Owned(combined)));
                 index += 2;
             } else {
-                shaped.push(self.shape_figure_caption(
+                shaped.push(self.shape_caption_with_emphasis(
                     source,
                     caption,
                     reader_style,
                     content_width,
                     unified_reflow,
                     compound_caption,
+                    Some(preserve_bold),
                 )?);
                 index += 1;
             }
@@ -3772,6 +3818,15 @@ fn resolve_text_block<'a>(
     reader_style: &ReaderStyle,
     context: TextContext,
 ) -> Cow<'a, TextBlock> {
+    resolve_text_block_with_caption_emphasis(block, reader_style, context, None)
+}
+
+fn resolve_text_block_with_caption_emphasis<'a>(
+    block: &'a TextBlock,
+    reader_style: &ReaderStyle,
+    context: TextContext,
+    preserve_caption_bold: Option<bool>,
+) -> Cow<'a, TextBlock> {
     if reader_style.typesetting.mode != TypesettingMode::Unified {
         let generated = block
             .content
@@ -3804,6 +3859,9 @@ fn resolve_text_block<'a>(
         return Cow::Borrowed(block);
     }
 
+    let preserve_caption_bold = block.kind == TextBlockKind::Caption
+        && preserve_caption_bold
+            .unwrap_or_else(|| caption_labels::preserve_single_bold(&block.content));
     let mut resolved = block.clone();
     headings::normalize_internal(&mut resolved);
     let generated_display = matches!(block.content.as_slice(),[Inline::Math(run)] if run.original.is_some() && run.display);
@@ -3961,11 +4019,12 @@ fn resolve_text_block<'a>(
                 // Unified typesetting starts from a neutral decoration layer.
                 // Semantic/application decorations can opt back in explicitly.
                 run.style.underline = false;
-                let text_scale = run
-                    .style
-                    .keyword_size_scale
-                    .filter(|value| value.is_finite() && *value > 0.0)
-                    .unwrap_or(scale);
+                let text_scale = scale
+                    * run
+                        .style
+                        .inline_size_scale
+                        .filter(|value| value.is_finite() && *value > 0.0)
+                        .unwrap_or(1.0);
                 run.style.size_scale = match run.style.baseline {
                     TextBaseline::Normal => text_scale,
                     TextBaseline::Superscript => text_scale * 0.70,
@@ -3990,13 +4049,9 @@ fn resolve_text_block<'a>(
                     run.style.italic = false;
                 }
                 if block.kind == TextBlockKind::Caption {
-                    // Unified captions use neutral prose. Restore emphasis only
-                    // for their numbered labels after clearing authored styles.
-                    run.style.bold = false;
-                    run.style.italic = false;
-                    run.style.emphasis = false;
-                    run.style.alternate_voice = false;
-                    run.style.citation = false;
+                    // Unnumbered structured captions keep authored subheadings.
+                    // Other captions restore only their numbered label below.
+                    caption_labels::neutral_emphasis(&mut run.style, preserve_caption_bold);
                 }
             }
             Inline::Ruby(run) => {
@@ -4005,18 +4060,37 @@ fn resolve_text_block<'a>(
                     .first()
                     .map_or(1.0, |r| r.style.size_scale)
                     .max(0.1);
+                let base_scale = scale
+                    * run
+                        .base
+                        .first()
+                        .and_then(|r| r.style.inline_size_scale)
+                        .filter(|value| value.is_finite() && *value > 0.0)
+                        .unwrap_or(1.0);
                 for base in &mut run.base {
-                    base.style.size_scale = scale;
+                    base.style.size_scale = scale
+                        * base.style.inline_size_scale
+                            .filter(|value| value.is_finite() && *value > 0.0)
+                            .unwrap_or(1.0);
                     base.style.color = Rgba::BLACK;
                     base.style.underline = false;
+                    if block.kind == TextBlockKind::Caption {
+                        caption_labels::neutral_emphasis(&mut base.style, preserve_caption_bold);
+                    }
                     if block.kind.is_heading() {
                         base.style.bold = true;
                     }
                 }
                 for annotation in &mut run.annotation {
                     annotation.style.size_scale =
-                        scale * annotation.style.size_scale / authored_base;
+                        base_scale * annotation.style.size_scale / authored_base;
                     annotation.style.color = Rgba::BLACK;
+                    if block.kind == TextBlockKind::Caption {
+                        caption_labels::neutral_emphasis(
+                            &mut annotation.style,
+                            preserve_caption_bold,
+                        );
+                    }
                 }
             }
             Inline::Math(run) => run.size_scale = scale,
@@ -8095,7 +8169,7 @@ mod tests {
     }
 
     #[test]
-    fn unified_keyword_sizes_override_role_sizes_without_compounding() {
+    fn unified_block_sizes_override_authored_keywords_and_preserve_local_sizes() {
         let style = ReaderStyle {
             typesetting: ReaderTypesetting::unified(),
             ..ReaderStyle::default()
@@ -8106,6 +8180,17 @@ mod tests {
             TextBlockKind::Caption,
             TextBlockKind::Blockquote,
             TextBlockKind::QuoteAttribution,
+            TextBlockKind::Preformatted,
+            TextBlockKind::FootnoteDefinition,
+            TextBlockKind::DefinitionTerm { depth: 0 },
+            TextBlockKind::DefinitionDescription { depth: 0 },
+            TextBlockKind::ListItem {
+                ordered: false,
+                ordinal: 1,
+                depth: 0,
+                marker_visible: true,
+            },
+            TextBlockKind::HeadingOrdinal(2),
         ] {
             for size in [0.6, 0.75, 8.0 / 9.0, 1.0, 1.2, 1.5, 2.0, 3.0, 1.25] {
                 let block = TextBlock {
@@ -8127,7 +8212,21 @@ mod tests {
                     let Inline::Text(run) = &resolved.content[0] else {
                         panic!("text");
                     };
-                    assert_eq!(run.style.size_scale, size);
+                    let expected = if context == TextContext::Table {
+                        style.typesetting.table_font_scale
+                    } else {
+                        match kind {
+                            TextBlockKind::Heading(2) | TextBlockKind::HeadingOrdinal(2) => {
+                                unified_heading_scale(style.typesetting.heading_scale, 2)
+                            }
+                            TextBlockKind::Caption => style.typesetting.caption_font_scale,
+                            TextBlockKind::Blockquote => 0.95,
+                            TextBlockKind::QuoteAttribution => 0.88,
+                            TextBlockKind::Preformatted => 0.9,
+                            _ => 1.0,
+                        }
+                    };
+                    assert_eq!(run.style.size_scale, expected);
                 }
                 assert_eq!(
                     resolve_text_block(&block, &ReaderStyle::default(), TextContext::Flow).content,
@@ -8153,6 +8252,7 @@ mod tests {
                         baseline,
                         size_scale: 0.4,
                         keyword_size_scale: Some(0.75),
+                        inline_size_scale: Some(0.75),
                         ..Default::default()
                     },
                 })
@@ -10551,6 +10651,38 @@ mod tests {
             first.metrics().offset > 0.0,
             "a short unified caption should be centered"
         );
+    }
+
+    #[test]
+    fn image_table_places_caption_before_image_and_notes_after_in_both_modes() {
+        let source = EmptySource {
+            book: Book {
+                id: PublicationId::new("image-table-notes-test").unwrap(),
+                metadata: Metadata::default(), cover: None, sections: Vec::new(), table_of_contents: Vec::new(),
+            },
+        };
+        let text = |value: &str, kind| TextBlock {
+            kind,
+            content: vec![Inline::Text(TextRun { text: value.into(), style: TextStyle::default(), link: None })],
+            style: BlockStyle::default(), source: None,
+        };
+        let block = Block::Figure(rebook_publication::FigureBlock {
+            images: vec![ImageBlock {
+                ocr_text: None, formula_image: false, formula: None,
+                href: PublicationUrl::parse("table.png").unwrap(), alt: "Table".into(),
+                style: ImageStyle::default(), source: None, text_layer: None,
+            }],
+            captions: vec![text("Table 1. Results", TextBlockKind::Caption), text("Source: First author.", TextBlockKind::Paragraph)],
+            caption_position: CaptionPosition::Split(1), style: BlockStyle::default(), source: None,
+        });
+        for typesetting in [ReaderTypesetting::default(), ReaderTypesetting::unified()] {
+            let style = ReaderStyle { typesetting, ..Default::default() };
+            let result = LayoutEngine::new().layout_blocks(&source, std::slice::from_ref(&block), LayoutViewport::new(800, 600).unwrap(), &style).unwrap();
+            let [PageItem::Text(before), PageItem::Image(image), PageItem::Text(after)] = result.pages[0].items.as_slice() else { panic!("caption / image / source"); };
+            assert!(before.text.contains("Table 1"));
+            assert!(after.text.contains("Source:"));
+            assert!(before.origin_y < image.y && image.y + image.height < after.origin_y);
+        }
     }
 
     #[test]

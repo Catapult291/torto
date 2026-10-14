@@ -1,5 +1,6 @@
 //! Local PDF reflow. Intermediate pages live on disk; the PDF and interpreter
 //! caches belong only to the cancellable conversion job, never the reader.
+mod boundaries;
 mod extract;
 mod layout;
 mod paragraphs;
@@ -20,7 +21,7 @@ use rebook_publication::*;
 use serde::{Deserialize, Serialize};
 
 // The revision also isolates semantic/translation caches from older grouping.
-pub const VERSION: u32 = 14;
+pub const VERSION: u32 = 16;
 pub const PAGE_ANCHOR_PREFIX: &str = "pdf-page-";
 pub use quality::{Assessment, TextRoute, assess};
 const MAX_SECTION_BYTES: u64 = 32 * 1024 * 1024;
@@ -182,6 +183,9 @@ struct NativePage {
     image_obstacles: Vec<[f64; 4]>,
     rules: Vec<[f64; 4]>,
     graphics: Vec<[f64; 4]>,
+    /// Closed, axis-aligned graphic frames/backgrounds, excluding page fills.
+    #[serde(default)]
+    enclosures: Vec<[f64; 4]>,
     unmapped: usize,
     invisible: usize,
     #[serde(default)]
@@ -387,9 +391,55 @@ pub fn convert(
             paragraphs::same_page(&mut stored, body_size, &floats);
             resources.extend(regions.iter().map(|region| region.path.clone()));
             let chapter = chapter_pages.contains(&index);
+            if chapter && let Some(previous) = pending.as_mut() {
+                relocate(
+                    &mut stored,
+                    spine_id(book.sections.len() + 1)?,
+                    section_href(book.sections.len() + 1)?,
+                );
+                let prefix_len = outline_labels
+                    .get(&index)
+                    .map_or(0, |labels| boundaries::chapter_prefix_len(&stored, labels));
+                if prefix_len > 0 {
+                    let mut prefix = boundaries::take_prefix(&mut stored, prefix_len);
+                    // Move source ownership, not links to notes that remain on
+                    // the chapter page. Their target already has its final href.
+                    prefix.section.href = previous.section.href.clone();
+                    relocate(
+                        &mut prefix,
+                        previous.section.id.clone(),
+                        previous.section.href.clone(),
+                    );
+                    paragraphs::across_pages(
+                        previous,
+                        &mut prefix,
+                        body_size,
+                        previous_frame,
+                        frame,
+                        &floats,
+                    );
+                    join_page_paragraph(
+                        previous,
+                        &mut prefix,
+                        &page,
+                        body_size,
+                        previous_frame,
+                        frame,
+                    );
+                    previous.section.blocks.append(&mut prefix.section.blocks);
+                    previous.section.anchors.append(&mut prefix.section.anchors);
+                    previous.provenance.append(&mut prefix.provenance);
+                }
+            }
             // One physical page of semantic boundary spill is permitted. Do not
             // retain an arbitrarily long paragraph spanning the whole document.
             if pending.is_some() && (chapter || chunk_pages >= 9) {
+                for anchor in &pending.as_ref().unwrap().section.anchors {
+                    anchor_targets.insert(
+                        anchor.fragment.clone(),
+                        pending.as_ref().unwrap().section.href.clone(),
+                    );
+                }
                 save_section(
                     directory,
                     &mut book,
@@ -409,7 +459,7 @@ pub fn convert(
             for (destination_index, destination) in destinations
                 .iter()
                 .enumerate()
-                .filter(|(_, d)| d.page == index && d.top.is_some())
+                .filter(|(_, d)| d.page == index)
             {
                 let point = publication.pdf.pages()[index]
                     .initial_transform(true)
@@ -418,21 +468,31 @@ pub fn convert(
                         destination.left.unwrap_or(0.0),
                         destination.top.unwrap_or(0.0),
                     );
-                if let Some(slice) = stored.provenance.iter().min_by(|a, b| {
-                    let distance = |s: &SourceSlice| {
-                        (s.rect[1] - point.y).abs() * 4.0
-                            + if destination.left.is_some() {
-                                (s.rect[0] - point.x).abs()
-                            } else {
-                                0.0
-                            }
-                    };
-                    distance(a).total_cmp(&distance(b))
-                }) {
+                let source =
+                    boundaries::heading_source(&stored, &destination.label).or_else(|| {
+                        destination.top.and_then(|_| {
+                            stored
+                                .provenance
+                                .iter()
+                                .min_by(|a, b| {
+                                    let distance = |s: &SourceSlice| {
+                                        (s.rect[1] - point.y).abs() * 4.0
+                                            + if destination.left.is_some() {
+                                                (s.rect[0] - point.x).abs()
+                                            } else {
+                                                0.0
+                                            }
+                                    };
+                                    distance(a).total_cmp(&distance(b))
+                                })
+                                .map(|slice| slice.source.start.clone())
+                        })
+                    });
+                if let Some(source) = source {
                     let fragment = format!("pdf-native-outline-{destination_index}");
                     stored.section.anchors.push(SectionAnchor {
                         fragment: fragment.clone(),
-                        source: slice.source.start.clone(),
+                        source,
                     });
                     outline_targets.insert(
                         (index, destination.label.clone()),
@@ -442,6 +502,28 @@ pub fn convert(
                             .resolve(&format!("#{fragment}"))
                             .map_err(|e| e.to_string())?,
                     );
+                }
+            }
+            if let Some(labels) = outline_labels.get(&index) {
+                for (label_index, (label, _)) in labels.iter().enumerate() {
+                    if outline_targets.contains_key(&(index, label.clone())) {
+                        continue;
+                    }
+                    if let Some(source) = boundaries::heading_source(&stored, label) {
+                        let fragment = format!("pdf-native-heading-{index}-{label_index}");
+                        stored.section.anchors.push(SectionAnchor {
+                            fragment: fragment.clone(),
+                            source,
+                        });
+                        outline_targets.insert(
+                            (index, label.clone()),
+                            stored
+                                .section
+                                .href
+                                .resolve(&format!("#{fragment}"))
+                                .map_err(|e| e.to_string())?,
+                        );
+                    }
                 }
             }
             let href = stored.section.href.clone();
@@ -598,21 +680,35 @@ pub fn convert(
 fn mark_storage_continuations(manifest: &mut Manifest) {
     // Conversion cuts at top-level chapter pages and an eight-page storage
     // budget. Only the latter continues the preceding semantic subsection.
-    // Derive this lightweight hint from the page map so existing generations
-    // also receive it on open without loading sections, provenance or the PDF.
+    // Physical page anchors can belong to the previous chapter's continuation.
+    // Prefer the mapped heading target; retain page-only fallback navigation.
     let chapter_sections = manifest
         .original
         .table_of_contents
         .iter()
-        .filter_map(|entry| entry.href.as_ref())
-        .filter_map(|href| {
-            manifest
-                .original
-                .sections
-                .iter()
-                .position(|section| section.href.path() == href.path())
+        .zip(&manifest.book.table_of_contents)
+        .filter_map(|(original, mapped)| {
+            mapped
+                .href
+                .as_ref()
+                .filter(|href| {
+                    manifest
+                        .book
+                        .sections
+                        .iter()
+                        .any(|section| section.href.path() == href.path())
+                })
+                .or_else(|| {
+                    original.href.as_ref().and_then(|href| {
+                        manifest
+                            .original
+                            .sections
+                            .iter()
+                            .position(|section| section.href.path() == href.path())
+                            .and_then(|page| manifest.page_targets.get(page))
+                    })
+                })
         })
-        .filter_map(|page| manifest.page_targets.get(page))
         .map(|target| target.path().to_owned())
         .collect::<HashSet<_>>();
     for (index, section) in manifest.book.sections.iter_mut().enumerate() {
@@ -1117,6 +1213,13 @@ mod tests {
             );
             assert_eq!(manifest.book.sections[2].properties, ["unrelated-property"]);
         }
+        // A chapter page starts with the preceding section's continuation.
+        // The heading, rather than that physical page anchor, owns the cut.
+        manifest.page_targets[4] = manifest.book.sections[1].href.resolve("#pdf-page-5").unwrap();
+        manifest.book.table_of_contents[0].href = Some(manifest.book.sections[2].href.resolve("#chapter-heading").unwrap());
+        mark_storage_continuations(&mut manifest);
+        assert_eq!(manifest.book.sections[1].properties, ["unrelated-property", CONTINUATION_SECTION_PROPERTY]);
+        assert_eq!(manifest.book.sections[2].properties, ["unrelated-property"]);
     }
 
     fn pdf() -> Vec<u8> {

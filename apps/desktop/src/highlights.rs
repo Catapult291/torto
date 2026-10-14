@@ -40,6 +40,9 @@ impl StoredHighlight {
 }
 
 pub(crate) trait HighlightRepository: Send + Sync {
+    fn compact_conflicts(&self, _book_id: &str) -> HighlightResult<usize> {
+        Ok(0)
+    }
     fn highlights_for_book(&self, book_id: &str) -> HighlightResult<Vec<StoredHighlight>>;
     fn insert_highlight(&self, highlight: &StoredHighlight) -> HighlightResult<()>;
     fn update_highlight(&self, highlight: &StoredHighlight) -> HighlightResult<bool>;
@@ -76,6 +79,10 @@ pub struct HighlightStore {
 }
 
 impl HighlightStore {
+    pub(crate) fn compact_conflicts(&self, book_id: &str) -> HighlightResult<usize> {
+        self.repository.compact_conflicts(book_id)
+    }
+
     pub(crate) fn from_repository(repository: impl HighlightRepository + 'static) -> Self {
         Self {
             repository: Arc::new(repository),

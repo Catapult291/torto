@@ -320,6 +320,96 @@ fn sidebar_resize_and_close_keep_the_selected_source_anchor() {
 }
 
 #[test]
+fn directory_drawer_dims_assistant_divider_and_blocks_its_drag() {
+    let mut reader = reader();
+    reader.toggle_assistant_panel(AssistantPanel::Chat);
+    reader.ui.sidebar_pinned = false;
+    let ctx = egui::Context::default();
+    let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1_200.0, 800.0));
+    let edge = screen.right() - reader.ui.assistant_width;
+    for progress in [0.0, 0.25, 1.0, 0.5, 0.0] {
+        for frame in 0..3 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: vec![egui::Event::PointerMoved(Pos2::new(edge, 200.0))],
+                    ..Default::default()
+                },
+                |ui| {
+                    reader.show_side_panels(ui);
+                    if progress > 0.0 {
+                        reader.floating_sidebar(&ctx, progress);
+                    }
+                    reader.resize_side_panels(&ctx, progress, 1.0, false);
+                },
+            );
+            output.textures_delta.clear();
+            if frame == 0 {
+                continue;
+            }
+            let divider = output
+                .shapes
+                .iter()
+                .position(|shape| {
+                    matches!(&shape.shape, egui::Shape::LineSegment { points, .. }
+                    if (points[0].x - edge).abs() < 0.1
+                        && points[0].y < 50.0 && points[1].y == screen.bottom())
+                })
+                .expect("assistant divider is painted");
+            if progress > 0.0 {
+                let scrim = output
+                    .shapes
+                    .iter()
+                    .position(|shape| {
+                        matches!(&shape.shape, egui::Shape::Rect(rect)
+                        if rect.rect == screen
+                            && rect.fill == Color32::BLACK.gamma_multiply(0.31 * progress))
+                    })
+                    .expect("directory backdrop is painted");
+                assert!(
+                    divider < scrim,
+                    "divider must be underneath the directory backdrop"
+                );
+                assert_ne!(
+                    output.platform_output.cursor_icon,
+                    egui::CursorIcon::ResizeHorizontal
+                );
+            }
+        }
+    }
+    let original_width = reader.ui.assistant_width;
+    for (point, pressed) in [
+        (Pos2::new(edge, 200.0), Some(true)),
+        (Pos2::new(700.0, 200.0), None),
+        (Pos2::new(700.0, 200.0), Some(false)),
+    ] {
+        let mut events = vec![egui::Event::PointerMoved(point)];
+        if let Some(pressed) = pressed {
+            events.push(egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                reader.show_side_panels(ui);
+                reader.floating_sidebar(&ctx, 1.0);
+                reader.resize_side_panels(&ctx, 1.0, 1.0, false);
+            },
+        );
+        output.textures_delta.clear();
+        assert_eq!(reader.ui.assistant_width, original_width);
+    }
+}
+
+#[test]
 fn sidebar_divider_drag_is_clamped_to_leave_room_for_text() {
     let mut reader = reader();
     reader.toggle_assistant_panel(AssistantPanel::Chat);

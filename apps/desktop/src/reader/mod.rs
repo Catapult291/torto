@@ -87,6 +87,7 @@ mod interaction;
 mod navigation;
 pub(super) mod render;
 mod semantic_layout;
+mod search_results;
 mod settings_controller;
 #[cfg(test)]
 mod sidebar_navigation_tests;
@@ -421,6 +422,16 @@ pub(crate) fn open_reader_staged(
             &mut highlight_store,
             revision.as_deref(),
         );
+    }
+    // Opening preparation runs in the background. Compact only related conflict
+    // copies after range repairs so identical source positions can converge too.
+    match highlight_store.compact_conflicts(&book_id) {
+        Ok(removed) if removed > 0 => {
+            highlights = highlight_store.for_book(&book_id);
+            tracing::info!(%book_id, removed, "compacted duplicate annotation conflicts");
+        }
+        Err(error) => tracing::warn!(%error, "failed to compact annotation conflicts"),
+        _ => {}
     }
     let highlights_ms = highlights_started.elapsed().as_secs_f32() * 1_000.0;
     let mut style = ReaderStyle {
@@ -3859,6 +3870,7 @@ struct SearchUiState {
     query: String,
     focus_input: bool,
     results: Vec<BookSearchResult>,
+    cards: search_results::SearchResults,
     status: String,
     task: TaskSlot<SearchTask>,
 }
@@ -4101,6 +4113,11 @@ struct PdfNativeTask {
 }
 
 pub(crate) enum PdfNativeTaskMessage {
+    Availability {
+        book_id: String,
+        job: String,
+        message: TaskResult<bool>,
+    },
     Progress {
         book_id: String,
         job: String,
@@ -4129,6 +4146,7 @@ struct PdfOcrUiState {
     task: TaskSlot<PdfOcrTask>,
     original_task: TaskSlot<PdfOriginalTask>,
     native_task: TaskSlot<PdfNativeTask>,
+    availability_task: TaskSlot<String>,
     native_progress: String,
     retired_sources: Vec<crate::plugins::RetiredPdfSource>,
     retired_rasters: Option<(String, bool)>,
@@ -4143,6 +4161,7 @@ impl PdfOcrUiState {
             task: TaskSlot::default(),
             original_task: TaskSlot::default(),
             native_task: TaskSlot::default(),
+            availability_task: TaskSlot::default(),
             native_progress: String::new(),
             retired_sources: Vec::new(),
             retired_rasters: None,

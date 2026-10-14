@@ -15,9 +15,7 @@ use super::{
     ImagePressCandidate, MOTION_EPSILON, ReaderOverlay, SelectedImage, SidebarTab,
     focus_scroll_content_height, focus_unit_screen_center_y, focus_unit_target_offset_for_rect,
 };
-use crate::plugins::{
-    BookSearchResult, ChatCommand, ChatRole, PdfOcrViewMode, chat_command_suggestions,
-};
+use crate::plugins::{ChatCommand, ChatRole, PdfOcrViewMode, chat_command_suggestions};
 use crate::preferences::{AppLanguage, AppTheme};
 use crate::settings::ReaderSettingsChange;
 use crate::ui::{
@@ -447,13 +445,23 @@ fn focus_assistant_sidebar_width(viewport_width: f32, preferred: f32) -> Option<
     })
 }
 
-fn panel_resize_pointer(ctx: &egui::Context, id: &'static str, edge_x: f32) -> Option<f32> {
+fn panel_resize_pointer(
+    ctx: &egui::Context,
+    id: &'static str,
+    edge_x: f32,
+    covered_by_drawer: bool,
+) -> Option<f32> {
     #[cfg(not(target_os = "windows"))]
     let viewport = ctx.content_rect();
     #[cfg(target_os = "windows")]
     let viewport = crate::app::window_chrome::body_rect(ctx);
     let response = egui::Area::new(id.into())
-        .order(egui::Order::Foreground)
+        .fade_in(false)
+        .order(if covered_by_drawer {
+            egui::Order::Background
+        } else {
+            egui::Order::Foreground
+        })
         .fixed_pos(Pos2::new(
             edge_x - PANEL_RESIZE_HANDLE_WIDTH / 2.0,
             viewport.top(),
@@ -461,12 +469,16 @@ fn panel_resize_pointer(ctx: &egui::Context, id: &'static str, edge_x: f32) -> O
         .show(ctx, |ui| {
             let (rect, response) = ui.allocate_exact_size(
                 Vec2::new(PANEL_RESIZE_HANDLE_WIDTH, viewport.height()),
-                egui::Sense::drag(),
+                if covered_by_drawer { egui::Sense::hover() } else { egui::Sense::drag() },
             );
-            let response = response.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
-            let stroke = if response.dragged() {
+            let response = if covered_by_drawer {
+                response
+            } else {
+                response.on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
+            };
+            let stroke = if !covered_by_drawer && response.dragged() {
                 egui::Stroke::new(2.0, palette().accent)
-            } else if response.hovered() {
+            } else if !covered_by_drawer && response.hovered() {
                 egui::Stroke::new(1.0, palette().muted)
             } else {
                 egui::Stroke::new(1.0, palette().border)
@@ -476,6 +488,9 @@ fn panel_resize_pointer(ctx: &egui::Context, id: &'static str, edge_x: f32) -> O
             response
         })
         .inner;
+    if covered_by_drawer {
+        return None;
+    }
     response
         .dragged()
         .then(|| response.interact_pointer_pos().map(|position| position.x))
@@ -1171,6 +1186,21 @@ impl DesktopReader {
                         .inner_margin(egui::Margin::symmetric(ASSISTANT_SIDE_PADDING, 0)),
                 )
                 .show(root_ui, |ui| {
+                    let header = Rect::from_min_size(
+                        Pos2::new(
+                            ui.max_rect().left() - f32::from(ASSISTANT_SIDE_PADDING),
+                            ui.max_rect().top(),
+                        ),
+                        Vec2::new(
+                            ui.max_rect().width() + 2.0 * f32::from(ASSISTANT_SIDE_PADDING),
+                            TOOLBAR_HEIGHT,
+                        ),
+                    );
+                    ui.painter().rect_filled(
+                        header,
+                        0.0,
+                        color32(self.reader.style().background),
+                    );
                     if ui.rect_contains_pointer(ui.max_rect())
                         && ui.input(|input| input.pointer.any_pressed())
                     {
@@ -1208,6 +1238,7 @@ impl DesktopReader {
                 ctx,
                 "reader-sidebar-resize",
                 viewport.left() + self.ui.sidebar_display_width,
+                false,
             ) {
                 self.ui.sidebar_width =
                     (pointer_x - viewport.left()).clamp(SIDEBAR_MIN_WIDTH, sidebar_max);
@@ -1236,6 +1267,7 @@ impl DesktopReader {
                 ctx,
                 "reader-assistant-resize",
                 viewport.right() - assistant_width,
+                !self.ui.sidebar_pinned && sidebar_progress > 0.001,
             ) {
                 self.ui.assistant_width =
                     (viewport.right() - pointer_x).clamp(ASSISTANT_MIN_WIDTH, assistant_max);
@@ -3932,40 +3964,25 @@ impl DesktopReader {
                     .color(palette().muted),
             );
         }
-        let results = self.search.results.clone();
         ui.add_space(4.0);
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for result in results {
-                    if search_result_card(ui, &result, self.language).clicked() {
-                        self.go_to_search_result(&result);
-                    }
-                    ui.add_space(6.0);
-                }
-            });
+        let clicked = self
+            .search
+            .cards
+            .show(ui, &self.search.results, self.language);
+        if let Some(result) = clicked
+            .and_then(|index| self.search.results.get(index))
+            .cloned()
+        {
+            self.go_to_search_result(&result);
+        }
     }
 
     fn assistant(&mut self, ui: &mut egui::Ui) {
-        #[cfg(not(target_os = "windows"))]
-        self.assistant_header(ui);
-        #[cfg(target_os = "windows")]
-        {
-            let (row, _) = ui.allocate_exact_size(
-                Vec2::new(ui.available_width(), TOOLBAR_HEIGHT),
-                egui::Sense::hover(),
-            );
-            let right = (ui.ctx().content_rect().right()
-                - crate::app::window_chrome::reserve_width(ui.ctx())
-                - TOOLBAR_CONTROL_SIZE
-                - 12.0)
-                .min(row.right());
-            let rect = Rect::from_min_max(
-                row.min,
-                Pos2::new(right.max(row.left() + 1.0), row.bottom()),
-            );
-            crate::app::window_chrome::bounded_ui(ui, rect, |ui| self.assistant_header(ui));
-        }
+        ui.allocate_exact_size(
+            Vec2::new(ui.available_width(), TOOLBAR_HEIGHT),
+            egui::Sense::hover(),
+        );
+        self.assistant_actions(ui);
 
         let busy = self.chat.task.is_pending();
         // The rows below the transcript are measured rather than predicted:
@@ -3992,30 +4009,26 @@ impl DesktopReader {
         }
     }
 
-    fn assistant_header(&mut self, ui: &mut egui::Ui) {
+    fn assistant_actions(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
         let width = ui.available_width();
-        let header = ui.allocate_ui_with_layout(
-            Vec2::new(width, TOOLBAR_HEIGHT),
+        ui.allocate_ui_with_layout(
+            Vec2::new(width, TOOLBAR_CONTROL_SIZE),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_enabled_ui(!self.chat.messages.is_empty(), |ui| {
-                        if icon_button(ui, Icon::Trash2)
-                            .on_hover_text(self.language.text("清空", "Clear"))
+                    ui.add_enabled_ui(!self.chat.task.is_pending(), |ui| {
+                        if icon_button(ui, Icon::SquarePen)
+                            .on_hover_text(self.language.text("发起新对话", "New conversation"))
                             .clicked()
                         {
-                            self.clear_chat();
+                            self.start_new_chat();
                         }
                     });
                 });
             },
         );
-        ui.painter().hline(
-            header.response.rect.left()..=header.response.rect.right(),
-            header.response.rect.bottom(),
-            egui::Stroke::new(1.0, palette().border),
-        );
-        ui.add_space(10.0);
+        ui.add_space(6.0);
     }
 
     fn assistant_conversation(&mut self, ui: &mut egui::Ui, height: f32, busy: bool) {
@@ -6080,77 +6093,6 @@ fn focus_actions_overlay_y(note_open: bool, anchor_y: f32, viewport: Rect) -> f3
     )
 }
 
-fn search_result_card(
-    ui: &mut egui::Ui,
-    result: &BookSearchResult,
-    language: AppLanguage,
-) -> egui::Response {
-    let width = ui.available_width().max(1.0);
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 76.0), egui::Sense::click());
-    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
-    let fill = if response.is_pointer_button_down_on() || response.hovered() {
-        palette().surface_muted
-    } else {
-        palette().surface
-    };
-    let stroke = if response.hovered() {
-        egui::Stroke::new(1.0, palette().accent.gamma_multiply(0.4))
-    } else {
-        egui::Stroke::new(1.0, palette().border)
-    };
-    ui.painter()
-        .rect(rect, 7.0, fill, stroke, egui::StrokeKind::Inside);
-
-    let heading = search_result_heading(result, language);
-    let content_rect = rect.shrink2(Vec2::new(10.0, 8.0));
-    ui.scope_builder(
-        egui::UiBuilder::new()
-            .max_rect(content_rect)
-            .layout(egui::Layout::left_to_right(egui::Align::Center)),
-        |ui| {
-            ui.vertical(|ui| {
-                ui.set_max_width(ui.available_width());
-                ui.spacing_mut().item_spacing.y = 3.0;
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(heading)
-                                .size(crate::ui::scaled_font_size(11.0))
-                                .strong()
-                                .color(palette().muted),
-                        )
-                        .truncate(),
-                    );
-                });
-                let mut excerpt_job = egui::text::LayoutJob::default();
-                RichText::new(&result.excerpt)
-                    .size(crate::ui::scaled_font_size(12.0))
-                    .color(palette().text)
-                    .append_to(
-                        &mut excerpt_job,
-                        ui.style(),
-                        egui::FontSelection::Default,
-                        egui::Align::Center,
-                    );
-                excerpt_job.wrap.max_width = ui.available_width();
-                excerpt_job.wrap.max_rows = 2;
-                ui.add(egui::Label::new(excerpt_job).wrap());
-            });
-        },
-    );
-    response
-}
-
-fn search_result_heading(result: &BookSearchResult, language: AppLanguage) -> String {
-    let section = result.section_title.trim();
-    let section = if section.is_empty() {
-        language.text("正文", "Text")
-    } else {
-        section
-    };
-    section.to_owned()
-}
-
 fn selection_popover_frame(inner_margin: i8) -> egui::Frame {
     egui::Frame::new()
         .fill(palette().surface)
@@ -7999,6 +7941,23 @@ mod reference_suggestion_label_tests {
                             },
                         );
                         output.textures_delta.clear();
+                        if assistant {
+                            let panel = egui::containers::panel::PanelState::load(
+                                &ctx,
+                                egui::Id::new("reader-assistant"),
+                            )
+                            .unwrap()
+                            .outer_rect;
+                            assert!(output.shapes.iter().any(|shape| {
+                                matches!(&shape.shape, egui::Shape::Rect(rect)
+                                    if rect.rect.left() <= panel.left()
+                                        && (rect.rect.right() - width).abs() < 0.01
+                                        && rect.rect.top() == panel.top()
+                                        && rect.rect.height() == TOOLBAR_HEIGHT
+                                        && rect.fill == color32(reader.reader.style().background))
+                            }), "assistant header matches the page and caption background");
+                        }
+                        output.textures_delta.clear();
                     }
                     let geometry = window_chrome::geometry(&ctx);
                     let caption_left = width - window_chrome::reserve_width(&ctx);
@@ -8054,13 +8013,13 @@ mod reference_suggestion_label_tests {
                             "right toggle stays outside the assistant column"
                         );
                         assert!(
-                            geometry
+                            !geometry
                                 .excluded
                                 .iter()
                                 .any(|rect| rect.left() >= assistant_left
                                     && rect.right() <= menu.left()
                                     && rect.top() < TOOLBAR_HEIGHT),
-                            "assistant header controls stay on their own column row"
+                            "assistant actions belong below the header"
                         );
                     }
                 }

@@ -1,5 +1,82 @@
 use super::*;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires TORTO_REFLOW_TEST_PDF pointing to the local Designing Type PDF"]
+    fn local_designing_type_visual_groups() {
+        let path = std::env::var_os("TORTO_REFLOW_TEST_PDF").expect("local PDF path");
+        let publication = crate::pdf::open(fs::read(path).unwrap(), "local-probe.pdf").unwrap();
+        let tags = extract::structure_tags(&publication.pdf);
+        for index in [12, 13, 14] {
+            let page = extract::page(&publication.pdf, index, &tags);
+            let (stored, crops) = build(
+                &page,
+                index,
+                10.0,
+                &HashSet::new(),
+                &mut Statistics::default(),
+            )
+            .unwrap();
+            assert_eq!(crops.len(), if index == 14 { 3 } else { 1 }, "{crops:?}");
+            if index != 14 {
+                let mut ids = crops[0].image_sources.clone();
+                ids.sort_unstable();
+                assert_eq!(
+                    ids,
+                    if index == 12 {
+                        vec![0, 1]
+                    } else {
+                        vec![0, 1, 2]
+                    }
+                );
+                let Block::Figure(figure) = &stored.section.blocks[0] else {
+                    panic!("shared description must be editable outside composite");
+                };
+                assert_eq!(figure.captions.len(), 1);
+                let caption = figure.captions[0]
+                    .content
+                    .iter()
+                    .filter_map(|i| {
+                        if let Inline::Text(t) = i {
+                            Some(t.text.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<String>();
+                assert!(
+                    caption.starts_with(if index == 12 {
+                        "IBM Plex"
+                    } else {
+                        "Neue was commissioned"
+                    }),
+                    "{caption}"
+                );
+            }
+            assert_eq!(stored.provenance.len(), page.glyphs.len());
+            assert_eq!(
+                stored
+                    .provenance
+                    .iter()
+                    .map(|p| p.original_glyph)
+                    .collect::<HashSet<_>>()
+                    .len(),
+                page.glyphs.len()
+            );
+            eprintln!(
+                "VISUAL_GROUP_AUDIT page={} crops={} glyphs={} sources={:?}",
+                index + 1,
+                crops.len(),
+                page.glyphs.len(),
+                crops.iter().map(|c| &c.image_sources).collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
 fn subfigure_label(line: &Line) -> Option<char> {
     let text = line.text();
     let mut chars = text.trim().chars();

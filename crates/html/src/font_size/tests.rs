@@ -153,6 +153,62 @@ fn body_keywords_do_not_replace_implicit_heading_sizes() {
     );
 }
 
+#[test]
+fn unified_inline_sizes_exclude_block_keywords_and_preserve_local_ratios() {
+    let runs = paragraph_runs(
+        r#"<html style="font-size:150%"><body style="font-size:large"><p style="font-size:small">body<br/><span>inherited</span><br/><span style="font-size:inherit">inherit</span><br/><span style="font-size:x-small">local keyword<br/><em>nested inheritance</em></span><br/><span style="font-size:0.5em">relative<br/><span style="font-size:larger">nested relative</span></span><br/><span style="font-size:12px">absolute</span><br/><small>small</small><br/><big>big</big><br/><small style="font-size:inherit">reset</small></p></body></html>"#,
+    );
+    let base = 8.0 / 9.0;
+    let expected = [
+        1.0,
+        1.0,
+        1.0,
+        0.75 / base,
+        0.75 / base,
+        0.5,
+        0.6,
+        0.75 / base,
+        0.85,
+        1.2,
+        1.0,
+    ];
+    assert_eq!(runs.len(), expected.len());
+    for (run, expected) in runs.iter().zip(expected) {
+        assert!(
+            (run.style.inline_size_scale.unwrap_or(1.0) - expected).abs() < 0.0001,
+            "{}",
+            run.text
+        );
+    }
+}
+
+#[test]
+fn baseline_defaults_are_not_counted_as_local_font_size_changes() {
+    let runs = paragraph_runs(
+        r#"<html><body><p style="font-size:x-small">normal<br/><sup>sup</sup><br/><sub>sub</sub><br/><sup style="font-size:smaller">explicit</sup></p><h2 style="font-size:large">heading<br/><span style="font-size:smaller">local heading</span></h2></body></html>"#,
+    );
+    for (run, expected) in runs.iter().zip([1.0, 1.0, 1.0, 1.0 / 1.2, 1.0, 1.0 / 1.2]) {
+        assert!(
+            (run.style.inline_size_scale.unwrap_or(1.0) - expected).abs() < 0.0001,
+            "{}",
+            run.text
+        );
+    }
+    assert_eq!(runs.len(), 6);
+}
+
+#[test]
+fn whole_block_wrappers_establish_the_base_and_keep_nested_size_contrasts() {
+    let runs = paragraph_runs(
+        r#"<html><body><p><span style="font-size:small">wrapped <span style="font-size:smaller">local</span></span></p><h2><b><span style="font-size:x-small">whole heading</span></b></h2><p>before <span style="font-size:small"><em>partial</em></span> after</p></body></html>"#,
+    );
+    let expected = [1.0, 1.0 / 1.2, 1.0, 1.0, 8.0 / 9.0, 1.0];
+    assert_eq!(runs.len(), expected.len());
+    for (run, expected) in runs.iter().zip(expected) {
+        assert!((run.style.inline_size_scale.unwrap_or(1.0) - expected).abs() < 0.0001, "{}", run.text);
+    }
+}
+
 /// Extracted EPUB resources, with XHTML sanitized like the EPUB import path
 /// (external DOCTYPE removed, named HTML entities expanded). Each book directory
 /// lists resource-relative XHTML paths in chapters.txt. No book content is stored

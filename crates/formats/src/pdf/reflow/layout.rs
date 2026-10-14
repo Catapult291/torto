@@ -3,6 +3,7 @@ use std::collections::HashSet;
 mod chrome;
 mod figures;
 mod headings;
+mod visual_groups;
 pub(super) use chrome::Detector as ChromeDetector;
 
 #[derive(Clone)]
@@ -726,11 +727,9 @@ pub(super) fn build(
         }
         merge_regions(&mut regions, body * 0.5);
         if !regions.is_empty() {
-            figures::group_subfigures(
-                &mut regions,
-                &lines(page.glyphs.iter().filter(|g| remaining[g.index]).cloned()),
-                body,
-            );
+            let graphic_prose = lines(page.glyphs.iter().filter(|g| remaining[g.index]).cloned());
+            visual_groups::group(&mut regions, &graphic_prose, page, &objects, body);
+            figures::group_subfigures(&mut regions, &graphic_prose, body);
         }
         for region in regions {
             let rect = region.bounds.inflate(2.0, 2.0).intersect(Rect::new(
@@ -963,9 +962,20 @@ fn continues(previous: &Line, next: &Line, body: f64) -> bool {
 // Keep this exception local to text directly following a real image.
 fn is_figure_caption(builder: &Builder, paragraph: &[Line]) -> bool {
     matches!(builder.section.blocks.last(), Some(Block::Image(_)))
-        && paragraph
-            .first()
-            .is_some_and(|line| caption_prefix_len(&line.text()).is_some())
+        && paragraph.first().is_some_and(|line| {
+            caption_prefix_len(&line.text()).is_some()
+                || builder.crops.last().is_some_and(|crop| {
+                    // Unnumbered small-print descriptions under a composite
+                    // artwork retain editable text outside its bitmap.
+                    crop.image_sources.len() >= 2
+                        && line.heading(builder.body).is_none()
+                        && line.size <= builder.body * 0.9
+                        && line.rect.y0 >= crop.bounds.y1 - 0.5
+                        && line.rect.y0 - crop.bounds.y1 <= builder.body * 2.5
+                        && line.rect.x1 > crop.bounds.x0
+                        && line.rect.x0 < crop.bounds.x1
+                })
+        })
 }
 
 fn figure_caption_continues(paragraph: &[Line], next: &Line, body: f64) -> bool {
@@ -973,7 +983,10 @@ fn figure_caption_continues(paragraph: &[Line], next: &Line, body: f64) -> bool 
         return false;
     };
     let Some(prefix) = caption_prefix_len(&first.text()) else {
-        return false;
+        return next.heading(body).is_none()
+            && caption_prefix_len(&next.text()).is_none()
+            && (first.size - next.size).abs() <= body * 0.035
+            && continues(paragraph.last().unwrap(), next, first.size);
     };
     let previous = paragraph.last().unwrap();
     let mut offset = 0;
@@ -1450,7 +1463,10 @@ fn attach_captions(blocks: &mut Vec<Block>) {
                 })
                 .collect::<String>();
             let plain = plain.trim_start().to_lowercase();
-            plain.starts_with("figure ") || plain.starts_with("fig.") || plain.starts_with('图')
+            text.kind == TextBlockKind::Caption
+                || plain.starts_with("figure ")
+                || plain.starts_with("fig.")
+                || plain.starts_with('图')
         } else {
             false
         };

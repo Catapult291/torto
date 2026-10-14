@@ -177,6 +177,28 @@ where
     Ok(PreparedDerivedData { uploads, downloads })
 }
 
+/// Reactive updates inspect only locally changed books. Periodic full sync still
+/// discovers remote-only updates, even when this device has no dirty markers.
+pub(crate) fn pending_book_ids(
+    webdav: &WebDavClient,
+    book_ids: Vec<String>,
+) -> SyncResult<Vec<String>> {
+    let mut pending = Vec::new();
+    for book_id in book_ids {
+        for kind in [
+            DerivedDataKind::Ocr,
+            DerivedDataKind::Metadata,
+            DerivedDataKind::NativePdf,
+        ] {
+            if is_dirty(webdav, &book_id, kind)? {
+                pending.push(book_id);
+                break;
+            }
+        }
+    }
+    Ok(pending)
+}
+
 pub(crate) struct PreparedDerivedData {
     uploads: Vec<DerivedOperation>,
     downloads: Vec<DerivedOperation>,
@@ -933,6 +955,54 @@ fn require_unchanged(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reactive_sync_selects_only_unacknowledged_local_changes_for_this_account() {
+        let database =
+            std::env::temp_dir().join(format!("derived-scope-{}.sqlite3", uuid::Uuid::new_v4()));
+        let store = crate::sync::SyncStore::open_at(database.clone(), "derived-device").unwrap();
+        let mut settings = crate::sync::SyncSettings::new_device();
+        settings.provider = crate::sync::CloudProviderKind::Custom;
+        settings.base_url = "http://127.0.0.1:1".into();
+        settings.username = "reader".into();
+        let client = WebDavClient::new(&settings, "secret".into())
+            .unwrap()
+            .with_store(store.clone(), "first-account".into());
+        let first = sha256(uuid::Uuid::new_v4().as_bytes());
+        let last = sha256(uuid::Uuid::new_v4().as_bytes());
+        let unchanged = sha256(uuid::Uuid::new_v4().as_bytes());
+        let ids = vec![first.clone(), unchanged, last.clone()];
+        mark_derived_dirty(&first, DerivedDataKind::Metadata).unwrap();
+        mark_derived_dirty(&last, DerivedDataKind::Ocr).unwrap();
+        assert_eq!(
+            pending_book_ids(&client, ids.clone()).unwrap(),
+            vec![first.clone(), last.clone()]
+        );
+        let revision = read_dirty_revision(&first, DerivedDataKind::Metadata).unwrap();
+        acknowledge_derived(&client, &first, DerivedDataKind::Metadata, &revision).unwrap();
+        assert_eq!(
+            pending_book_ids(&client, ids.clone()).unwrap(),
+            vec![last.clone()]
+        );
+        let other = WebDavClient::new(&settings, "secret".into())
+            .unwrap()
+            .with_store(store.clone(), "second-account".into());
+        assert_eq!(
+            pending_book_ids(&other, ids.clone()).unwrap(),
+            vec![first.clone(), last.clone()]
+        );
+        mark_derived_dirty(&first, DerivedDataKind::Metadata).unwrap();
+        assert_eq!(
+            pending_book_ids(&client, ids).unwrap(),
+            vec![first.clone(), last.clone()]
+        );
+        fs::remove_file(dirty_marker_path(&first, DerivedDataKind::Metadata).unwrap()).unwrap();
+        fs::remove_file(dirty_marker_path(&last, DerivedDataKind::Ocr).unwrap()).unwrap();
+        drop(other);
+        drop(client);
+        drop(store);
+        fs::remove_file(database).unwrap();
+    }
 
     #[test]
     fn native_archive_rejects_paths_outside_the_generation_and_unknown_entries() {

@@ -11,6 +11,8 @@ pub struct BookSearchResult {
     pub section_index: usize,
     pub section_title: String,
     pub excerpt: String,
+    /// UTF-8 byte range of this occurrence within `excerpt`, not source offsets.
+    pub excerpt_match: std::ops::Range<usize>,
     pub matched_text: String,
     pub block_kind: String,
     pub range: SourceRange,
@@ -65,17 +67,14 @@ fn search_sections(
                     };
                     let text = text_block_text(cell);
                     for found in matcher.find_iter(&text) {
-                        let range =
-                            text_block_match_range(cell, found.start(), found.end());
+                        let range = text_block_match_range(cell, found.start(), found.end());
+                        let (excerpt, excerpt_match) =
+                            excerpt(&text, found.start(), found.end(), DEFAULT_CONTEXT_CHARS);
                         results.push(BookSearchResult {
                             section_index,
                             section_title: section_title.clone(),
-                            excerpt: excerpt(
-                                &text,
-                                found.start(),
-                                found.end(),
-                                DEFAULT_CONTEXT_CHARS,
-                            ),
+                            excerpt,
+                            excerpt_match,
                             matched_text: found.as_str().to_owned(),
                             block_kind: "table-cell".into(),
                             range,
@@ -105,15 +104,13 @@ fn search_sections(
                         };
                         let text = text_block_text(child);
                         for found in matcher.find_iter(&text) {
+                            let (excerpt, excerpt_match) =
+                                excerpt(&text, found.start(), found.end(), DEFAULT_CONTEXT_CHARS);
                             results.push(BookSearchResult {
                                 section_index,
                                 section_title: section_title.clone(),
-                                excerpt: excerpt(
-                                    &text,
-                                    found.start(),
-                                    found.end(),
-                                    DEFAULT_CONTEXT_CHARS,
-                                ),
+                                excerpt,
+                                excerpt_match,
                                 matched_text: found.as_str().to_owned(),
                                 block_kind: text_block_kind(child).to_owned(),
                                 range: text_block_match_range(child, found.start(), found.end()),
@@ -144,11 +141,16 @@ fn search_sections(
             for found in matcher.find_iter(&text) {
                 let range = if let Block::Text(block) = block {
                     text_block_match_range(block, found.start(), found.end())
-                } else { source_range_for_match(source_range, &text, found.start(), found.end()) };
+                } else {
+                    source_range_for_match(source_range, &text, found.start(), found.end())
+                };
+                let (excerpt, excerpt_match) =
+                    excerpt(&text, found.start(), found.end(), DEFAULT_CONTEXT_CHARS);
                 results.push(BookSearchResult {
                     section_index,
                     section_title: section_title.clone(),
-                    excerpt: excerpt(&text, found.start(), found.end(), DEFAULT_CONTEXT_CHARS),
+                    excerpt,
+                    excerpt_match,
                     matched_text: found.as_str().to_owned(),
                     block_kind: block_kind.clone(),
                     range,
@@ -300,7 +302,12 @@ fn text_block_match_range(block: &TextBlock, byte_start: usize, byte_end: usize)
     }
 }
 
-fn excerpt(text: &str, start: usize, end: usize, context_chars: usize) -> String {
+fn excerpt(
+    text: &str,
+    start: usize,
+    end: usize,
+    context_chars: usize,
+) -> (String, std::ops::Range<usize>) {
     let context_start = text[..start]
         .char_indices()
         .rev()
@@ -310,11 +317,86 @@ fn excerpt(text: &str, start: usize, end: usize, context_chars: usize) -> String
         .char_indices()
         .nth(context_chars)
         .map_or(text.len(), |(index, _)| end + index);
-    format!(
+    // Only inspect bounded context around the occurrence, even for very large
+    // OCR paragraphs. Do not split decimal numbers or common abbreviations.
+    let sentence_start = text[context_start..start]
+        .char_indices()
+        .rev()
+        .find(|(at, ch)| sentence_end(text, context_start + at, *ch))
+        .map(|(at, ch)| context_start + at + ch.len_utf8());
+    let sentence_end = text[end..context_end]
+        .char_indices()
+        .find(|(at, ch)| sentence_end(text, end + at, *ch))
+        .map(|(at, ch)| end + at + ch.len_utf8());
+    let context_start = sentence_start.unwrap_or(context_start);
+    let context_end = sentence_end.unwrap_or(context_end);
+    let fragment = &text[context_start..context_end];
+    let trimmed = fragment.trim();
+    let leading_space = fragment.len() - fragment.trim_start().len();
+    let prefix = if context_start > 0 && sentence_start.is_none() {
+        "…"
+    } else {
+        ""
+    };
+    let excerpt = format!(
         "{}{}{}",
-        if context_start > 0 { "…" } else { "" },
-        text[context_start..context_end].trim(),
-        if context_end < text.len() { "…" } else { "" }
+        prefix,
+        trimmed,
+        if context_end < text.len() && sentence_end.is_none() {
+            "…"
+        } else {
+            ""
+        }
+    );
+    let match_start = prefix.len() + start - context_start - leading_space;
+    (excerpt, match_start..match_start + end - start)
+}
+
+fn sentence_end(text: &str, at: usize, ch: char) -> bool {
+    if matches!(
+        ch,
+        '。' | '！' | '？' | '!' | '?' | '\n' | '\r' | ';' | '；'
+    ) {
+        return true;
+    }
+    if ch != '.' {
+        return false;
+    }
+    let next = text[at + 1..].chars().next();
+    if next.is_some_and(|ch| !ch.is_whitespace() && !matches!(ch, '"' | '\'' | '”' | '’' | ')'))
+    {
+        return false;
+    }
+    let token: String = text[..at]
+        .chars()
+        .rev()
+        .take(12)
+        .take_while(|ch| ch.is_ascii_alphabetic() || *ch == '.')
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    if token.len() == 1 && token.chars().all(|ch| ch.is_ascii_uppercase()) {
+        return false;
+    }
+    !matches!(
+        token.to_ascii_lowercase().as_str(),
+        "mr" | "mrs"
+            | "ms"
+            | "dr"
+            | "prof"
+            | "fig"
+            | "eq"
+            | "e.g"
+            | "i.e"
+            | "etc"
+            | "vs"
+            | "no"
+            | "st"
+            | "al"
+            | "vol"
+            | "pp"
+            | "p"
     )
 }
 
@@ -419,6 +501,15 @@ mod tests {
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].matched_text, "Systems");
+        assert_eq!(
+            &results[0].excerpt[results[0].excerpt_match.clone()],
+            "Systems"
+        );
+        assert_eq!(
+            &results[1].excerpt[results[1].excerpt_match.clone()],
+            "systems"
+        );
+        assert!(results[1].excerpt_match.start > results[0].excerpt_match.start);
         assert_eq!(results[0].block_kind, "paragraph");
         assert_eq!(results[0].range.start.text_offset, 4);
         assert_eq!(results[0].range.end.text_offset, 11);
@@ -499,6 +590,47 @@ mod tests {
 
     #[test]
     fn excerpt_keeps_unicode_boundaries_and_context() {
-        assert_eq!(excerpt("alpha beta gamma", 6, 10, 2), "…a beta g…");
+        assert_eq!(
+            excerpt("alpha beta gamma", 6, 10, 2),
+            ("…a beta g…".into(), 5..9)
+        );
+    }
+
+    #[test]
+    fn preview_prefers_the_sentence_containing_this_occurrence() {
+        let text = "人们会产生五花八门的联想。人工纤维织物只能承受低温清洗。下一句不应该出现。";
+        let start = text.find("纤维").unwrap();
+        let (preview, matched) = excerpt(text, start, start + "纤维".len(), 72);
+        assert_eq!(preview, "人工纤维织物只能承受低温清洗。");
+        assert_eq!(&preview[matched], "纤维");
+    }
+
+    #[test]
+    fn preview_keeps_abbreviations_decimals_and_exact_repeated_occurrences() {
+        let text = "Previous sentence. Dr. Myers uses Fig. 4.4 and e.g. a value of 3.14 to describe reading. Next sentence.";
+        let start = text.find("reading").unwrap();
+        let (preview, matched) = excerpt(text, start, start + 7, 100);
+        assert_eq!(
+            preview,
+            "Dr. Myers uses Fig. 4.4 and e.g. a value of 3.14 to describe reading."
+        );
+        assert_eq!(&preview[matched], "reading");
+        let text = "纤维和纤维有区别。";
+        let start = text.rfind("纤维").unwrap();
+        let (preview, matched) = excerpt(text, start, start + "纤维".len(), 72);
+        assert_eq!(matched.start, "纤维和".len());
+        assert_eq!(&preview[matched], "纤维");
+    }
+
+    #[test]
+    fn preview_context_is_bounded_and_utf8_safe_for_large_paragraphs() {
+        let text = format!("{}纤维{}", "长🙂".repeat(10_000), "字👩‍💻".repeat(10_000));
+        let start = text.find("纤维").unwrap();
+        let (preview, matched) = excerpt(&text, start, start + "纤维".len(), 72);
+        assert!(preview.chars().count() <= 72 * 2 + 4);
+        assert!(preview.starts_with('…') && preview.ends_with('…'));
+        assert_eq!(&preview[matched], "纤维");
+        let (preview, matched) = excerpt("  words\tkeyword\twords  ", 8, 15, 72);
+        assert_eq!(&preview[matched], "keyword");
     }
 }

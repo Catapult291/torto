@@ -80,6 +80,7 @@ mod tests {
             image_obstacles: vec![[2.0, 3.0, 4.0, 5.0]],
             rules: vec![[3.0, 4.0, 5.0, 6.0]],
             graphics: vec![[4.0, 5.0, 6.0, 7.0]],
+            enclosures: vec![[3.0, 4.0, 8.0, 9.0]],
             unmapped: 1,
             invisible: 2,
             headings: vec![NativeHeading {

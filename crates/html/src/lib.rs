@@ -2985,8 +2985,14 @@ fn collect_inline_node_with_block_boundaries(
             style.citation = true;
         }
         "u" => style.underline = true,
-        "small" => style.size_scale *= 0.85,
-        "big" => style.size_scale *= 1.2,
+        "small" => {
+            style.size_scale *= 0.85;
+            style.inline_size_scale = Some(style.inline_size_scale.unwrap_or(1.0) * 0.85);
+        }
+        "big" => {
+            style.size_scale *= 1.2;
+            style.inline_size_scale = Some(style.inline_size_scale.unwrap_or(1.0) * 1.2);
+        }
         "sup" => {
             style.baseline = TextBaseline::Superscript;
             style.size_scale *= 0.75;
@@ -2997,9 +3003,16 @@ fn collect_inline_node_with_block_boundaries(
         }
         _ => {}
     }
-    context
-        .styles
-        .apply_text_node(node, &mut style, inherited.size_scale);
+    if is_block_boundary(&name) {
+        context
+            .styles
+            .apply_text_node(node, &mut style, inherited.size_scale);
+        style.inline_size_scale = None;
+    } else {
+        context
+            .styles
+            .apply_inline_text_node(node, &mut style, inherited);
+    }
     if name == "span" {
         let classes = attribute_local(node, "class").unwrap_or_default();
         if classes
@@ -3063,7 +3076,7 @@ fn collect_ruby(
     let mut style = inherited;
     context
         .styles
-        .apply_text_node(node, &mut style, inherited.size_scale);
+        .apply_inline_text_node(node, &mut style, inherited);
     let below = context
         .styles
         .cascaded_properties(node)
@@ -3978,6 +3991,32 @@ impl StyleSheet {
         }
     }
 
+    fn apply_inline_text_node(
+        &self,
+        node: Node<'_, '_>,
+        style: &mut TextStyle,
+        inherited: TextStyle,
+    ) {
+        self.apply_text_node(node, style, inherited.size_scale);
+        let properties = self.cascaded_properties(node);
+        if inherited.size_scale > 0.0
+            && let Some(size) = properties
+                .get("font-size")
+                .and_then(|value| FontSize::parse(value))
+                .and_then(|size| {
+                    size.resolve(inherited.size_scale, self.root_font_size.unwrap_or(1.0))
+                })
+        {
+            let relative = inherited.inline_size_scale.unwrap_or(1.0) * size / inherited.size_scale;
+            if relative.is_finite() {
+                // An explicit declaration replaces small/big's default on this
+                // element, while nested declarations retain their local ratio.
+                style.inline_size_scale = (relative != 1.0 && !font_size_covers_block(node))
+                    .then_some(relative);
+            }
+        }
+    }
+
     fn cascaded_properties(&self, node: Node<'_, '_>) -> Rc<HashMap<String, String>> {
         if let Some(properties) = self.cascaded_cache.borrow().get(node.id()) {
             return properties;
@@ -4003,6 +4042,24 @@ impl StyleSheet {
             .insert(node.id(), Rc::clone(&properties));
         properties
     }
+}
+
+/// An inline wrapper around all content establishes the block's authored base
+/// size, rather than a local size contrast within that block.
+fn font_size_covers_block(mut node: Node<'_, '_>) -> bool {
+    while let Some(parent) = node.parent().filter(Node::is_element) {
+        if parent.children().any(|sibling| sibling != node
+            && (node_has_visible_text(sibling)
+                || sibling.is_element() && matches!(sibling.tag_name().name(), "img" | "image" | "ruby")))
+        {
+            return false;
+        }
+        if is_block_boundary(&parent.tag_name().name().to_ascii_lowercase()) {
+            return true;
+        }
+        node = parent;
+    }
+    false
 }
 
 impl SimpleSelector {
