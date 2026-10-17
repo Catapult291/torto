@@ -2,6 +2,51 @@ use rebook_publication::{Block, Inline, TextBlockKind};
 
 #[test]
 #[ignore = "requires TORTO_BARRIERS_BOOK local EPUB"]
+fn local_barriers_table_figure_padding_and_focus_surface() {
+    use anyrender::ImageRenderer;
+    use rebook_layout::{LayoutEngine, LayoutViewport, PageItem, ReaderFontBlob, ReaderStyle, ReaderTypesetting, SpreadMode};
+    let opened = rebook_formats::open_file(std::env::var("TORTO_BARRIERS_BOOK").unwrap()).unwrap();
+    let source = opened.source();
+    let index = source.book().sections.iter().position(|s| s.href.to_string().ends_with("chapter-5.xhtml")).unwrap();
+    let section = source.parse_section(index).unwrap();
+    let first = section.blocks.iter().position(|block| matches!(block, Block::Figure(f) if f.caption_blocks().any(|t| {
+        let text = t.content.iter().flat_map(Inline::text_runs).map(|r| r.text.as_str()).collect::<String>();
+        text.starts_with("Figure 5.3")
+    }))).unwrap();
+    let figures: Vec<_> = section.blocks[first..].iter().filter(|block| matches!(block, Block::Figure(_))).take(3).collect();
+    assert_eq!(figures.len(), 3);
+    let style = ReaderStyle { typesetting: ReaderTypesetting::unified(), spread: SpreadMode::Single, ..Default::default() };
+    let mut engine = LayoutEngine::with_fonts([ReaderFontBlob::new(std::sync::Arc::new(include_bytes!("../../../assets/fonts/Literata-opsz-wght.ttf").as_slice().to_vec()))]);
+    for (index, figure) in figures.into_iter().enumerate() {
+        let layout = engine.layout_blocks(source.as_ref(), std::slice::from_ref(figure), LayoutViewport::new(1000, 1000).unwrap(), &style).unwrap();
+        assert_eq!(layout.pages.len(), 1);
+        let page = &layout.pages[0];
+        let panels: Vec<_> = page.items.iter().filter_map(|i| match i { PageItem::FigureBody(p) => Some(p), _ => None }).collect();
+        assert_eq!(panels.len(), 1, "the table must have one figure surface");
+        let panel = panels[0];
+        let table = page.items.iter().find_map(|i| match i { PageItem::Table(t) => Some(t), _ => None }).unwrap();
+        let left = table.cells.iter().map(|c| c.x).reduce(f32::min).unwrap();
+        let right = table.cells.iter().map(|c| c.x + c.width).reduce(f32::max).unwrap();
+        let gaps = [left - panel.x, panel.x + panel.width - right, table.y - panel.y, panel.y + panel.height - table.y - table.height];
+        for gap in gaps { assert!((gap - style.typography.font_size * 0.8).abs() < 1.1, "table {}: {gaps:?}", index + 1); }
+        let display = rebook_renderer::DisplayListCompiler.compile(page);
+        let range = table.cells.iter().filter_map(|c| c.text.as_ref()?.source.as_ref()).next().unwrap();
+        let bounds = display.source_content_bounds(std::slice::from_ref(range)).unwrap();
+        assert!(bounds.y0 <= f64::from(panel.y) && bounds.y1 >= f64::from(panel.y + panel.height));
+        let mut renderer = anyrender_vello_cpu::VelloCpuImageRenderer::new(1000, 1000);
+        let mut pixels = Vec::new();
+        renderer.render_to_vec(|scene| display.paint(scene), &mut pixels);
+        let image = image::RgbaImage::from_raw(1000, 1000, pixels).unwrap();
+        for (x,y) in [(panel.x + 2.0, panel.y + 2.0), (panel.x + 2.0, panel.y + panel.height - 2.0)] {
+            assert_eq!(image.get_pixel(x as u32, y as u32).0, [255,255,255,255]);
+        }
+        if let Ok(path) = std::env::var("TORTO_TABLE_FIGURE_PNG_DIR") { image.save(std::path::Path::new(&path).join(format!("table-{}.png", index + 1))).unwrap(); }
+        println!("table {}: one panel, padding={gaps:?}, focus includes the complete panel", index + 1);
+    }
+}
+
+#[test]
+#[ignore = "requires TORTO_BARRIERS_BOOK local EPUB"]
 fn local_barriers_text_figure_surface() {
     use anyrender::ImageRenderer;
     use rebook_layout::{LayoutEngine, LayoutViewport, PageItem, ReaderFontBlob, ReaderStyle, ReaderTypesetting, SpreadMode};

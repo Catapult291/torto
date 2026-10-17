@@ -1588,20 +1588,23 @@ impl DesktopReader {
         clippy::cast_possible_truncation,
         reason = "page geometry is GPU-bounded"
     )]
-    fn focus_image_preview_shortcut(
+    pub(super) fn focus_image_preview_shortcut(
         &mut self,
         ctx: &egui::Context,
         interaction_blocked: bool,
     ) -> bool {
         if !self.focus_body_accepts_actions(interaction_blocked)
             || ctx.text_edit_focused()
-            || !(self.current_focus_unit_is_image() || self.focus_units.get(self.focus_unit_index).is_some_and(|unit| unit.media_key.is_some()))
             || !supports_image_preview(self.format, self.pdf_ocr.mode)
         {
             return false;
         }
         if !ctx.input_mut(|input| input.consume_shortcut(&self.shortcuts.focus_image_preview)) {
             return false;
+        }
+        if self.open_focus_reference_preview(ctx) { return true; }
+        if !(self.current_focus_unit_is_image() || self.focus_units.get(self.focus_unit_index).is_some_and(|unit| unit.media_key.is_some())) {
+            return true;
         }
         if let Some(unit) = self.focus_units.get(self.focus_unit_index)
             && let Some(key) = unit.media_key.clone()
@@ -4972,6 +4975,7 @@ impl DesktopReader {
                 return;
             }
             if let Some(hit) = self.media_reference_at_canvas(x, y) {
+                if self.is_focus_mode() { self.focus_clicked_unit(x, y); }
                 self.open_media_preview(&response.ctx, hit.source, hit.key);
                 return;
             }

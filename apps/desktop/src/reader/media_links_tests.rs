@@ -60,6 +60,23 @@ fn fixture(html: &[&str]) -> Arc<Fixture> {
 }
 
 #[test]
+fn preview_candidates_use_validated_links_and_resolve_same_numbers_by_destination() {
+    let fixture = fixture(&[
+        "<html><body><p>See Table 2, <a href='s1.xhtml#remote'>Figure 1</a>, <a href='#local'>Figure 1</a>, Table 2 and Figure 99.</p><figure id='local'><div><p>Local diagram</p></div><figcaption>Figure 1 Local</figcaption></figure><table><caption>Table 2 Results</caption><tr><td>Data</td></tr></table></body></html>",
+        "<html><body><figure id='remote'><div><p>Remote diagram</p></div><figcaption>Figure 1 Remote</figcaption></figure></body></html>",
+    ]);
+    let source = ready(&fixture);
+    let text = fixture.sections[0].blocks[0].text_blocks().next().unwrap();
+    let before = fixture.parses.load(Ordering::Relaxed);
+    let candidates = source.preview_references(text.source.as_ref().unwrap(), &text.content);
+    assert_eq!(candidates.iter().map(|(key,target,_)| (key.kind,key.number.as_str(),target.section)).collect::<Vec<_>>(),
+        [(MediaKind::Table,"2",0),(MediaKind::Figure,"1",1),(MediaKind::Figure,"1",0),(MediaKind::Table,"2",0)]);
+    assert!(candidates.iter().all(|(_,_,node)| node.is_some()));
+    assert_eq!(fixture.parses.load(Ordering::Relaxed), before, "opening a group must not parse sections on the UI thread");
+    assert_eq!(fixture.resources.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn changed_source_rejects_old_catalog_and_cancelled_build_does_no_work() {
     let fixture = fixture(&[
         "<html><body><p>See Figure 1.</p><figure><img src='a.png'/><figcaption>Figure 1 example</figcaption></figure></body></html>",

@@ -85,6 +85,7 @@ pub struct PageDisplayList {
     text_regions: Vec<TextRegion>,
     inline_content_regions: Vec<InlineContentRegion>,
     table_regions: Vec<TableRegion>,
+    figure_regions: Vec<FigureRegion>,
     quote_regions: Vec<QuoteRegion>,
     footnote_regions: Vec<FootnoteRegion>,
     text_groups: Vec<SourceTextGroup>,
@@ -104,6 +105,12 @@ struct SourceTextGroup {
 struct InlineContentRegion {
     bounds: Rect,
     source: SourceRange,
+}
+
+#[derive(Clone)]
+struct FigureRegion {
+    bounds: Rect,
+    sources: Vec<SourceRange>,
 }
 
 #[derive(Clone)]
@@ -453,6 +460,7 @@ impl PageDisplayList {
             + allocation(&self.text_regions)
             + allocation(&self.inline_content_regions)
             + allocation(&self.table_regions)
+            + allocation(&self.figure_regions)
             + allocation(&self.quote_regions)
             + allocation(&self.footnote_regions)
             + allocation(&self.text_groups);
@@ -461,6 +469,7 @@ impl PageDisplayList {
             .iter()
             .map(|group| allocation(&group.additional_sources))
             .sum::<usize>();
+        bytes += self.figure_regions.iter().map(|figure| allocation(&figure.sources)).sum::<usize>();
         for command in &self.commands {
             if let DisplayCommand::Glyphs(command) = command {
                 bytes += command.glyphs.len() * std::mem::size_of::<Glyph>()
@@ -774,6 +783,7 @@ impl PageDisplayList {
                     .map(|region| &region.source),
             )
             .chain(self.table_regions.iter().flat_map(|region| &region.sources))
+            .chain(self.figure_regions.iter().flat_map(|region| &region.sources))
             .chain(self.quote_regions.iter().flat_map(|region| &region.sources))
             .chain(self.commands.iter().filter_map(|command| match command {
                 DisplayCommand::Image(image) => image.source.as_ref(),
@@ -960,6 +970,9 @@ impl PageDisplayList {
             .chain(self.image_source_rects(ranges))
             .chain(self.source_table_bounds(ranges))
             .chain(self.source_quote_bounds(ranges))
+            .chain(self.figure_regions.iter().filter(|figure| figure.sources.iter()
+                .any(|source| ranges.iter().any(|range| range == source)))
+                .map(|figure| figure.bounds))
             .reduce(|bounds, next| bounds.union(next))
     }
 
@@ -2433,6 +2446,7 @@ impl DisplayListCompiler {
         let mut text_regions = Vec::new();
         let mut inline_content_regions = Vec::new();
         let mut table_regions = Vec::new();
+        let mut figure_regions = Vec::new();
         let mut quote_regions = Vec::new();
         let mut footnote_regions = Vec::new();
         let mut text_groups: Vec<SourceTextGroup> = Vec::new();
@@ -2443,6 +2457,11 @@ impl DisplayListCompiler {
             }
             match item {
                 PageItem::FigureBody(body) => {
+                    figure_regions.push(FigureRegion {
+                        bounds: Rect::new(body.x.into(), body.y.into(),
+                            (body.x + body.width).into(), (body.y + body.height).into()),
+                        sources: body.sources.clone(),
+                    });
                     commands.push(DisplayCommand::FillRect(FillRectCommand {
                         rect: Rect::new(body.x.into(), body.y.into(),
                             (body.x + body.width).into(), (body.y + body.height).into()),
@@ -2637,6 +2656,7 @@ impl DisplayListCompiler {
             text_regions,
             inline_content_regions,
             table_regions,
+            figure_regions,
             quote_regions,
             footnote_regions,
         }
@@ -3549,6 +3569,37 @@ mod tests {
         assert_eq!(hit.pixels, pixels);
         assert_eq!(hit.formula.as_deref(), Some(r"\sigma=\sqrt{k\theta^2}"));
         assert_eq!(hit.bounds, Rect::new(20.0, 30.0, 120.0, 80.0));
+    }
+
+    #[test]
+    fn text_figure_focus_includes_the_whole_panel_without_expanding_text_selection() {
+        let source = SourceRange {
+            start: SourceAnchor { spine: SpineItemId::new("chapter").unwrap(), node: "cell".into(), text_offset: 0 },
+            end: SourceAnchor { spine: SpineItemId::new("chapter").unwrap(), node: "cell".into(), text_offset: 5 },
+        };
+        let mut other = source.clone();
+        other.start.node = "other-cell".into();
+        other.end.node = "other-cell".into();
+        let page = PageLayout {
+            viewport: LayoutViewport::new(500, 500).unwrap(),
+            background: Rgba::BLACK,
+            leading_gap: 0.0,
+            items: vec![
+                PageItem::FigureBody(rebook_layout::FigureBodyPlacement {
+                    x: 40.0, y: 60.0, width: 300.0, height: 100.0, sources: vec![source.clone()],
+                }),
+                PageItem::FigureBody(rebook_layout::FigureBodyPlacement {
+                    x: 40.0, y: 200.0, width: 300.0, height: 100.0, sources: vec![other.clone()],
+                }),
+            ],
+        };
+        let display = DisplayListCompiler.compile(&page);
+        assert_eq!(display.source_content_bounds(std::slice::from_ref(&source)),
+            Some(Rect::new(40.0, 60.0, 340.0, 160.0)));
+        assert_eq!(display.source_content_bounds(std::slice::from_ref(&other)),
+            Some(Rect::new(40.0, 200.0, 340.0, 300.0)));
+        assert!(display.source_rects(&[source.clone()]).is_empty(), "padding is not selectable text");
+        assert!(display.geometry_sources().any(|range| range == &source));
     }
 
     #[test]

@@ -4,6 +4,207 @@ use rebook_publication::{
 };
 use std::sync::atomic::AtomicUsize;
 
+fn reference_reader(body: &str) -> super::super::DesktopReader {
+    let (base, _, _) = crate::reader::semantic_layout::tests::fixture();
+    let html = format!("<html><body><p>Intro</p>{body}<figure><div><p>First example.</p></div><figcaption>Figure 1 Example</figcaption></figure><table><caption>Table 2 Results</caption><tr><td>Data</td></tr></table><figure><div><p>Third example.</p></div><figcaption>Figure 3 Example</figcaption></figure><table><caption>Table 1 Other table</caption><tr><td>Other</td></tr></table></body></html>");
+    let section = rebook_html::parse_section(&html, &base.source.book().sections[0], |_| None).unwrap();
+    let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture_with_blocks(section.blocks.clone());
+    // The layout fixture accepts blocks only; retain the parsed chapter's anchors
+    // in the original source used by the validated reference catalog.
+    let original = Arc::new(Source { book: reader.source.book().clone(), sections: vec![section], resources: AtomicUsize::new(0), parses: AtomicUsize::new(0) });
+    let links = Arc::new(super::super::media_links::Source::new(reader.rewrite_source.clone(), original));
+    links.prepare_for_test();
+    reader.media_preview.links = Some(links);
+    let layout = reader.current_scroll_layout().unwrap();
+    reader.rebuild_focus_units(&layout);
+    let index = reader.focus_units.iter().position(|u| u.text.contains("See")).unwrap();
+    reader.select_focus_unit(index);
+    reader.ui.sidebar_open = false;
+    let (tx, _) = mpsc::sync_channel(1);
+    reader.media_preview.worker = Some(Worker { tx, pending: Default::default(), result: Default::default(), generation: Arc::new(AtomicU64::new(0)) });
+    reader
+}
+
+fn preview_key(reader: &mut super::super::DesktopReader, ctx: &egui::Context, key: egui::Key) {
+    let mut output = ctx.run_ui(egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0,700.0))),
+        events: vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }],
+        ..Default::default()
+    }, |_| {
+        if reader.media_preview.active.is_some() { assert!(reader.media_preview_keyboard(ctx)); }
+        else { assert!(reader.focus_image_preview_shortcut(ctx, false)); }
+    });
+    output.textures_delta.clear();
+}
+
+#[test]
+fn focus_reference_shortcut_orders_deduplicates_and_keeps_navigation_inside_the_modal() {
+    let mut reader = reference_reader("<p>See Table 2, Figure 1, Table 2, Figure 99 and Figure 3.</p>");
+    let ctx = egui::Context::default();
+    let focused = reader.focus_unit_index;
+    preview_key(&mut reader, &ctx, egui::Key::Num0);
+    let active = reader.media_preview.active.as_ref().unwrap();
+    assert_eq!(active.items.iter().map(|i| (i.key.kind,i.key.number.as_str())).collect::<Vec<_>>(),
+        [(MediaKind::Table,"2"),(MediaKind::Figure,"1"),(MediaKind::Figure,"3")]);
+    preview_key(&mut reader, &ctx, egui::Key::ArrowLeft);
+    assert_eq!(reader.media_preview.active.as_ref().unwrap().item_index, 0);
+    preview_key(&mut reader, &ctx, egui::Key::ArrowRight);
+    preview_key(&mut reader, &ctx, egui::Key::ArrowRight);
+    assert_eq!(reader.media_preview.active.as_ref().unwrap().item_index, 2, "rapid navigation works during loading");
+    preview_key(&mut reader, &ctx, egui::Key::ArrowRight);
+    assert_eq!(reader.media_preview.active.as_ref().unwrap().item_index, 2, "do not wrap");
+    assert_eq!(reader.focus_unit_index, focused);
+    let worker = reader.media_preview.worker.as_ref().unwrap();
+    let pending = worker.pending.load_full().unwrap();
+    assert_eq!(pending.key.number, "3");
+    let stale_generation = pending.generation;
+    let ready = || Ready {
+        image: egui::ColorImage::filled([10,10],egui::Color32::WHITE), size:[10,10], captions:vec!["Third".into()], caption_images:vec![],
+        previous:None, next:Some(Cursor {chunk:1,page:0}), position:"1 / 2 · 1 / 1".into(),
+    };
+    worker.result.store(Some(Arc::new(Completion { generation:stale_generation, revision:reader.source.content_revision(),result:Ok(ready()) })));
+    reader.accept_media_preview_completion(&ctx);
+    let old_texture = reader.media_preview.active.as_ref().unwrap().texture.as_ref().unwrap().id();
+    preview_key(&mut reader, &ctx, egui::Key::PageDown);
+    let active = reader.media_preview.active.as_ref().unwrap();
+    assert_eq!(active.item_index,2);
+    assert_eq!(active.texture.as_ref().unwrap().id(),old_texture,"keep the displayed image until the replacement is ready");
+    assert_eq!(reader.media_preview.worker.as_ref().unwrap().pending.load_full().unwrap().cursor.chunk,1);
+    reader.media_preview.worker.as_ref().unwrap().result.store(Some(Arc::new(Completion { generation:stale_generation, revision:reader.source.content_revision(),result:Ok(ready()) })));
+    reader.accept_media_preview_completion(&ctx);
+    assert!(reader.media_preview.active.as_ref().unwrap().loading,"stale pixels cannot complete the new request");
+    preview_key(&mut reader, &ctx, egui::Key::Escape);
+    assert!(reader.media_preview.active.as_ref().unwrap().motion.is_closing());
+    assert_eq!(reader.focus_unit_index,focused);
+}
+
+#[test]
+fn list_reference_previews_cover_the_whole_group_and_clicks_open_the_matching_item() {
+    let mut reader = reference_reader("<ol><li><p>See Table 2.</p></li><li><p>See Figure 1.</p></li><li><p>See Figure 3.</p></li><li><p>Again Table 2.</p></li></ol>");
+    let unit = &reader.focus_units[reader.focus_unit_index];
+    let origin = unit.range.clone();
+    let items = reader.focus_reference_previews(&origin);
+    assert_eq!(items.iter().map(|i| i.key.number.as_str()).collect::<Vec<_>>(),["2","1","3"]);
+    let clicked = items[1].clone();
+    reader.open_media_preview(&egui::Context::default(), clicked.origin, clicked.key);
+    let active = reader.media_preview.active.as_ref().unwrap();
+    assert_eq!(active.item_index,1);
+    assert_eq!(active.items.len(),3);
+    let sections = reader.reader.current_reading_unit_content().unwrap();
+    let repeated = sections.iter().flat_map(|(_,s)| &s.blocks).flat_map(Block::text_blocks).find(|t| plain(t).contains("Again")).unwrap();
+    let key = media_references::references("Table 2")[0].key.clone();
+    reader.open_media_preview(&egui::Context::default(), repeated.source.clone().unwrap(), key);
+    let active = reader.media_preview.active.as_ref().unwrap();
+    assert_eq!(active.item_index,0);
+    assert_eq!(active.items.len(),3,"clicking a duplicate keeps the complete reference group");
+}
+
+#[test]
+fn translated_reference_previews_follow_display_order_and_ignore_invented_references() {
+    let mut reader = reference_reader("<p>See Figure 1 and Table 2.</p>");
+    reader.translation_source.set_mode(crate::plugins::TranslationMode::Replace).unwrap();
+    reader.translation_source.set_enabled(true).unwrap();
+    reader.translation_source.store_batch(0,&[crate::plugins::BlockTranslation {
+        block_index:1, segment_index:None, text:"参见表 2，再看图 1。另外提到表一。".into()
+    }]).unwrap();
+    reader.snapshot = reader.reader.refresh_source().unwrap();
+    reader.scroll_section = None;
+    let layout = reader.current_scroll_layout().unwrap();
+    reader.rebuild_focus_units(&layout);
+    let unit = reader.focus_units.iter().find(|u|u.text.contains("参见")).unwrap();
+    let items = reader.focus_reference_previews(&unit.range);
+    assert_eq!(items.iter().map(|i|(i.key.kind,i.key.number.as_str())).collect::<Vec<_>>(),[(MediaKind::Table,"2"),(MediaKind::Figure,"1")]);
+}
+
+#[test]
+fn reference_navigation_arrows_work_while_loading_and_do_not_dismiss_the_popup() {
+    let mut reader = reference_reader("<p>See Table 2, Figure 1 and Figure 3.</p>");
+    let ctx = egui::Context::default();
+    assert!(reader.open_focus_reference_preview(&ctx));
+    let frame = |reader: &mut super::super::DesktopReader, events| {
+        let mut output = ctx.run_ui(egui::RawInput {
+            time:Some(1.0), screen_rect:Some(egui::Rect::from_min_size(egui::Pos2::ZERO,egui::vec2(900.0,700.0))),
+            events, ..Default::default()
+        }, |_| reader.media_preview_overlay(&ctx));
+        output.textures_delta.clear();
+    };
+    frame(&mut reader,vec![]);
+    frame(&mut reader,vec![]); // Area's initial sizing pass is not interactive.
+    let screen = crate::ui::overlay_rect(&ctx);
+    let at = egui::pos2(screen.right() - 28.0, screen.center().y);
+    frame(&mut reader,vec![egui::Event::PointerMoved(at), egui::Event::PointerButton {pos:at,button:egui::PointerButton::Primary,pressed:true,modifiers:egui::Modifiers::NONE}]);
+    frame(&mut reader,vec![egui::Event::PointerButton {pos:at,button:egui::PointerButton::Primary,pressed:false,modifiers:egui::Modifiers::NONE}]);
+    let active = reader.media_preview.active.as_ref().unwrap();
+    assert_eq!(active.item_index,1);
+    assert!(!active.motion.is_closing());
+}
+
+#[test]
+fn adjacent_subfigures_sharing_a_page_link_remain_separate_preview_items() {
+    let mut reader = reference_reader("<ul><li><p>See <a href='#page-103'>Figure 7.2a</a> and <a href='#page-103'>Figure 7.2b</a>.</p></li></ul><figure id='page-103'><figcaption><p>Figure 7.2 Comparison</p><p>(a) First horse.</p></figcaption><img src='first.png'/></figure><figure><figcaption><p>(b) Second horse.</p></figcaption><img src='second.png'/></figure>");
+    let sections = reader.reader.current_reading_unit_content().unwrap();
+    let text = sections.iter().flat_map(|(_,section)| &section.blocks).flat_map(Block::text_blocks).find(|text| plain(text).contains("See")).unwrap();
+    let candidates = reader.media_preview.links.as_ref().unwrap().preview_references(text.source.as_ref().unwrap(), &text.content);
+    assert_eq!(candidates.len(), 2, "both shared-anchor references must be valid before opening the modal: {candidates:?}");
+    let ctx = egui::Context::default();
+    preview_key(&mut reader, &ctx, egui::Key::Num0);
+    let active = reader.media_preview.active.as_ref().unwrap();
+    assert_eq!(active.items.iter().map(|item| item.key.number.as_str()).collect::<Vec<_>>(), ["7.2a", "7.2b"]);
+    assert_ne!(active.items[0].destination, active.items[1].destination);
+    let first = reader.media_preview.worker.as_ref().unwrap().pending.load_full().unwrap();
+    let a = Index::default().resolve(&first, &|| true).unwrap();
+    preview_key(&mut reader, &ctx, egui::Key::ArrowRight);
+    let second = reader.media_preview.worker.as_ref().unwrap().pending.load_full().unwrap();
+    let b = Index::default().resolve(&second, &|| true).unwrap();
+    assert_ne!(a.block, b.block);
+    let section = second.source.parse_section(b.section).unwrap();
+    let Block::Figure(figure) = &section.blocks[b.block] else { panic!("second figure") };
+    assert!(figure.images[0].href.path().ends_with("second.png"));
+    assert_eq!(b.group, Some(a.block));
+}
+
+#[test]
+fn subfigure_inference_stops_at_prose_and_does_not_split_a_combined_figure() {
+    let source = source(&["<html><body><figure><figcaption><p>Figure 7.2 Comparison</p><p>(a) First.</p></figcaption><img src='a.png'/></figure><p>Ordinary prose interrupts the group.</p><figure><figcaption>(b) Unrelated.</figcaption><img src='b.png'/></figure><figure><figcaption><p>Figure 8 Combined</p><p>(a) First.</p><p>(b) Second.</p></figcaption><img src='combined.png'/></figure></body></html>"]);
+    let targets = targets(&source.sections[0], 0);
+    assert!(targets.iter().any(|target| target.key.number == "7.2a"));
+    assert!(!targets.iter().any(|target| target.key.number == "7.2b" || target.key.number == "8a" || target.key.number == "8b"));
+    assert_eq!(source.resources.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+#[ignore = "requires original BOOKS without barriers chapter-7.xhtml via TORTO_MEDIA_CHAPTER"]
+fn local_book_separate_subfigures_have_distinct_reference_destinations() {
+    let html = std::fs::read_to_string(std::env::var("TORTO_MEDIA_CHAPTER").unwrap()).unwrap().replace("chapter-7.xhtml", "s0.xhtml");
+    let original = source(&[&html]);
+    let catalog = super::super::media_links::Source::new(original.clone(), original.clone());
+    catalog.prepare_for_test();
+    let text = original.sections[0].blocks.iter().flat_map(Block::text_blocks).find(|text| plain(text).contains("Figure 7.2a")).unwrap();
+    let candidates = catalog.preview_references(text.source.as_ref().unwrap(), &text.content);
+    assert_eq!(candidates.iter().map(|(key,_,_)| key.number.as_str()).collect::<Vec<_>>(), ["7.2a", "7.2b"]);
+    assert_ne!(candidates[0].1.block, candidates[1].1.block);
+    for (key, target, _) in candidates {
+        let Block::Figure(figure) = &original.sections[0].blocks[target.block] else { panic!("figure") };
+        println!("{} -> {}", key.number, figure.images[0].href.path());
+    }
+    assert_eq!(original.resources.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn numbered_table_shortcut_previews_itself_and_missing_references_do_not_open_a_popup() {
+    let mut reader = reference_reader("<p>See Figure 99.</p>");
+    let ctx = egui::Context::default();
+    preview_key(&mut reader,&ctx,egui::Key::Num0);
+    assert!(reader.media_preview.active.is_none());
+    let index = reader.focus_units.iter().position(|u|u.is_table && u.media_key.as_ref().is_some_and(|key| key.number == "2")).unwrap();
+    reader.select_focus_unit(index);
+    preview_key(&mut reader,&ctx,egui::Key::Num0);
+    let active = reader.media_preview.active.as_ref().unwrap();
+    assert_eq!(active.items.len(),1);
+    assert_eq!(active.key.kind,MediaKind::Table);
+    assert_eq!(active.key.number,"2");
+}
+
 #[test]
 fn preview_motion_reverses_continuously_and_stops_scheduling_when_idle_or_unfocused() {
     let ctx = egui::Context::default();
@@ -71,6 +272,7 @@ fn media_modal_rejects_stale_pixels_and_restores_parent_state_on_escape() {
         next: None,
         error: None,
         loading: true,
+        items: vec![], item_index: 0, displayed_index: 0, position: String::new(), multipart: false,
     });
     reader.media_preview.restore_parent = true;
     let (tx, _jobs) = mpsc::sync_channel(1);
@@ -302,6 +504,7 @@ fn job(source: Arc<dyn BookSource>, at: usize, key: &str) -> Job {
         generation: 1,
         source,
         catalog: None,
+        destination: None,
         origin,
         key: media_references::references(key)[0].key.clone(),
         cursor: Cursor::default(),
@@ -576,6 +779,7 @@ fn local_book_media_preview() {
         generation: 1,
         source,
         catalog: Some(catalog),
+        destination: None,
         origin,
         key: wanted,
         cursor: Cursor::default(),

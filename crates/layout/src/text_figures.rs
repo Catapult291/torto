@@ -153,6 +153,7 @@ impl LayoutEngine {
                     y,
                     width,
                     height,
+                    sources: body_sources(&page),
                 }));
             for item in &mut page.items {
                 translate(item, x + padding, y + padding);
@@ -249,6 +250,43 @@ mod tests {
                 .to_vec(),
         ))])
     }
+    #[test]
+    fn table_figure_uses_the_same_padding_on_all_sides() {
+        let rows = [["Year", "Gold medallist", "Country", "Time"],
+            ["2008", "Alain Bernard", "France", "47.21 seconds"]]
+            .into_iter().enumerate().map(|(row, values)| TableRow {
+                cells: values.into_iter().map(|value| {
+                    let Block::Text(text) = text(value, TextAlignment::Start, TextBlockKind::Paragraph) else { unreachable!() };
+                    TableCell { text, authored_alignment: None, column_span: 1, row_span: 1, header: row == 0 }
+                }).collect(),
+            }).collect();
+        let blocks = [figure(vec![Block::Table(TableBlock {
+            before: vec![], after: vec![], rows, source: None,
+        })])];
+        let style = ReaderStyle { spread: SpreadMode::Single,
+            typesetting: ReaderTypesetting::unified(), ..Default::default() };
+        for width in [600, 1000, 1400] {
+            let layout = engine().layout_blocks(&source(), &blocks,
+                LayoutViewport::new(width, 800).unwrap(), &style).unwrap();
+            let page = &layout.pages[0];
+            let panel = page.items.iter().find_map(|item| match item {
+                PageItem::FigureBody(panel) => Some(panel), _ => None,
+            }).unwrap();
+            let table = page.items.iter().find_map(|item| match item {
+                PageItem::Table(table) => Some(table), _ => None,
+            }).unwrap();
+            let left = table.cells.iter().map(|cell| cell.x).reduce(f32::min).unwrap();
+            let right = table.cells.iter().map(|cell| cell.x + cell.width).reduce(f32::max).unwrap();
+            let padding = style.typography.font_size * 0.8;
+            for gap in [left - panel.x, panel.x + panel.width - right,
+                table.y - panel.y, panel.y + panel.height - table.y - table.height] {
+                assert!((gap - padding).abs() < 1.1, "width={width}, padding={padding}, actual={gap}");
+            }
+            assert!((panel.x + panel.width * 0.5 - width as f32 * 0.5).abs() < 0.1);
+            assert_eq!(panel.sources.len(), 8);
+        }
+    }
+
     #[test]
     fn figure_surface_centers_the_body_preserving_internal_alignment_and_caption_ownership() {
         let blocks = [figure(vec![
@@ -420,13 +458,31 @@ fn natural_right(item: &PageItem) -> f32 {
         PageItem::FigureBody(body) => body.x + body.width,
         PageItem::Quote(quote) => quote.x + quote.width,
         PageItem::Image(image) => image.x + image.width,
-        PageItem::Table(table) => table
-            .cells
-            .iter()
-            .map(|c| c.x + c.width)
-            .fold(0.0, f32::max),
+        // The grid is already centered in the measuring viewport. That offset
+        // is not intrinsic width; carrying it forward adds padding a second time.
+        PageItem::Table(table) => {
+            let left = table.cells.iter().map(|c| c.x).reduce(f32::min).unwrap_or(0.0);
+            let right = table.cells.iter().map(|c| c.x + c.width).fold(0.0, f32::max);
+            (right - left).max(0.0)
+        }
         PageItem::Separator(line) => line.x + line.width,
     }
+}
+
+fn body_sources(page: &PageLayout) -> Vec<SourceRange> {
+    let mut sources = Vec::new();
+    for item in &page.items {
+        match item {
+            PageItem::Text(text) => sources.extend(text.sources().cloned()),
+            PageItem::Table(table) => sources.extend(table.cells.iter()
+                .filter_map(|cell| cell.text.as_ref()).flat_map(TextPlacement::sources).cloned()),
+            PageItem::FigureBody(body) => sources.extend(body.sources.iter().cloned()),
+            PageItem::Quote(quote) => sources.extend(quote.sources.iter().cloned()),
+            PageItem::Image(image) => sources.extend(image.source.iter().cloned()),
+            PageItem::Separator(_) => {}
+        }
+    }
+    sources
 }
 
 fn page_bottom(page: &PageLayout) -> f32 {

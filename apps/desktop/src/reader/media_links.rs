@@ -2,7 +2,7 @@
 //! code only read an immutable snapshot. Pending/missing/ambiguous links are prose.
 use super::media_preview::{self, Target};
 use rebook_publication::{
-    media_references::{self, MediaKey, MediaReference},
+    media_references::{self, MediaKey, MediaKind, MediaReference},
     *,
 };
 use std::{
@@ -251,6 +251,25 @@ pub(super) struct Source {
 }
 
 impl Source {
+    /// Read the same validated links used by displayed prose; never parse a book here.
+    pub(super) fn preview_references(&self, origin: &SourceRange, content: &[Inline])
+        -> Vec<(MediaKey, Target, Option<String>)>
+    {
+        let snapshot = self.catalog.load();
+        let Some(catalog) = snapshot.as_ref().filter(|c| c.revision == self.original.content_revision()) else { return vec![] };
+        let Some(index) = self.book().sections.iter().position(|s| s.id == origin.start.spine) else { return vec![] };
+        media_references::inline_references(content).into_iter()
+            .filter(|r| matches!(r.key.kind, MediaKind::Figure | MediaKind::Table))
+            .filter_map(|reference| {
+                let href = href_for(content, &reference).and_then(|href| {
+                    if href.is_some() { Ok(href) } else { catalog.authored(index, &origin.start.node, &reference.key) }
+                }).ok()?;
+                let target = catalog.resolve(self.original.as_ref(), index, &reference.key, href.as_ref())?;
+                let node = catalog.entries.iter().find(|entry| entry.target == target).and_then(|entry| entry.node.clone());
+                Some((reference.key, target, node))
+            }).collect()
+    }
+
     pub(super) fn changes_display(&self) -> bool {
         self.catalog
             .load()

@@ -936,6 +936,8 @@ pub struct FigureBodyPlacement {
     pub y: f32,
     pub width: f32,
     pub height: f32,
+    /// Child sources painted on this page, including the body's padding in focus geometry.
+    pub sources: Vec<SourceRange>,
 }
 
 /// Unified-typesetting decoration for one page slice of a semantic quotation.

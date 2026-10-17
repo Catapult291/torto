@@ -381,7 +381,7 @@ fn focus_shortcut_group(ui: &mut egui::Ui, state: &mut SettingsFeature, language
             ),
             (
                 ShortcutAction::FocusImagePreview,
-                language.text("预览图片", "Preview image"),
+                language.text("预览图表", "Preview figure or table"),
             ),
             (
                 ShortcutAction::FocusFootnotes,

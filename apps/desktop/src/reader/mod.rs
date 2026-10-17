@@ -3174,6 +3174,9 @@ impl DesktopReader {
             };
             let media_key = if let Block::Figure(figure) = block {
                 (!figure.body.is_empty()).then(|| figure.caption_blocks().find_map(|t| rebook_publication::media_references::caption_label(&text_block_focus_text(t)).map(|label| label.key))).flatten()
+            } else if let Block::Table(table) = block {
+                table.before.iter().chain(&table.after).find_map(|t| rebook_publication::media_references::caption_label(&text_block_focus_text(t))
+                    .filter(|label| label.key.kind == rebook_publication::media_references::MediaKind::Table).map(|label| label.key))
             } else { None };
             let unit = FocusUnit {
                 media_key,

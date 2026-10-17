@@ -74,6 +74,7 @@ pub(super) struct Target {
     pub(super) block: usize,
     images: Vec<usize>,
     captions: Vec<usize>,
+    group: Option<usize>,
     pub(super) key: MediaKey,
 }
 
@@ -132,7 +133,7 @@ pub(super) fn targets(section: &Section, index: usize) -> Vec<Target> {
     let mut result = Vec::new();
     for (at, block) in section.blocks.iter().enumerate() {
         if let Some(key) = media_references::equation_target(block) {
-            result.push(Target { section: index, block: at, images: vec![], captions: vec![], key });
+            result.push(Target { section: index, block: at, images: vec![], captions: vec![], group: None, key });
             continue;
         }
         let mut captions = Vec::new();
@@ -208,6 +209,7 @@ pub(super) fn targets(section: &Section, index: usize) -> Vec<Target> {
                 block: at,
                 images: images.clone(),
                 captions: captions.clone(),
+                group: None,
                 key: label.key,
             };
             if !result.contains(&target) {
@@ -215,7 +217,44 @@ pub(super) fn targets(section: &Section, index: usize) -> Vec<Target> {
             }
         }
     }
+    // Publishers sometimes split (a), (b), ... into adjacent figure elements,
+    // with the number and page anchor present only in the first element.
+    // Require an explicit, consecutive caption sequence; never infer from class names.
+    let mut group: Option<(usize, MediaKey, u8)> = None;
+    for (at, block) in section.blocks.iter().enumerate() {
+        let Block::Figure(figure) = block else { group = None; continue };
+        let numbered = figure.caption_blocks().find_map(|text| media_references::caption_label(&plain(text)));
+        let mut letters = figure.caption_blocks().filter_map(|text| subfigure_letter(&plain(text)));
+        let letter = letters.next().filter(|first| letters.all(|letter| letter == *first));
+        if let Some(label) = numbered {
+            group = None;
+            if label.key.kind == MediaKind::Figure && letter == Some(b'a')
+                && !label.key.number.ends_with(|c: char| c.is_ascii_alphabetic())
+            {
+                let mut key = label.key.clone();
+                key.number.push('a');
+                result.push(Target { section: index, block: at, images: vec![], captions: vec![], group: None, key });
+                group = Some((at, label.key, b'b'));
+            }
+        } else if let Some((root, key, next)) = group.as_mut() {
+            if letter == Some(*next) && *next <= b'z' {
+                let mut key = key.clone();
+                key.number.push(char::from(*next));
+                result.push(Target { section: index, block: at, images: vec![], captions: vec![], group: Some(*root), key });
+                *next += 1;
+            } else { group = None; }
+        }
+    }
     result
+}
+
+fn subfigure_letter(value: &str) -> Option<u8> {
+    let value = value.trim_start();
+    let value = value.strip_prefix('(').or_else(|| value.strip_prefix('（')).unwrap_or(value);
+    let mut chars = value.chars();
+    let letter = chars.next()?.to_ascii_lowercase();
+    if !letter.is_ascii_lowercase() || !matches!(chars.next()?, ')' | '）' | '.') { return None; }
+    chars.next().is_none_or(char::is_whitespace).then_some(letter as u8)
 }
 
 fn text_blocks(block: &Block) -> Vec<&TextBlock> {
@@ -290,6 +329,7 @@ pub(super) fn target_has_anchor(section: &Section, target: &Target, href: &Publi
 
 fn target_has_node(section: &Section, target: &Target, node: &str) -> bool {
     let mut indices = vec![target.block];
+    indices.extend(target.group);
     indices.extend(&target.images);
     indices.extend(&target.captions);
     indices.into_iter().any(|index| {
@@ -410,13 +450,14 @@ impl Index {
         let source = job.source.as_ref();
         // Reuse the validated catalog and stable source identity, even when AI
         // layout or translation has shifted the displayed block ordinals.
-        if let Some((index, node)) = job.catalog.as_ref().and_then(|catalog| catalog.target_node(&job.origin, &job.key)) {
+        if let Some((index, node)) = job.destination.clone().or_else(|| job.catalog.as_ref().and_then(|catalog| catalog.target_node(&job.origin, &job.key))) {
             if !needed() { return Err("Cancelled".into()); }
             let section = source.parse_section(index).map_err(|e| e.to_string())?;
             self.add(&section, index)?;
             if let Some(target) = select(self.entries[&index].iter().filter(|t| target_has_node(&section, t, &node)).cloned(), &job.key)? {
                 return Ok(target);
             }
+            if job.destination.is_some() { return Err("The figure/table changed. Please reopen the preview.".into()); }
         }
         let origin_index = source
             .book()
@@ -521,6 +562,7 @@ struct Job {
     generation: u64,
     source: Arc<dyn BookSource>,
     catalog: Option<Arc<super::media_links::Source>>,
+    destination: Option<(usize, String)>,
     origin: SourceRange,
     key: MediaKey,
     cursor: Cursor,
@@ -534,7 +576,6 @@ struct Ready {
     caption_images: Vec<egui::ColorImage>,
     previous: Option<Cursor>,
     next: Option<Cursor>,
-    #[cfg(test)]
     position: String,
 }
 struct Completion {
@@ -575,6 +616,9 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
     let mut caption_blocks: Vec<TextBlock> = Vec::new();
     let (chunk, chunk_count, blocks) = match block {
         Block::Figure(figure) => {
+            if let Some(Block::Figure(parent)) = target.group.and_then(|at| section.blocks.get(at)) {
+                caption_blocks.extend(parent.caption_blocks().filter(|text| media_references::caption_label(&plain(text)).is_some()).cloned());
+            }
             caption_blocks.extend(figure.caption_blocks().cloned());
             if !figure.body.is_empty() {
                 if figure.body.len() > 4096
@@ -830,7 +874,6 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
         caption_images,
         previous,
         next,
-        #[cfg(test)]
         position: format!(
             "{} / {} · {} / {}",
             chunk + 1,
@@ -897,6 +940,13 @@ impl Worker {
     }
 }
 
+#[derive(Clone)]
+struct PreviewItem {
+    origin: SourceRange,
+    key: MediaKey,
+    destination: Option<(usize, String)>,
+}
+
 struct Preview {
     motion: PreviewMotion,
     content_motion: Option<PreviewMotion>,
@@ -912,6 +962,11 @@ struct Preview {
     next: Option<Cursor>,
     error: Option<String>,
     loading: bool,
+    items: Vec<PreviewItem>,
+    item_index: usize,
+    displayed_index: usize,
+    position: String,
+    multipart: bool,
 }
 #[derive(Default)]
 pub(super) struct MediaPreviewController {
@@ -958,6 +1013,63 @@ impl super::DesktopReader {
         origin: SourceRange,
         key: MediaKey,
     ) {
+        let mut items = self.focus_reference_previews(&origin);
+        let destination = self.media_preview.links.as_ref().and_then(|links| links.target_node(&origin, &key));
+        let index = items.iter().position(|item| item.key == key && item.origin.start.node == origin.start.node)
+            .or_else(|| destination.as_ref().and_then(|destination| items.iter().position(|item| item.key == key && item.destination.as_ref() == Some(destination))))
+            .or_else(|| destination.as_ref().and_then(|destination| {
+                let mut matches = items.iter().enumerate().filter(|(_,item)| item.destination.as_ref() == Some(destination));
+                let first = matches.next()?;
+                matches.next().is_none().then_some(first.0)
+            }));
+        let index = match index {
+            Some(index) => index,
+            None => {
+                items = vec![PreviewItem { origin, key, destination: None }];
+                0
+            }
+        };
+        self.open_media_items(ctx, items, index);
+    }
+
+    fn focus_reference_previews(&self, origin: &SourceRange) -> Vec<PreviewItem> {
+        if !self.is_focus_mode() { return vec![]; }
+        let Some(unit) = self.focus_units.iter().find(|unit| unit.paint_ranges.iter()
+            .any(|range| super::source_range_contains_anchor(range, &origin.start))) else { return vec![] };
+        if unit.is_image || unit.is_table || unit.media_key.is_some() { return vec![]; }
+        let ranges = unit.list_group.as_ref().map_or(unit.paint_ranges.as_slice(), |group| group.paint_ranges.as_slice());
+        let Some(links) = &self.media_preview.links else { return vec![] };
+        let Ok(sections) = self.reader.current_reading_unit_content() else { return vec![] };
+        let mut seen = Vec::new();
+        let mut items = Vec::new();
+        let mut bytes = 0;
+        for text in sections.iter().flat_map(|(_, s)| &s.blocks).flat_map(Block::text_blocks) {
+            let Some(source) = &text.source else { continue };
+            if !ranges.iter().any(|range| super::source_range_contains_anchor(range, &source.start)
+                || super::source_range_contains_anchor(source, &range.start)) { continue; }
+            for (key, target, node) in links.preview_references(source, &text.content) {
+                if seen.iter().any(|old: &Target| old.section == target.section && old.block == target.block
+                    && old.images == target.images && old.captions == target.captions) { continue; }
+                bytes += target.retained_bytes() + key.number.len() + node.as_ref().map_or(0, String::len) + 256;
+                if bytes > INDEX_BUDGET { return items; }
+                let destination = node.map(|node| (target.section, node));
+                seen.push(target);
+                items.push(PreviewItem { origin: source.clone(), key, destination });
+            }
+        }
+        items
+    }
+
+    pub(super) fn open_focus_reference_preview(&mut self, ctx: &egui::Context) -> bool {
+        let Some(unit) = self.focus_units.get(self.focus_unit_index) else { return false };
+        let items = self.focus_reference_previews(&unit.range);
+        if items.is_empty() { return false; }
+        self.open_media_items(ctx, items, 0);
+        true
+    }
+
+    fn open_media_items(&mut self, ctx: &egui::Context, items: Vec<PreviewItem>, index: usize) {
+        let Some(item) = items.get(index) else { return };
         self.ui.focus_navigation_repeat = Default::default();
         self.ui.focus_wheel.reset();
         self.ui.wheel_accumulator = 0.0;
@@ -965,8 +1077,8 @@ impl super::DesktopReader {
         self.media_preview.active = Some(Preview {
             motion: PreviewMotion::new(ctx),
             content_motion: None,
-            origin,
-            key,
+            origin: item.origin.clone(),
+            key: item.key.clone(),
             texture: None,
             captions: vec![],
             caption_textures: vec![],
@@ -977,6 +1089,11 @@ impl super::DesktopReader {
             next: None,
             error: None,
             loading: true,
+            items,
+            item_index: index,
+            displayed_index: index,
+            position: String::new(),
+            multipart: false,
         });
         self.request_media_page(ctx, Cursor::default());
     }
@@ -988,17 +1105,15 @@ impl super::DesktopReader {
             return;
         };
         active.loading = true;
-        active.texture = None;
-        active.caption_textures.clear();
-        active.content_motion = None;
         active.error = None;
-        active.pan = egui::Vec2::ZERO;
-        active.zoom = 1.0;
+        active.previous = None;
+        active.next = None;
         let generation = worker.generation.fetch_add(1, Ordering::AcqRel) + 1;
         worker.pending.store(Some(Arc::new(Job {
             generation,
             source: self.source.clone(),
             catalog: self.media_preview.links.clone(),
+            destination: active.items.get(active.item_index).and_then(|item| item.destination.clone()),
             origin: active.origin.clone(),
             key: active.key.clone(),
             cursor,
@@ -1007,6 +1122,15 @@ impl super::DesktopReader {
         })));
         let _ = worker.tx.try_send(());
         ctx.request_repaint();
+    }
+
+    fn step_media_item(&mut self, ctx: &egui::Context, direction: isize) {
+        let Some(active) = &mut self.media_preview.active else { return };
+        let Some(index) = active.item_index.checked_add_signed(direction).filter(|i| *i < active.items.len()) else { return };
+        active.item_index = index;
+        active.origin = active.items[index].origin.clone();
+        active.key = active.items[index].key.clone();
+        self.request_media_page(ctx, Cursor::default());
     }
     pub(super) fn close_media_preview(&mut self, ctx: &egui::Context) {
         let Some(active) = &mut self.media_preview.active else { return };
@@ -1027,7 +1151,8 @@ impl super::DesktopReader {
         if self.media_preview.active.as_ref().is_some_and(|active| active.motion.is_closing()) {
             return true;
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+            || i.consume_shortcut(&self.shortcuts.focus_image_preview)) {
             self.close_media_preview(ctx);
             return true;
         }
@@ -1040,11 +1165,19 @@ impl super::DesktopReader {
                 0
             }
         });
-        if direction != 0
+        if direction != 0 {
+            self.step_media_item(ctx, direction);
+        }
+        let part = ctx.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::PageUp) { -1 }
+            else if i.consume_key(egui::Modifiers::NONE, egui::Key::PageDown) { 1 }
+            else { 0 }
+        });
+        if part != 0
             && let Some(active) = &self.media_preview.active
             && !active.loading
         {
-            let cursor = if direction < 0 {
+            let cursor = if part < 0 {
                 active.previous
             } else {
                 active.next
@@ -1085,13 +1218,20 @@ impl super::DesktopReader {
                 if active.motion.is_closing() { return; }
                 active.loading = false;
                 if completion.revision != self.source.content_revision() {
+                    active.texture = None;
+                    active.caption_textures.clear();
                     active.error =
                         Some("The book content changed. Please reopen the preview.".into());
                     return;
                 }
                 match completion.result {
                     Ok(ready) => {
-                        active.content_motion = Some(PreviewMotion::new(ctx));
+                        active.content_motion = active.texture.is_none().then(|| PreviewMotion::new(ctx));
+                        active.displayed_index = active.item_index;
+                        active.position = ready.position;
+                        active.multipart = ready.previous.is_some() || ready.next.is_some();
+                        active.zoom = 1.0;
+                        active.pan = egui::Vec2::ZERO;
                         active.size = egui::vec2(ready.size[0] as f32, ready.size[1] as f32);
                         active.texture = Some(ctx.load_texture(
                             "media-preview",
@@ -1113,7 +1253,14 @@ impl super::DesktopReader {
                         active.previous = ready.previous;
                         active.next = ready.next;
                     }
-                    Err(error) => active.error = Some(error),
+                    Err(error) => {
+                        active.texture = None;
+                        active.caption_textures.clear();
+                        active.captions.clear();
+                        active.multipart = false;
+                        active.displayed_index = active.item_index;
+                        active.error = Some(error);
+                    }
                 }
             }
         }
@@ -1134,9 +1281,12 @@ impl super::DesktopReader {
         }
         let content_opacity = active.content_motion.as_ref().map_or(1.0, |motion| motion.opacity(ctx));
         let screen = crate::ui::overlay_rect(ctx);
-        let available = screen.shrink(32.0);
+        let available = if active.items.len() > 1 {
+            screen.shrink2(egui::vec2(64.0, 48.0))
+        } else { screen.shrink(32.0) };
         let mut close = false;
         let mut navigate = None;
+        let mut item_direction = 0;
         #[cfg(target_os = "windows")]
         crate::app::window_chrome::dim_controls(ctx, 190.0 / 255.0 * opacity);
         egui::Area::new("reader-media-preview".into())
@@ -1213,54 +1363,7 @@ impl super::DesktopReader {
                         active.zoom = 1.0;
                         active.pan = egui::Vec2::ZERO;
                     }
-                    let pointer = ctx.input(|i| i.pointer.hover_pos());
-                    let mut over_navigation = false;
-                    // Navigation appears only for multipart media, near the hovered edge.
-                    // Ordinary single-image/table previews have no toolbar or buttons.
-                    for (cursor, x, symbol, hint, id) in [
-                        (
-                            active.previous,
-                            (paper.left() - 24.0).max(screen.left() + 24.0),
-                            "‹",
-                            language.text("上一部分（←）", "Previous part (←)"),
-                            "previous",
-                        ),
-                        (
-                            active.next,
-                            (paper.right() + 24.0).min(screen.right() - 24.0),
-                            "›",
-                            language.text("下一部分（→）", "Next part (→)"),
-                            "next",
-                        ),
-                    ] {
-                        let Some(cursor) = cursor.filter(|_| !active.loading) else {
-                            continue;
-                        };
-                        let rect = egui::Rect::from_center_size(
-                            egui::pos2(x, available.center().y),
-                            egui::vec2(40.0, 64.0),
-                        );
-                        if !pointer.is_some_and(|p| rect.expand(20.0).contains(p)) {
-                            continue;
-                        }
-                        let response = ui
-                            .interact(rect, ui.id().with(id), egui::Sense::click())
-                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .on_hover_text(hint);
-                        ui.painter().text(
-                            rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            symbol,
-                            egui::FontId::proportional(36.0),
-                            egui::Color32::WHITE,
-                        );
-                        over_navigation |= response.hovered();
-                        if response.clicked() {
-                            navigate = Some(cursor);
-                        }
-                    }
                     close |= backdrop.clicked()
-                        && !over_navigation
                         && backdrop
                             .interact_pointer_pos()
                             .is_some_and(|p| !visible.contains(p));
@@ -1291,9 +1394,66 @@ impl super::DesktopReader {
                     );
                     close |= backdrop.clicked();
                 }
+                let mut over_navigation = false;
+                if active.items.len() > 1 {
+                    for (direction, x, glyph, hint) in [
+                        (-1_isize, screen.left() + 28.0, crate::ui::Icon::ChevronLeft,
+                            language.text("上一个引用（←）", "Previous reference (←)")),
+                        (1, screen.right() - 28.0, crate::ui::Icon::ChevronRight,
+                            language.text("下一个引用（→）", "Next reference (→)")),
+                    ] {
+                        if active.item_index.checked_add_signed(direction).is_none_or(|i| i >= active.items.len()) { continue; }
+                        let rect = egui::Rect::from_center_size(egui::pos2(x, screen.center().y), egui::vec2(40.0, 56.0));
+                        let response = ui.interact(rect, ui.id().with(("reference", direction)), egui::Sense::click())
+                            .on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(hint);
+                        ui.painter().rect_filled(rect, 20.0, egui::Color32::from_black_alpha(if response.hovered() { 110 } else { 55 }));
+                        crate::ui::paint_icon(ui, egui::Rect::from_center_size(rect.center(), egui::vec2(26.0, 26.0)), glyph,
+                            egui::Color32::from_white_alpha(if response.hovered() { 255 } else { 180 }));
+                        over_navigation |= response.hovered() || response.clicked();
+                        if response.clicked() { item_direction = direction; }
+                    }
+                    let shown = active.items.get(active.displayed_index);
+                    if let Some(shown) = shown {
+                        let kind = match shown.key.kind {
+                            MediaKind::Figure => language.text("图", "Figure"),
+                            MediaKind::Table => language.text("表", "Table"),
+                            MediaKind::Equation => language.text("公式", "Equation"),
+                        };
+                        ui.painter().text(egui::pos2(screen.center().x, screen.bottom() - 42.0), egui::Align2::CENTER_CENTER,
+                            format!("{kind} {} · {} / {}", shown.key.number, active.displayed_index + 1, active.items.len()),
+                            egui::FontId::proportional(14.0), egui::Color32::from_white_alpha(210));
+                    }
+                }
+                if active.multipart {
+                    let y = screen.bottom() - 18.0;
+                    ui.painter().text(egui::pos2(screen.center().x, y), egui::Align2::CENTER_CENTER,
+                        format!("{} {}", language.text("部分／页", "Part / page"), active.position),
+                        egui::FontId::proportional(12.0), egui::Color32::from_white_alpha(190));
+                    for (cursor, x, glyph, hint) in [
+                        (active.previous, screen.center().x - 145.0, crate::ui::Icon::ChevronLeft,
+                            language.text("上一部分（PageUp）", "Previous part (PageUp)")),
+                        (active.next, screen.center().x + 145.0, crate::ui::Icon::ChevronRight,
+                            language.text("下一部分（PageDown）", "Next part (PageDown)")),
+                    ] {
+                        let Some(cursor) = cursor.filter(|_| !active.loading) else { continue };
+                        let rect = egui::Rect::from_center_size(egui::pos2(x, y), egui::vec2(32.0, 24.0));
+                        let response = ui.interact(rect, ui.id().with(("part", x.to_bits())), egui::Sense::click())
+                            .on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(hint);
+                        crate::ui::paint_icon(ui, rect.shrink2(egui::vec2(6.0, 2.0)), glyph, egui::Color32::WHITE);
+                        over_navigation |= response.hovered() || response.clicked();
+                        if response.clicked() { navigate = Some(cursor); }
+                    }
+                }
+                if active.loading && active.texture.is_some() {
+                    ui.painter().text(egui::pos2(screen.center().x, screen.top() + 18.0), egui::Align2::CENTER_CENTER,
+                        language.text("正在加载…", "Loading…"), egui::FontId::proportional(13.0), egui::Color32::WHITE);
+                }
+                if over_navigation { close = false; }
             });
         if close {
             self.close_media_preview(ctx);
+        } else if item_direction != 0 {
+            self.step_media_item(ctx, item_direction);
         } else if let Some(cursor) = navigate {
             self.request_media_page(ctx, cursor);
         }
