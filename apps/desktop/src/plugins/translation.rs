@@ -910,15 +910,15 @@ fn apply_note_translation(
                     Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
                 })
                 .unwrap_or_default();
-            let original = text_block.content.clone();
+            let translated = replacement_block_content(translation, style, text_block);
             if mode == TranslationMode::Replace {
-                text_block.content = replacement_block_content(translation, style, text_block);
+                text_block.content = translated;
                 normalize_rtl_translation(text_block);
             } else {
                 text_block.content.push(Inline::Break);
                 text_block
                     .content
-                    .extend(replacement_content(translation, style, Some(&original)));
+                    .extend(translated);
             }
         });
     }
@@ -1717,7 +1717,12 @@ fn replacement_block_content(text: &str, style: TextStyle, original: &TextBlock)
             }),
         );
     }
-    let mut content = replacement_content(text, style, Some(&original.content));
+    let mut content = replacement_content_with_whitespace(
+        text,
+        style,
+        Some(&original.content),
+        original.kind == TextBlockKind::Preformatted,
+    );
     if matches!(original.kind, TextBlockKind::Heading(_)) {
         restore_heading_number_space(&original.content, &mut content);
     }
@@ -1763,7 +1768,22 @@ fn restore_heading_number_space(original: &[Inline], translated: &mut [Inline]) 
 }
 
 fn replacement_content(text: &str, style: TextStyle, original: Option<&[Inline]>) -> Vec<Inline> {
-    let text = normalize_translation_spacing(text);
+    replacement_content_with_whitespace(text, style, original, false)
+}
+
+fn replacement_content_with_whitespace(
+    text: &str,
+    style: TextStyle,
+    original: Option<&[Inline]>,
+    preserve_whitespace: bool,
+) -> Vec<Inline> {
+    // Preformatted whitespace is content: prose normalization would erase
+    // indentation, tabs, trailing spaces and alignment within code examples.
+    let text = if preserve_whitespace {
+        normalize_legacy_placeholder_tags(text)
+    } else {
+        std::borrow::Cow::Owned(normalize_translation_spacing(text))
+    };
     let has_source = original.is_some();
     let original = original.unwrap_or_default();
     let math = original
@@ -1792,7 +1812,7 @@ fn replacement_content(text: &str, style: TextStyle, original: Option<&[Inline]>
             // Without a source, preserve the supplied text rather than interpreting
             // an unresolved placeholder as an index into an empty formula list.
             vec![Inline::Text(TextRun {
-                text,
+                text: text.into_owned(),
                 style,
                 link: None,
             })]
@@ -2782,6 +2802,55 @@ mod tests {
             panic!("expected text block");
         };
         text_block_text(block)
+    }
+
+    #[test]
+    fn preformatted_translation_preserves_whitespace_in_replace_and_bilingual_views() {
+        let original = "<html>\n    ...\n     <dl epub:type=\"glossary\">\n         <dt><dfn>Brimstone</dfn></dt>\n         <dd>Sulphur; See Sulphur.</dd>\n     </dl>\n    ...\n</html>";
+        let translated = "<html>\n    ...\n     <dl epub:type=\"glossary\">\n         <dt><dfn>硫磺</dfn></dt>\n         <dd>硫；参见硫。</dd>\n     </dl>\n    ...\n</html>";
+        let base = source();
+        let escaped = original.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+        let section = rebook_html::parse_section(
+            &format!("<html><body><pre>{escaped}</pre><p>Original prose</p></body></html>"),
+            &base.book().sections[0],
+            |_| None,
+        ).unwrap();
+        assert_eq!(block_text(&section.blocks[0]), original);
+        for mode in [TranslationMode::Replace, TranslationMode::Bilingual] {
+            let overlay = TranslationBookSource::new(Arc::new(TestSource {
+                book: base.book().clone(), section: section.clone(),
+            }), mode);
+            overlay.set_enabled(true).unwrap();
+            overlay.set_target_language("简体中文").unwrap();
+            overlay.store_batch(0, &[
+                BlockTranslation { block_index: 0, segment_index: None, text: translated.into() },
+                BlockTranslation { block_index: 1, segment_index: None, text: "  普通    正文  ".into() },
+            ]).unwrap();
+            let displayed = overlay.parse_section(0).unwrap();
+            let translated_index = usize::from(mode == TranslationMode::Bilingual);
+            let Block::Text(code) = &displayed.blocks[translated_index] else { panic!("code block") };
+            assert_eq!(code.kind, TextBlockKind::Preformatted);
+            assert_eq!(text_block_text(code), translated);
+            assert_eq!(block_text(displayed.blocks.last().unwrap()), "普通正文");
+            if mode == TranslationMode::Bilingual {
+                assert_eq!(block_text(&displayed.blocks[0]), original);
+            }
+            overlay.set_enabled(false).unwrap();
+            assert_eq!(block_text(&overlay.parse_section(0).unwrap().blocks[0]), original);
+        }
+    }
+
+    #[test]
+    fn preformatted_translation_keeps_tabs_blank_lines_and_alignment_spaces() {
+        let text = "\n\tif ready:\n\t\tlabel = \"甲  乙\"  # 注释\n\n    column_a    column_b  \n";
+        let original = TextBlock {
+            kind: TextBlockKind::Preformatted,
+            content: vec![],
+            style: BlockStyle::default(),
+            source: None,
+        };
+        let content = replacement_block_content(text, TextStyle::default(), &original);
+        assert_eq!(text_block_text(&TextBlock { content, ..original }), text);
     }
 
     #[test]

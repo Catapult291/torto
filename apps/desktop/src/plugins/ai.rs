@@ -996,6 +996,7 @@ Paired <t-img-N>...</t-img-N> tags contain faithfully recognized image text. Ret
 Translate inlinefootnote contents; retain each complete group and ID exactly once. IDs identify sources, not display numbers.
 Move complete inline style tags around the corresponding translated words. Keep tag attributes and nesting; do not expand style ranges.
 Style tags include strong, em, i, cite, t-italic, t-size, u, sup, sub, noteref and noteback.
+For code and preformatted examples, preserve indentation, tabs, line breaks, blank lines and repeated spaces. Keep code syntax and identifiers unchanged; translate only human-language content and comments. Do not add Markdown fences.
 
 # Citation structure
 Retain every <citation id="N">...</citation> group and ID exactly once, including nested style tags.
