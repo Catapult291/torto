@@ -68,10 +68,12 @@ fn native_background_color() -> [u8; 3] {
     [background.r(), background.g(), background.b()]
 }
 
-fn toggle_fullscreen(state: &mut WindowState, app: &mut DesktopApp, ctx: &egui::Context) {
+fn toggle_fullscreen(state: &mut WindowState) {
     #[cfg(target_os = "windows")]
     {
         if let Some(placement) = state.windowed_placement.take() {
+            state.window.set_decorations(true);
+            state.native_frame.set_fullscreen(false);
             state.native_frame.restore_placement(&placement.native);
         } else {
             let Some(monitor) = state.window.current_monitor() else {
@@ -81,30 +83,21 @@ fn toggle_fullscreen(state: &mut WindowState, app: &mut DesktopApp, ctx: &egui::
                 return;
             };
             let placement = WindowedPlacement { native };
+            if state.window.is_maximized() {
+                state.window.set_maximized(false);
+            }
             // Do not call winit's set_fullscreen on Windows. Besides changing the
             // border and bounds it registers a taskbar/DWM fullscreen window. That
             // special compositor path can invalidate a wgpu flip-model surface when
             // an IME candidate window appears, producing a black frame while typing.
             let (position, size) = compositor_fullscreen_bounds(monitor.position(), monitor.size());
-            if let Err(error) = state.native_frame.set_fullscreen_bounds([
-                position.x,
-                position.y,
-                size.width.min(i32::MAX as u32) as i32,
-                size.height.min(i32::MAX as u32) as i32,
-            ]) {
-                state.native_frame.restore_placement(&placement.native);
-                tracing::warn!(%error, "failed to enter fullscreen");
-                return;
-            }
+            state.native_frame.set_fullscreen(true);
+            state.window.set_decorations(false);
+            state.window.set_outer_position(position);
+            let _ = state.window.request_inner_size(size);
             state.windowed_placement = Some(placement);
         }
     }
-    // Present at the final extent without overriding the system animation preference.
-    // Native resize messages generated during the change are still queued.
-    #[cfg(target_os = "windows")]
-    Application::render_window_state(state, app, ctx);
-    #[cfg(not(target_os = "windows"))]
-    let _ = (app, ctx);
     #[cfg(not(target_os = "windows"))]
     {
         let fullscreen = state
@@ -701,13 +694,6 @@ impl ApplicationHandler<UserEvent> for Application {
                     .log_reader_diagnostics("window.occluded.reader", None);
             }
             WindowEvent::Resized(size) => {
-                #[cfg(target_os = "windows")]
-                if size != state.window.inner_size() {
-                    // Do not reconfigure the swapchain to an intermediate size
-                    // from an already-completed fullscreen/maximize transition.
-                    state.window.request_redraw();
-                    return;
-                }
                 let minimized = state.window.is_minimized() == Some(true);
                 if minimized || size.width == 0 || size.height == 0 {
                     crate::diagnostics::log(
@@ -775,7 +761,7 @@ impl ApplicationHandler<UserEvent> for Application {
                     #[cfg(target_os = "windows")]
                     state.native_background.set_color(native_background_color());
                     if self.app.take_fullscreen_toggle_request() {
-                        toggle_fullscreen(state, &mut self.app, &self.egui_ctx);
+                        toggle_fullscreen(state);
                     }
                     state
                         .gpu
@@ -799,21 +785,6 @@ impl ApplicationHandler<UserEvent> for Application {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if crate::smoke::enabled() {
-            #[cfg(target_os = "windows")]
-            if let Some(state) = self.window.as_mut() {
-                match crate::smoke::fullscreen_tick(
-                    &state.window,
-                    state.windowed_placement.is_some(),
-                ) {
-                    Ok(true) => toggle_fullscreen(state, &mut self.app, &self.egui_ctx),
-                    Ok(false) => {}
-                    Err(error) => {
-                        self.fatal_error = Some(error);
-                        event_loop.exit();
-                        return;
-                    }
-                }
-            }
             if let Some(state) = &self.window
                 && let Err(error) = crate::smoke::window_tick(&self.egui_ctx, &state.window)
             {

@@ -7,9 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::{
-    DWMNCRP_DISABLED, DWMNCRP_ENABLED, DWMWA_NCRENDERING_POLICY, DWMWA_TRANSITIONS_FORCEDISABLED,
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND, DwmExtendFrameIntoClientArea,
-    DwmGetWindowAttribute, DwmSetWindowAttribute,
+    DWMNCRP_DISABLED, DWMNCRP_ENABLED, DWMWA_NCRENDERING_POLICY, DWMWA_WINDOW_CORNER_PREFERENCE,
+    DWMWCP_DONOTROUND, DWMWCP_ROUND, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
 };
 use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
 use windows_sys::Win32::Graphics::Gdi::{
@@ -44,60 +43,11 @@ struct State {
 
 pub struct WindowPlacement(WINDOWPLACEMENT);
 
-/// Suppress only the intermediate restore/maximize animations of an F11 change.
-/// Keep this alive through presentation of the first frame at the final bounds.
-/// Restore the window's previous preference, including on an early return.
-pub struct WindowTransition {
-    hwnd: isize,
-    previous: Option<i32>,
-}
-impl Drop for WindowTransition {
-    fn drop(&mut self) {
-        if let Some(previous) = self.previous {
-            unsafe {
-                DwmSetWindowAttribute(
-                    self.hwnd as HWND,
-                    DWMWA_TRANSITIONS_FORCEDISABLED as u32,
-                    &previous as *const _ as _,
-                    std::mem::size_of::<i32>() as u32,
-                );
-            }
-        }
-    }
-}
-
 pub struct WindowFrame {
     hwnd: isize,
     state: Arc<State>,
 }
 impl WindowFrame {
-    pub fn fullscreen_transition(&self) -> WindowTransition {
-        let mut previous = 0_i32;
-        let size = std::mem::size_of::<i32>() as u32;
-        let available = unsafe {
-            DwmGetWindowAttribute(
-                self.hwnd as HWND,
-                DWMWA_TRANSITIONS_FORCEDISABLED as u32,
-                &mut previous as *mut _ as _,
-                size,
-            )
-        } >= 0;
-        let disabled = 1_i32;
-        if available {
-            unsafe {
-                DwmSetWindowAttribute(
-                    self.hwnd as HWND,
-                    DWMWA_TRANSITIONS_FORCEDISABLED as u32,
-                    &disabled as *const _ as _,
-                    size,
-                );
-            }
-        }
-        WindowTransition {
-            hwnd: self.hwnd,
-            previous: available.then_some(previous),
-        }
-    }
     pub fn install(hwnd: isize) -> io::Result<Self> {
         if hwnd == 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid HWND"));
@@ -140,11 +90,9 @@ impl WindowFrame {
         Ok(WindowPlacement(placement))
     }
     pub fn restore_placement(&self, placement: &WindowPlacement) {
-        self.update_fullscreen(false);
         unsafe {
             SetWindowPlacement(self.hwnd as HWND, &placement.0);
         }
-        apply_dwm_frame(self.hwnd as HWND, false);
     }
     pub fn set_layout(&self, layout: FrameLayout) {
         // A resize/fullscreen transition can move the caption beneath a stationary
@@ -181,42 +129,25 @@ impl WindowFrame {
             *current = layout;
         }
     }
-    fn update_fullscreen(&self, fullscreen: bool) {
+    pub fn set_fullscreen(&self, fullscreen: bool) {
         if let Ok(mut layout) = self.state.layout.lock() {
             layout.fullscreen = fullscreen;
         }
         self.state.pressed.store(0, Ordering::Relaxed);
         self.state.hovered.store(0, Ordering::Relaxed);
+        apply_dwm_frame(self.hwnd as HWND, fullscreen);
         unsafe {
             ReleaseCapture();
-        }
-    }
-    /// Keep the custom caption's native styles intact and move directly to the
-    /// final extent. ShowWindow(SW_RESTORE) would expose the normal-sized window
-    /// before a maximized window reaches fullscreen.
-    pub fn set_fullscreen_bounds(&self, [x, y, width, height]: [i32; 4]) -> io::Result<()> {
-        let hwnd = self.hwnd as HWND;
-        let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
-        self.update_fullscreen(true);
-        apply_dwm_frame(hwnd, true);
-        unsafe {
-            SetWindowLongPtrW(hwnd, GWL_STYLE, style & !(WS_MAXIMIZE as isize));
-        }
-        let moved = unsafe {
             SetWindowPos(
-                hwnd,
+                self.hwnd as HWND,
                 std::ptr::null_mut(),
-                x,
-                y,
-                width,
-                height,
-                SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-            )
-        };
-        if moved == 0 {
-            return Err(io::Error::last_os_error());
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
         }
-        Ok(())
     }
     pub fn header_hovered(&self) -> bool {
         self.state.header_hovered.load(Ordering::Relaxed)
@@ -577,30 +508,6 @@ mod tests {
         assert!(!hwnd.is_null());
         let _window = HiddenWindow(hwnd);
         let frame = WindowFrame::install(hwnd as isize).unwrap();
-        let transitions = || {
-            let mut value = 0_i32;
-            let result = unsafe {
-                DwmGetWindowAttribute(
-                    hwnd,
-                    DWMWA_TRANSITIONS_FORCEDISABLED as u32,
-                    &mut value as *mut _ as _,
-                    std::mem::size_of::<i32>() as u32,
-                )
-            };
-            (result >= 0).then_some(value)
-        };
-        let before = transitions();
-        {
-            let _guard = frame.fullscreen_transition();
-            if before.is_some() {
-                assert_eq!(transitions(), Some(1));
-            }
-        }
-        assert_eq!(
-            transitions(),
-            before,
-            "F11 must restore the window's animation preference"
-        );
         let supports_dwm = non_client_rendering(hwnd).is_some();
         if supports_dwm {
             assert_eq!(non_client_rendering(hwnd), Some(true));
@@ -627,18 +534,7 @@ mod tests {
         );
         let mut placement = frame.save_placement().unwrap();
         placement.0.showCmd = SW_HIDE as u32; // Keep this integration test invisible.
-        // Enter from the maximized style without an intermediate SW_RESTORE.
-        let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
-        unsafe {
-            SetWindowLongPtrW(hwnd, GWL_STYLE, style | WS_MAXIMIZE as isize);
-        }
-        frame.set_fullscreen_bounds([120, 160, 1100, 750]).unwrap();
-        assert_eq!(unsafe { IsZoomed(hwnd) }, 0);
-        let fullscreen_style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
-        assert_eq!(
-            fullscreen_style & WS_OVERLAPPEDWINDOW as isize,
-            style & WS_OVERLAPPEDWINDOW as isize
-        );
+        frame.set_fullscreen(true);
         if supports_dwm {
             assert_eq!(non_client_rendering(hwnd), Some(false));
         }
@@ -646,16 +542,24 @@ mod tests {
             assert_eq!(corner_preference(hwnd), Some(DWMWCP_DONOTROUND));
         }
         unsafe {
-            GetClientRect(hwnd, &mut client);
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                120,
+                160,
+                1100,
+                750,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
         }
-        assert_eq!([client.right, client.bottom], [1100, 750]);
-        frame.restore_placement(&placement);
+        frame.set_fullscreen(false);
         if supports_dwm {
             assert_eq!(non_client_rendering(hwnd), Some(true));
         }
         if supports_corners {
             assert_eq!(corner_preference(hwnd), Some(DWMWCP_ROUND));
         }
+        frame.restore_placement(&placement);
         let restored = frame.save_placement().unwrap();
         let expected = placement.0.rcNormalPosition;
         let actual = restored.0.rcNormalPosition;
