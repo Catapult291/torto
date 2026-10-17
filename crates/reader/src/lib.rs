@@ -53,17 +53,30 @@ pub fn sentence_byte_ranges(text: &str) -> Vec<Range<usize>> {
     sentence_byte_ranges_with_language(text, "en")
 }
 
+mod sentence_protection;
+
 /// Returns sentence ranges as UTF-8 byte offsets while preserving every source
 /// character, including boundary whitespace and punctuation.
 pub fn sentence_byte_ranges_with_language(text: &str, language_hint: &str) -> Vec<Range<usize>> {
     let language = sentence_language_for_text(text, language_hint);
-    let initialisms = initialism_byte_ranges(text);
+    let mut protected = initialism_byte_ranges(text);
+    protected.extend(sentence_protection::abbreviation_ranges(text));
+    protected.sort_unstable_by_key(|r| r.start);
+    let mut initialisms: Vec<Range<usize>> = Vec::with_capacity(protected.len());
+    for span in protected {
+        if let Some(previous) = initialisms.last_mut() && span.start <= previous.end {
+            previous.end = previous.end.max(span.end);
+        } else { initialisms.push(span); }
+    }
+    let segmentation_text = sentence_protection::segmentation_text(text);
     let mut ranges: Vec<Range<usize>> = Vec::new();
-    for boundary in sentencex::get_sentence_boundaries(&language, text) {
+    let mut protected_index = 0;
+    for boundary in sentencex::get_sentence_boundaries(&language, &segmentation_text) {
+        while protected_index < initialisms.len() && ranges.last().is_some_and(|r| initialisms[protected_index].end <= r.end) {
+            protected_index += 1;
+        }
         if let Some(previous) = ranges.last_mut()
-            && initialisms
-                .iter()
-                .any(|span| span.start < previous.end && previous.end < span.end)
+            && initialisms.get(protected_index).is_some_and(|span| span.start < previous.end && previous.end < span.end)
         {
             previous.end = boundary.end_byte;
         } else {
@@ -114,6 +127,8 @@ fn initialism_byte_ranges(text: &str) -> Vec<Range<usize>> {
             // the following name prefix so the initial's last dot is protected
             // too, without hiding any punctuation after the name.
             ranges.push(chars[start].0..chars.get(name_end).map_or(text.len(), |(byte, _)| *byte));
+        } else if let Some(name_end) = sentence_protection::latin_name_end(&chars, cursor) {
+            ranges.push(chars[start].0..chars.get(name_end).map_or(text.len(), |(byte,_)|*byte));
         } else if initials >= 2 {
             ranges.push(chars[start].0..chars.get(end).map_or(text.len(), |(byte, _)| *byte));
         }
@@ -4192,7 +4207,7 @@ fn compile_segment_layout(
                             .source
                             .as_ref()
                             .is_some_and(|range| source_range_contains(range, &anchor.source)),
-                        PageItem::Separator(_) => false,
+                        PageItem::Separator(_) | PageItem::FigureBody(_) => false,
                     })
                 })
                 .map(|page| (anchor.fragment.clone(), page))
@@ -4762,9 +4777,7 @@ fn block_text_len(block: &Block) -> usize {
             .text_blocks()
             .map(|text| inline_content_len(&text.content))
             .sum(),
-        Block::Figure(figure) => figure
-            .captions
-            .iter()
+        Block::Figure(figure) => figure.text_blocks()
             .map(|caption| inline_content_len(&caption.content))
             .sum(),
         Block::Note(note) => note.blocks.iter().map(block_text_len).sum(),
@@ -4812,6 +4825,7 @@ fn append_block_geometry_sources(block: &Block, ranges: &mut Vec<SourceRange>) {
             ranges.extend(table.text_blocks().filter_map(|text| text.source.clone()))
         }
         Block::Figure(figure) => {
+            for child in &figure.body { append_block_geometry_sources(child, ranges); }
             ranges.extend(
                 figure
                     .images
@@ -4819,9 +4833,7 @@ fn append_block_geometry_sources(block: &Block, ranges: &mut Vec<SourceRange>) {
                     .filter_map(|image| image.source.clone()),
             );
             ranges.extend(
-                figure
-                    .captions
-                    .iter()
+                figure.text_blocks()
                     .filter_map(|caption| caption.source.clone()),
             );
         }
@@ -7079,7 +7091,7 @@ mod tests {
             .filter_map(|item| match item {
                 PageItem::Text(placement) => placement.source.as_ref(),
                 PageItem::Image(placement) => placement.source.as_ref(),
-                PageItem::Quote(_) | PageItem::Table(_) | PageItem::Separator(_) => None,
+                PageItem::Quote(_) | PageItem::Table(_) | PageItem::Separator(_) | PageItem::FigureBody(_) => None,
             })
             .collect::<Vec<_>>();
         assert!(

@@ -303,6 +303,7 @@ where
                     },
                 )
                 .await?;
+            super::changes::record(webdav, &book_id, true)?;
             acknowledge_derived(webdav, &book_id, DerivedDataKind::Metadata, &dirty_revision)?;
             Ok(completed.saturating_add(length))
         }
@@ -350,6 +351,7 @@ where
                     &manifest,
                 )
                 .await?;
+            super::changes::record(webdav, &book_id, true)?;
             acknowledge_derived(webdav, &book_id, kind, &dirty_revision)?;
             Ok(completed.saturating_add(length))
         }
@@ -424,7 +426,14 @@ where
     }
     require_unchanged(book_id, kind, dirty_revision)?;
     if kind == DerivedDataKind::NativePdf {
-        crate::plugins::pdf_native::import(book_id, unpack_native_archive(bytes)?)?;
+        if let Some(version) = crate::plugins::pdf_native::import_sync(book_id, unpack_native_archive(bytes)?)? {
+            webdav.cache_set(&native_skip_key(book_id), &native_skip_value(manifest, rebook_formats::pdf_reflow::VERSION))?;
+            crate::diagnostics::log("sync.native.incompatible", &[
+                crate::diagnostics::Field::Detail("book_id", book_id),
+                crate::diagnostics::Field::Usize("archive_version", version as usize),
+                crate::diagnostics::Field::Usize("reader_version", rebook_formats::pdf_reflow::VERSION as usize),
+            ]);
+        }
     } else {
         import_pdf_ocr_sync_data(book_id, unpack_ocr_archive(bytes)?)?;
     }
@@ -613,7 +622,7 @@ async fn collect_native_operation(
     let kind = DerivedDataKind::NativePdf;
     let revision = read_dirty_revision(book_id, kind)?;
     let root = crate::plugins::pdf_native::directory(book_id)?;
-    let fingerprint = fs::read(root.join("current.json")).ok().map(|b| sha256(&b));
+    let fingerprint = crate::plugins::pdf_native::sync_pointer(book_id)?.map(|b| sha256(&b));
     let key = format!("native-archive:{book_id}");
     let mut cached = webdav
         .cache_get(&key)?
@@ -692,15 +701,27 @@ async fn collect_native_operation(
                 manifest: local.manifest,
             })
         }
+        (_, Some(manifest)) if webdav.cache_get(&native_skip_key(book_id))?.as_deref()
+            == Some(native_skip_value(&manifest, rebook_formats::pdf_reflow::VERSION).as_slice()) => {
+            acknowledge_derived(webdav, book_id, kind, &revision)?;
+        }
         (_, Some(manifest)) => operations.push(DerivedOperation::DownloadArchive {
             kind,
             book_id: book_id.to_owned(),
             dirty_revision: revision,
             manifest,
         }),
-        _ => {}
+        (None, None) => acknowledge_derived(webdav, book_id, kind, &revision)?,
     }
     Ok(())
+}
+
+fn native_skip_key(book_id: &str) -> String {
+    format!("native-incompatible:{book_id}")
+}
+
+fn native_skip_value(manifest: &DerivedArchiveManifest, reader_version: u32) -> Vec<u8> {
+    format!("{reader_version}:{}", manifest.content_sha256).into_bytes()
 }
 
 fn unpack_native_archive(bytes: Vec<u8>) -> io::Result<Vec<(String, Vec<u8>)>> {
@@ -955,6 +976,80 @@ fn require_unchanged(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incompatible_native_download_finishes_and_expired_local_cache_is_not_uploaded() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        let id = sha256(uuid::Uuid::new_v4().as_bytes());
+        let root = std::env::temp_dir().join(format!("native-sync-{id}"));
+        let store = crate::sync::SyncStore::open_at(root.join("cache.sqlite"), "device").unwrap();
+        let mut settings = crate::sync::SyncSettings::new_device();
+        settings.provider = crate::sync::CloudProviderKind::Custom;
+        settings.base_url = "http://127.0.0.1:1".into();
+        settings.username = "reader".into();
+        let client = WebDavClient::new(&settings, "secret".into()).unwrap().with_store(store, "account".into());
+        let native_root = crate::plugins::pdf_native::directory(&id).unwrap();
+        fs::create_dir_all(&native_root).unwrap();
+        let pointer = serde_json::to_vec(&serde_json::json!({
+            "version": rebook_formats::pdf_reflow::VERSION - 1,
+            "generation": uuid::Uuid::new_v4().to_string()
+        })).unwrap();
+        fs::write(native_root.join("current.json"), &pointer).unwrap();
+        mark_derived_dirty(&id, DerivedDataKind::NativePdf).unwrap();
+        let mut operations = Vec::new();
+        collect_native_operation(&client, &id, &root, false, &mut operations).await.unwrap();
+        assert!(operations.is_empty(), "expired local IR must not fail or upload");
+        assert!(!is_dirty(&client, &id, DerivedDataKind::NativePdf).unwrap());
+
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        writer.start_file("manifest.json", SimpleFileOptions::default()).unwrap();
+        writer.write_all(&serde_json::to_vec(&serde_json::json!({
+            "version": 7, "book": {"id": id}, "original": {"id": id}
+        })).unwrap()).unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let manifest = ocr_manifest(&id, &bytes);
+        let path = root.join(format!("{id}-native-pdf-{}.part", manifest.content_sha256));
+        fs::write(&path, bytes).unwrap();
+        let revision = read_dirty_revision(&id, DerivedDataKind::NativePdf).unwrap();
+        let completed = download_archive(DerivedDataKind::NativePdf, &client, &id, &manifest,
+            &root, 23, 23 + manifest.content_length, &mut |_, _| {}, &revision).await.unwrap();
+        assert_eq!(completed, 23 + manifest.content_length);
+        assert!(!path.exists());
+        assert_eq!(fs::read(native_root.join("current.json")).unwrap(), pointer);
+        let skipped = client.cache_get(&native_skip_key(&id)).unwrap().unwrap();
+        assert_eq!(skipped, native_skip_value(&manifest, rebook_formats::pdf_reflow::VERSION));
+        assert_ne!(skipped, native_skip_value(&manifest, rebook_formats::pdf_reflow::VERSION + 1));
+        let mut changed = manifest.clone();
+        changed.content_sha256 = sha256(b"updated remote generation");
+        assert_ne!(skipped, native_skip_value(&changed, rebook_formats::pdf_reflow::VERSION));
+        fs::remove_file(dirty_marker_path(&id, DerivedDataKind::NativePdf).unwrap()).unwrap();
+        fs::remove_dir_all(native_root).unwrap();
+        drop(client);
+        fs::remove_dir_all(root).unwrap();
+        });
+    }
+
+    #[test]
+    #[ignore = "requires TORTO_TEST_NATIVE_SYNC_ARCHIVES; validates downloaded old IR without cloud requests"]
+    fn local_incompatible_native_archives_are_skipped_without_touching_the_generation() {
+        let root = PathBuf::from(std::env::var_os("TORTO_TEST_NATIVE_SYNC_ARCHIVES").unwrap());
+        let mut checked = 0;
+        for entry in fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy();
+            if !name.contains("-native-pdf-") || !name.ends_with(".part") { continue }
+            let id = &name[..64];
+            let directory = crate::plugins::pdf_native::directory(id).unwrap();
+            let before = fs::read(directory.join("current.json")).ok();
+            let version = crate::plugins::pdf_native::import_sync(id,
+                unpack_native_archive(fs::read(&path).unwrap()).unwrap()).unwrap();
+            assert!(version.is_some());
+            assert_eq!(fs::read(directory.join("current.json")).ok(), before);
+            eprintln!("book={id}; skipped incompatible reflow version={version:?}");
+            checked += 1;
+        }
+        assert!(checked >= 2, "expected both failing local archives");
+    }
 
     #[test]
     fn reactive_sync_selects_only_unacknowledged_local_changes_for_this_account() {

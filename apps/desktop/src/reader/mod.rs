@@ -65,6 +65,7 @@ static NEXT_SCENE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_CHAT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 mod assistant;
+mod title_translations;
 #[cfg(test)]
 mod blank_lines_tests;
 mod chat_autocomplete;
@@ -83,6 +84,7 @@ mod footnote_navigation;
 mod footnotes;
 mod images;
 mod media_preview;
+mod media_links;
 mod interaction;
 mod navigation;
 pub(super) mod render;
@@ -379,6 +381,7 @@ pub(crate) fn open_reader_staged(
         );
     };
     let fixed_page = canonical_source.book().metadata.layout == RenditionLayout::PrePaginated;
+    let media_original = canonical_source.clone();
     let rewrite_source = Arc::new(RewriteBookSource::new(canonical_source));
     let translation_source = Arc::new(if fixed_page {
         TranslationBookSource::new_fixed_page(
@@ -399,7 +402,8 @@ pub(crate) fn open_reader_staged(
         );
     }
     let structure_source = Arc::new(ParagraphStructureSource::new(semantic_source.clone()));
-    let source: Arc<dyn BookSource> = structure_source.clone();
+    let media_source = Arc::new(media_links::Source::new(structure_source.clone(), media_original));
+    let source: Arc<dyn BookSource> = media_source.clone();
     let highlights_started = Instant::now();
     let mut highlight_store = HighlightStore::from_repository(local_store.clone());
     let mut highlights = highlight_store.for_book(&book_id);
@@ -601,6 +605,7 @@ pub(crate) fn open_reader_staged(
         reader,
         DesktopReaderResources {
             source,
+            media_source: Some(media_source),
             rewrite_source,
             translation_source,
             structure_source,
@@ -829,7 +834,7 @@ fn legacy_translated_paragraph_range(
                 .filter(matches_range)
                 .map(|source| (source, crate::plugins::text_block_text(cell)))
         }),
-        Block::Figure(figure) => figure.captions.iter().find_map(|caption| {
+        Block::Figure(figure) => figure.text_blocks().find_map(|caption| {
             caption
                 .source
                 .as_ref()
@@ -1050,6 +1055,7 @@ struct ScrollQuoteBridge {
 
 #[derive(Clone)]
 struct FocusUnit {
+    media_key: Option<rebook_publication::media_references::MediaKey>,
     list_group: Option<Arc<focus_lists::ListGroup>>,
     range: SourceRange,
     paint_ranges: Vec<SourceRange>,
@@ -1107,6 +1113,7 @@ enum FocusFootnoteSource {
         text: String,
         source: SourceRange,
         number: u32,
+        display_number: u32,
     },
     Inline(String, u32),
     Reference {
@@ -1236,6 +1243,7 @@ fn text_block_focus_footnotes(block: &TextBlock) -> Vec<FocusFootnoteSource> {
             continue;
         };
         let number = run.style.inline_citation;
+        let display_number = if run.style.citation_number == 0 { number } else { run.style.citation_number };
         let Some(source) = block.source.as_ref().filter(|_| number != 0) else {
             index += 1;
             continue;
@@ -1252,6 +1260,7 @@ fn text_block_focus_footnotes(block: &TextBlock) -> Vec<FocusFootnoteSource> {
             text,
             source: source.clone(),
             number,
+            display_number,
         });
     }
     notes
@@ -1278,9 +1287,7 @@ fn block_is_footnote_definition(block: &Block) -> bool {
         Block::Table(table) => table
             .text_blocks()
             .any(|text| text_block_has_link_role(text, LinkRole::FootnoteBacklink)),
-        Block::Figure(figure) => figure
-            .captions
-            .iter()
+        Block::Figure(figure) => figure.text_blocks()
             .any(|caption| text_block_has_link_role(caption, LinkRole::FootnoteBacklink)),
         Block::Image(_) | Block::Separator(_) | Block::LineBreak | Block::PageBreak => false,
     }
@@ -1303,9 +1310,7 @@ fn block_focus_footnotes(block: &Block) -> Vec<FocusFootnoteSource> {
             .text_blocks()
             .flat_map(text_block_focus_footnotes)
             .collect(),
-        Block::Figure(figure) => figure
-            .captions
-            .iter()
+        Block::Figure(figure) => figure.text_blocks()
             .flat_map(text_block_focus_footnotes)
             .collect(),
         Block::Note(_) => Vec::new(),
@@ -1418,7 +1423,7 @@ fn collect_focus_footnote_translation_ranges(block: &Block, ranges: &mut Vec<Sou
             }
         }
         Block::Figure(figure) => {
-            for caption in &figure.captions {
+            for caption in figure.text_blocks() {
                 push_text(caption);
             }
         }
@@ -1498,11 +1503,9 @@ fn text_block_focus_text(block: &TextBlock) -> String {
             Inline::Text(run) if run.style.inline_role == InlineRole::Footnote => None,
             Inline::Text(run) => Some(run.text.clone()),
             Inline::Math(run) => Some(run.latex.clone()),
-            Inline::Image(run) => run
-                .image
-                .formula
-                .as_ref()
-                .map(|f| format!(r"\({}\)", f.latex)),
+            Inline::Image(run) => run.image.ocr_text.as_ref()
+                .map(|text| text.display_text().to_owned())
+                .or_else(|| run.image.formula.as_ref().map(|f| format!(r"\({}\)", f.latex))),
             Inline::Break => Some("\n".to_owned()),
         })
         .collect()
@@ -1636,9 +1639,7 @@ fn block_focus_text(block: &Block) -> String {
             .formula
             .as_ref()
             .map_or_else(|| image.alt.clone(), |f| format!(r"\({}\)", f.latex)),
-        Block::Figure(figure) => figure
-            .captions
-            .iter()
+        Block::Figure(figure) => figure.text_blocks()
             .map(text_block_focus_text)
             .collect::<Vec<_>>()
             .join(" "),
@@ -1685,11 +1686,10 @@ fn focus_block_paint_ranges(block: &Block, range: &SourceRange) -> Vec<SourceRan
             .iter()
             .filter_map(|image| image.source.clone())
             .chain(
-                figure
-                    .captions
-                    .iter()
+                figure.text_blocks()
                     .filter_map(|caption| caption.source.clone()),
             )
+            .chain(figure.body.iter().flat_map(|child| focus_block_paint_ranges(child, block_source_range(child).unwrap_or(range))))
             .collect::<Vec<_>>();
         if !figure_ranges.is_empty() {
             return figure_ranges;
@@ -1742,9 +1742,7 @@ fn focus_block_structure_ranges(block: &Block) -> Vec<SourceRange> {
         {
             text.source.iter().cloned().collect()
         }
-        Block::Figure(figure) => figure
-            .captions
-            .iter()
+        Block::Figure(figure) => figure.text_blocks()
             .filter_map(|caption| caption.source.clone())
             .collect(),
         Block::Quote(quote) => quote
@@ -1797,11 +1795,8 @@ fn focus_unit_geometry(
         let page = &layout.pages[page_index];
         for rect in page
             .page
-            .source_rects(paint_ranges)
+            .source_content_bounds(paint_ranges)
             .into_iter()
-            .chain(page.page.image_source_rects(paint_ranges))
-            .chain(page.page.source_table_bounds(paint_ranges))
-            .chain(page.page.source_quote_bounds(paint_ranges))
         {
             let rect = egui::Rect::from_min_max(
                 egui::pos2(rect.x0 as f32, layout.content_y(page_index, rect.y0 as f32)),
@@ -2781,7 +2776,25 @@ impl DesktopReader {
         Ok(layout)
     }
 
+    fn resolve_semantic_scope_footnotes(&mut self, blocks: &[Block], index: usize) -> Vec<FocusFootnote> {
+        let Some(block) = blocks.get(index) else { return Vec::new() };
+        if self.reader.style().typesetting.mode != rebook_layout::TypesettingMode::Unified {
+            return self.resolve_focus_footnotes(block);
+        }
+        let refs: Vec<_> = blocks.iter().collect();
+        let mut groups = rebook_layout::semantic_list_groups(&refs);
+        groups.extend(rebook_layout::semantic_paragraph_groups(&refs));
+        let Some(group) = groups.into_iter().find(|group| group.contains(&index)) else {
+            return self.resolve_focus_footnotes(block);
+        };
+        let mut scoped = blocks[group].to_vec();
+        rebook_layout::number_list_footnotes(&mut scoped);
+        scoped.iter().filter(|block| block_source_range(block).is_some())
+            .flat_map(|block| self.resolve_focus_footnotes(block)).collect()
+    }
+
     fn resolve_focus_footnotes(&mut self, block: &Block) -> Vec<FocusFootnote> {
+        let block_identity = block_source_range(block).map(rebook_publication::source_block_identity);
         let mut notes: Vec<_> = block_focus_footnotes(block)
             .into_iter()
             .enumerate()
@@ -2790,6 +2803,7 @@ impl DesktopReader {
                     text,
                     source,
                     number,
+                    display_number,
                 } => Some(FocusFootnote {
                     owner: None,
                     stable_id: Some(egui::Id::new((
@@ -2799,12 +2813,12 @@ impl DesktopReader {
                         number,
                     ))),
                     text,
-                    number,
+                    number: display_number,
                     citation: Some((source, number)),
                 }),
                 FocusFootnoteSource::Inline(text, number) => Some(FocusFootnote {
                     owner: None,
-                    stable_id: Some(egui::Id::new(("inline-note-slot", slot))),
+                    stable_id: Some(egui::Id::new(("inline-note-slot", block_identity, slot))),
                     text,
                     number,
                     citation: None,
@@ -2816,6 +2830,7 @@ impl DesktopReader {
                 } => {
                     let id = egui::Id::new((
                         "linked-note-slot",
+                        block_identity,
                         target.path(),
                         target.fragment(),
                         &marker,
@@ -2838,7 +2853,13 @@ impl DesktopReader {
         if notes.is_empty() {
             return notes;
         }
-        let numbered = rebook_layout::numbered_semantic_footnotes(block);
+        // Text blocks may already carry list-wide ordinals. Re-numbering one
+        // item here would detach later notes from their painted references.
+        let numbered = if matches!(block, Block::Text(_)) {
+            std::borrow::Cow::Borrowed(block)
+        } else {
+            rebook_layout::numbered_semantic_footnotes(block)
+        };
         fn collect_sources(block: &Block, out: &mut HashMap<u32, SourceRange>) {
             let mut text = |text: &TextBlock| {
                 if let Some(source) = &text.source {
@@ -2865,7 +2886,7 @@ impl DesktopReader {
                     }
                 }
                 Block::Figure(f) => {
-                    for t in &f.captions {
+                    for t in f.text_blocks() {
                         text(t);
                     }
                 }
@@ -3047,9 +3068,7 @@ impl DesktopReader {
                             continue;
                         };
                         let paint_ranges = focus_block_paint_ranges(block, &range);
-                        let caption = figure
-                            .captions
-                            .iter()
+                        let caption = figure.text_blocks()
                             .map(text_block_focus_text)
                             .filter(|text| !text.trim().is_empty())
                             .collect::<Vec<_>>()
@@ -3070,7 +3089,7 @@ impl DesktopReader {
                         } else {
                             text
                         };
-                        (range, paint_ranges, text, true, false, false, None)
+                        (range, paint_ranges, text, figure.body.is_empty(), false, !figure.body.is_empty(), None)
                     }
                     Block::Note(_) | Block::Separator(_) | Block::LineBreak | Block::PageBreak => {
                         active_list_root = None;
@@ -3146,16 +3165,18 @@ impl DesktopReader {
                 .then(|| single_focus_image_rect(layout, &paint_ranges))
                 .flatten();
             let caption_rect = if let Block::Figure(figure) = block {
-                let ranges = figure
-                    .captions
-                    .iter()
+                let ranges = figure.caption_blocks()
                     .filter_map(|caption| caption.source.clone())
                     .collect::<Vec<_>>();
                 focus_unit_geometry(layout, &ranges).map(|(rect, _)| rect)
             } else {
                 None
             };
+            let media_key = if let Block::Figure(figure) = block {
+                (!figure.body.is_empty()).then(|| figure.caption_blocks().find_map(|t| rebook_publication::media_references::caption_label(&text_block_focus_text(t)).map(|label| label.key))).flatten()
+            } else { None };
             let unit = FocusUnit {
+                media_key,
                 list_group: None,
                 range,
                 paint_ranges,
@@ -3794,6 +3815,7 @@ fn effective_typesetting(
 
 struct DesktopReaderResources {
     source: Arc<dyn BookSource>,
+    media_source: Option<Arc<media_links::Source>>,
     rewrite_source: Arc<RewriteBookSource>,
     translation_source: Arc<TranslationBookSource>,
     structure_source: Arc<ParagraphStructureSource>,
@@ -4200,6 +4222,7 @@ struct TranslationUiState {
     task: TaskSlot<TranslationTask>,
     toc_task: TaskSlot<TocTranslationTask>,
     toc_labels: HashMap<String, String>,
+    canonical_titles: HashMap<String, String>,
 }
 
 impl TranslationUiState {
@@ -4562,6 +4585,7 @@ impl DesktopReader {
     fn new(reader: ReaderSession, resources: DesktopReaderResources) -> Self {
         let DesktopReaderResources {
             source,
+            media_source,
             rewrite_source,
             translation_source,
             structure_source,
@@ -4692,7 +4716,7 @@ impl DesktopReader {
             selected_image: None,
             image_pointer_state: ImagePointerState::Idle,
             image_preview: None,
-            media_preview: Default::default(),
+            media_preview: media_preview::MediaPreviewController::with_links(media_source),
             annotation_note_draft: None,
             selected_highlight_id: None,
             focused_mark: None,
@@ -6302,11 +6326,8 @@ mod tests {
             for (index, page) in layout.pages.iter().enumerate() {
                 for rect in page
                     .page
-                    .source_rects(&ranges)
+                    .source_content_bounds(&ranges)
                     .into_iter()
-                    .chain(page.page.image_source_rects(&ranges))
-                    .chain(page.page.source_table_bounds(&ranges))
-                    .chain(page.page.source_quote_bounds(&ranges))
                 {
                     let rect = egui::Rect::from_min_max(
                         egui::pos2(rect.x0 as f32, layout.content_y(index, rect.y0 as f32)),
@@ -6506,6 +6527,7 @@ mod tests {
         let image_range = range("image");
         let caption_range = range("caption");
         let block = Block::Figure(FigureBlock {
+            body: Vec::new(),
             images: vec![ImageBlock {
                 ocr_text: None,
                 formula_image: false,
@@ -6551,6 +6573,7 @@ mod tests {
         let image_range = range("image", 0);
         let caption_range = range("caption", 18);
         let mut image = FocusUnit {
+            media_key: None,
             list_group: None,
             range: image_range.clone(),
             paint_ranges: vec![image_range],
@@ -6574,6 +6597,7 @@ mod tests {
             footnotes: Vec::new(),
         };
         let caption = FocusUnit {
+            media_key: None,
             list_group: None,
             range: caption_range.clone(),
             paint_ranges: vec![caption_range.clone()],
@@ -6622,6 +6646,7 @@ mod tests {
             text_offset: 0,
         };
         FocusUnit {
+            media_key: None,
             list_group: None,
             range: SourceRange {
                 start: anchor.clone(),
@@ -6910,6 +6935,7 @@ mod tests {
             page_index: 0,
         };
         let unit = |node: &str, text: &str, y: f32| FocusUnit {
+            media_key: None,
             list_group: None,
             range: range(node),
             paint_ranges: vec![range(node)],
@@ -6990,6 +7016,7 @@ mod tests {
             page_index: 0,
         };
         let units = ["previous", "target"].map(|node| FocusUnit {
+            media_key: None,
             list_group: None,
             range: range(node),
             paint_ranges: vec![range(node)],

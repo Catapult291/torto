@@ -1,4 +1,4 @@
-//! Media lookup and preview rasterization are dispatched only after a click.
+//! Media preview rasterization is dispatched only after a click.
 //! The worker retains bounded identifiers, never sections, layouts or pixels.
 use anyrender::ImageRenderer;
 use rebook_layout::{LayoutEngine, LayoutViewport, ReaderStyle, SpreadMode};
@@ -69,12 +69,19 @@ impl PreviewMotion {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Target {
-    section: usize,
-    block: usize,
+pub(super) struct Target {
+    pub(super) section: usize,
+    pub(super) block: usize,
     images: Vec<usize>,
     captions: Vec<usize>,
-    key: MediaKey,
+    pub(super) key: MediaKey,
+}
+
+impl Target {
+    pub(super) fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.key.number.len()
+            + (self.images.len() + self.captions.len()) * std::mem::size_of::<usize>()
+    }
 }
 
 fn plain(text: &TextBlock) -> String {
@@ -121,14 +128,18 @@ fn caption_text(text: &TextBlock) -> String {
 #[path = "media_preview_tests.rs"]
 mod tests;
 
-fn targets(section: &Section, index: usize) -> Vec<Target> {
+pub(super) fn targets(section: &Section, index: usize) -> Vec<Target> {
     let mut result = Vec::new();
     for (at, block) in section.blocks.iter().enumerate() {
+        if let Some(key) = media_references::equation_target(block) {
+            result.push(Target { section: index, block: at, images: vec![], captions: vec![], key });
+            continue;
+        }
         let mut captions = Vec::new();
         let mut images = Vec::new();
         let (kind, texts): (Option<MediaKind>, Vec<&TextBlock>) = match block {
             // Some books publish their numbered tables as images.
-            Block::Figure(figure) => (None, figure.captions.iter().collect()),
+            Block::Figure(figure) => (None, figure.text_blocks().filter(|text| text.kind == rebook_publication::TextBlockKind::Caption).collect()),
             Block::Table(table) => {
                 let mut texts: Vec<_> = table.before.iter().chain(&table.after).collect();
                 if let Some(Block::Text(text)) =
@@ -210,7 +221,7 @@ fn targets(section: &Section, index: usize) -> Vec<Target> {
 fn text_blocks(block: &Block) -> Vec<&TextBlock> {
     match block {
         Block::Text(t) => vec![t],
-        Block::Figure(f) => f.captions.iter().collect(),
+        Block::Figure(f) => f.text_blocks().collect(),
         Block::Table(t) => t.text_blocks().collect(),
         Block::Quote(q) => q.body.iter().chain(&q.attribution).collect(),
         Block::Note(n) => n.blocks.iter().flat_map(text_blocks).collect(),
@@ -233,23 +244,9 @@ fn authored_link(
             continue;
         }
         let value = plain(text);
-        // Authored source offsets count text scalars, without display placeholders
-        // for inline images/math. Mask notes in this same flattened coordinate space.
-        let mut reference_text = value.as_bytes().to_vec();
-        let mut offset = 0;
-        for run in text.content.iter().flat_map(Inline::text_runs) {
-            let end = offset + run.text.len();
-            if run.style.link_role != rebook_publication::LinkRole::Normal
-                || run.style.inline_role != rebook_publication::InlineRole::Normal
-                || run.style.baseline != rebook_publication::TextBaseline::Normal
-                || run.style.suppress_media_references
-            {
-                reference_text[offset..end].fill(0);
-            }
-            offset = end;
-        }
-        let reference_text = std::str::from_utf8(&reference_text).expect("masked whole text runs preserve UTF-8");
-        for reference in media_references::references(reference_text)
+        // Authored source offsets count text scalars, without image placeholders.
+        let content: Vec<_> = text.content.iter().filter(|inline| matches!(inline, Inline::Text(_))).cloned().collect();
+        for reference in media_references::inline_references(&content)
             .into_iter()
             .filter(|r| &r.key == key)
         {
@@ -281,13 +278,17 @@ fn authored_link(
     Ok(found)
 }
 
-fn target_has_anchor(section: &Section, target: &Target, href: &PublicationUrl) -> bool {
+pub(super) fn target_has_anchor(section: &Section, target: &Target, href: &PublicationUrl) -> bool {
     let Some(fragment) = href.fragment() else {
         return false;
     };
     let Some(anchor) = section.anchors.iter().find(|a| a.fragment == fragment) else {
         return false;
     };
+    target_has_node(section, target, &anchor.source.node)
+}
+
+fn target_has_node(section: &Section, target: &Target, node: &str) -> bool {
     let mut indices = vec![target.block];
     indices.extend(&target.images);
     indices.extend(&target.captions);
@@ -306,7 +307,7 @@ fn target_has_anchor(section: &Section, target: &Target, href: &PublicationUrl) 
             Block::Table(t) => sources.extend(t.source.as_ref()),
             _ => {}
         }
-        sources.iter().any(|s| s.start.node == anchor.source.node)
+        sources.iter().any(|s| s.start.node == node)
     })
 }
 
@@ -328,7 +329,7 @@ fn unique(candidates: impl Iterator<Item = Target>) -> Result<Option<Target>, St
     }
 }
 
-fn select(
+pub(super) fn select(
     candidates: impl Iterator<Item = Target>,
     key: &MediaKey,
 ) -> Result<Option<Target>, String> {
@@ -342,7 +343,7 @@ fn select(
     }
 }
 
-fn chapter_scope(source: &dyn BookSource, origin: usize) -> Range<usize> {
+pub(super) fn chapter_scope(source: &dyn BookSource, origin: usize) -> Range<usize> {
     fn collect(
         entries: &[rebook_publication::TocEntry],
         source: &dyn BookSource,
@@ -407,6 +408,16 @@ impl Index {
     }
     fn resolve(&mut self, job: &Job, needed: &impl Fn() -> bool) -> Result<Target, String> {
         let source = job.source.as_ref();
+        // Reuse the validated catalog and stable source identity, even when AI
+        // layout or translation has shifted the displayed block ordinals.
+        if let Some((index, node)) = job.catalog.as_ref().and_then(|catalog| catalog.target_node(&job.origin, &job.key)) {
+            if !needed() { return Err("Cancelled".into()); }
+            let section = source.parse_section(index).map_err(|e| e.to_string())?;
+            self.add(&section, index)?;
+            if let Some(target) = select(self.entries[&index].iter().filter(|t| target_has_node(&section, t, &node)).cloned(), &job.key)? {
+                return Ok(target);
+            }
+        }
         let origin_index = source
             .book()
             .sections
@@ -417,30 +428,28 @@ impl Index {
             .parse_section(origin_index)
             .map_err(|e| e.to_string())?;
         self.add(&origin, origin_index)?;
-        if let Some(href) = authored_link(&origin, &job.origin, &job.key)?
-            && let Some(index) = source
-                .book()
-                .sections
-                .iter()
-                .position(|s| s.href.path() == href.path())
-        {
-            let section = if index == origin_index {
-                origin.clone()
-            } else {
-                source.parse_section(index).map_err(|e| e.to_string())?
-            };
-            self.add(&section, index)?;
-            if let Some(target) = select(
-                self.entries[&index]
-                    .iter()
-                    .filter(|t| target_has_anchor(&section, t, &href))
-                    .cloned(),
-                &job.key,
-            )? {
+        if let Some(href) = authored_link(&origin, &job.origin, &job.key)? {
+            let mut candidates = Vec::new();
+            for (index, _) in source.book().sections.iter().enumerate().filter(|(_, s)| s.href.path() == href.path()) {
+                if !needed() { return Err("Cancelled".into()); }
+                let section = if index == origin_index { origin.clone() }
+                    else { source.parse_section(index).map_err(|e| e.to_string())? };
+                self.add(&section, index)?;
+                candidates.extend(self.entries[&index].iter().filter(|t| target_has_anchor(&section, t, &href)).cloned());
+            }
+            if let Some(target) = select(candidates.into_iter(), &job.key)? {
                 return Ok(target);
             }
+            return Err("The authored media target is unavailable.".into());
         }
-        if let Some(target) = select(self.entries[&origin_index].iter().cloned(), &job.key)? {
+        let local: Vec<_> = source.book().sections.iter().enumerate()
+            .filter(|(_, s)| s.href.path() == source.book().sections[origin_index].href.path())
+            .map(|(index, _)| index).collect();
+        for index in &local {
+            if !needed() { return Err("Cancelled".into()); }
+            if !self.entries.contains_key(index) { self.add(&source.parse_section(*index).map_err(|e| e.to_string())?, *index)?; }
+        }
+        if let Some(target) = select(local.iter().flat_map(|index| &self.entries[index]).cloned(), &job.key)? {
             return Ok(target);
         }
         let scope = chapter_scope(source, origin_index);
@@ -511,6 +520,7 @@ struct Cursor {
 struct Job {
     generation: u64,
     source: Arc<dyn BookSource>,
+    catalog: Option<Arc<super::media_links::Source>>,
     origin: SourceRange,
     key: MediaKey,
     cursor: Cursor,
@@ -565,19 +575,37 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
     let mut caption_blocks: Vec<TextBlock> = Vec::new();
     let (chunk, chunk_count, blocks) = match block {
         Block::Figure(figure) => {
-            caption_blocks.extend(figure.captions.iter().cloned());
-            let at = job.cursor.chunk.min(figure.images.len().saturating_sub(1));
-            (
-                at,
-                figure.images.len(),
-                vec![Block::Image(
-                    figure
-                        .images
-                        .get(at)
-                        .ok_or("The figure has no image.")?
-                        .clone(),
-                )],
-            )
+            caption_blocks.extend(figure.caption_blocks().cloned());
+            if !figure.body.is_empty() {
+                if figure.body.len() > 4096
+                    || figure.body.iter().flat_map(Block::text_blocks)
+                        .map(|text| plain(text).len()).sum::<usize>() > 512 * 1024
+                {
+                    return Err("This figure is too large to preview safely.".into());
+                }
+                let body: Vec<_> = figure.body.iter().filter(|block| {
+                    !matches!(block, Block::Text(text) if matches!(text.kind,
+                        rebook_publication::TextBlockKind::Caption
+                            | rebook_publication::TextBlockKind::QuoteAttribution))
+                }).cloned().collect();
+                (0, 1, vec![Block::Figure(rebook_publication::FigureBlock {
+                    body,
+                    images: Vec::new(),
+                    captions: Vec::new(),
+                    caption_position: figure.caption_position,
+                    style: figure.style,
+                    source: figure.source.clone(),
+                })])
+            } else {
+                let at = job.cursor.chunk.min(figure.images.len().saturating_sub(1));
+                (
+                    at,
+                    figure.images.len(),
+                    vec![Block::Image(
+                        figure.images.get(at).ok_or("The figure has no image.")?.clone(),
+                    )],
+                )
+            }
         }
         Block::Table(table) => {
             caption_blocks.extend(table.before.iter().chain(&table.after).cloned());
@@ -623,6 +651,9 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
                 return Err("This table segment is too large to preview safely.".into());
             }
             (at, ranges.len(), vec![Block::Table(part)])
+        }
+        Block::Text(_) | Block::Image(_) if media_references::equation_target(block).is_some() => {
+            (0, 1, vec![block.clone()])
         }
         Block::Text(_) => {
             caption_blocks.extend(target.captions.iter().filter_map(|i| {
@@ -691,18 +722,24 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
     if !needed() {
         return Err("Cancelled".into());
     }
-    let height = (display.content_bottom().unwrap_or(100.0) + 8.0)
-        .ceil()
-        .clamp(1.0, height as f32) as usize;
-    let width = rebook_layout::reading_content_width(1200.0, &style).ceil() as usize + 32;
-    let left = rebook_layout::reading_content_left(1200.0, &style) - 16.0;
+    let surface = matches!(block, Block::Figure(figure) if !figure.body.is_empty())
+        .then(|| page.items.iter().find_map(|item| match item {
+            rebook_layout::PageItem::FigureBody(body) => Some(body), _ => None,
+        })).flatten();
+    // Fit the preview to the actual figure surface, including its padding,
+    // rather than retaining an entire reading column around a short diagram.
+    let top = surface.map_or(0.0, |body| body.y);
+    let height = surface.map_or_else(|| display.content_bottom().unwrap_or(100.0) + 8.0, |body| body.height)
+        .ceil().clamp(1.0, height as f32) as usize;
+    let width = surface.map_or_else(|| rebook_layout::reading_content_width(1200.0, &style).ceil() as usize + 32, |body| body.width.ceil() as usize);
+    let left = surface.map_or_else(|| rebook_layout::reading_content_left(1200.0, &style) - 16.0, |body| body.x);
     if width * height * 4 > PIXEL_BUDGET {
         return Err("The preview exceeds the image memory limit.".into());
     }
     let mut renderer = anyrender_vello_cpu::VelloCpuImageRenderer::new(width as u32, height as u32);
     let mut pixels = Vec::new();
     renderer.render_to_vec(
-        |scene| display.paint_scaled_at(scene, 1.0, -left, 0.0),
+        |scene| display.paint_scaled_at(scene, 1.0, -left, -top),
         &mut pixels,
     );
     let image = egui::ColorImage::from_rgba_premultiplied([width, height], &pixels);
@@ -714,7 +751,14 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
     caption_style.top_margin = 8.0;
     caption_style.bottom_margin = 8.0;
     for caption in &mut caption_blocks {
-        caption.kind = rebook_publication::TextBlockKind::Caption;
+        let text = caption_text(caption).trim_start().to_lowercase();
+        if ["source:", "sources:", "source：", "credit:", "credits:", "credit：", "来源:", "来源：", "图片来源:", "图片来源："]
+            .iter().any(|prefix| text.starts_with(prefix))
+        {
+            caption.kind = rebook_publication::TextBlockKind::QuoteAttribution;
+        } else if caption.kind != rebook_publication::TextBlockKind::QuoteAttribution {
+            caption.kind = rebook_publication::TextBlockKind::Caption;
+        }
     }
     let caption_blocks: Vec<_> = caption_blocks.into_iter().map(Block::Text).collect();
     let caption_layout = engine
@@ -871,9 +915,17 @@ struct Preview {
 }
 #[derive(Default)]
 pub(super) struct MediaPreviewController {
+    pub(super) links: Option<Arc<super::media_links::Source>>,
+    pub(super) links_revision: u64,
     worker: Option<Worker>,
     active: Option<Preview>,
     restore_parent: bool,
+}
+
+impl MediaPreviewController {
+    pub(super) fn with_links(links: Option<Arc<super::media_links::Source>>) -> Self {
+        Self { links, ..Default::default() }
+    }
 }
 
 impl super::DesktopReader {
@@ -946,6 +998,7 @@ impl super::DesktopReader {
         worker.pending.store(Some(Arc::new(Job {
             generation,
             source: self.source.clone(),
+            catalog: self.media_preview.links.clone(),
             origin: active.origin.clone(),
             key: active.key.clone(),
             cursor,
@@ -1218,13 +1271,13 @@ impl super::DesktopReader {
                         .is_some_and(|error| error.contains("several"))
                     {
                         language.text(
-                            "存在多个同号图表，无法确定对应内容",
-                            "Several figures/tables share this number",
+                            "存在多个同号图表或公式，无法确定对应内容",
+                            "Several figures, tables or equations share this number",
                         )
                     } else if active.error.is_some() {
                         language.text(
-                            "未能预览对应图表，请关闭后重试",
-                            "Unable to preview this figure/table",
+                            "未能预览对应图表或公式，请关闭后重试",
+                            "Unable to preview this figure, table or equation",
                         )
                     } else {
                         language.text("正在加载…", "Loading…")

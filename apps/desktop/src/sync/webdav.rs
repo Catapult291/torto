@@ -38,11 +38,13 @@ pub(crate) struct WebDavClient {
     root: Url,
     username: String,
     password: String,
+    pub(super) device_id: String,
     cstcloud_compatibility: bool,
     cache: Option<(SyncStore, String)>,
     next_request: Arc<tokio::sync::Mutex<tokio::time::Instant>>,
     cooldown_until: Arc<AtomicU64>,
     cooldown_loaded: Arc<tokio::sync::OnceCell<()>>,
+    request_interval_ms: Arc<AtomicU64>,
     listings: Arc<std::sync::Mutex<super::listing::ListingCache>>,
 }
 
@@ -97,11 +99,13 @@ impl WebDavClient {
             root,
             username: settings.username.clone(),
             password,
+            device_id: settings.device_id.clone(),
             cstcloud_compatibility: compatibility_user_agent.is_some(),
             cache: None,
             next_request: Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now())),
             cooldown_until: Arc::new(AtomicU64::new(0)),
             cooldown_loaded: Arc::new(tokio::sync::OnceCell::new()),
+            request_interval_ms: Arc::new(AtomicU64::new(1000)),
             listings: Arc::new(std::sync::Mutex::new(
                 super::listing::ListingCache::default(),
             )),
@@ -126,6 +130,12 @@ impl WebDavClient {
                             .store(u64::from_le_bytes(bytes), Ordering::Relaxed);
                     }
                 }
+                if let Some(bytes) = self.cache_get(rate_limit::PACE_KEY)? {
+                    self.request_interval_ms.store(
+                        rate_limit::pace_interval(&bytes, rate_limit::now_ms()),
+                        Ordering::Relaxed,
+                    );
+                }
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
             })
             .await?;
@@ -136,7 +146,8 @@ impl WebDavClient {
             let at = {
                 let mut next = self.next_request.lock().await;
                 let at = (*next).max(tokio::time::Instant::now());
-                *next = at + Duration::from_secs(1);
+                *next =
+                    at + Duration::from_millis(self.request_interval_ms.load(Ordering::Relaxed));
                 at
             };
             tokio::time::sleep_until(at).await;
@@ -148,6 +159,19 @@ impl WebDavClient {
                 rate_limit::retry_after(response.headers(), std::time::SystemTime::now());
             let until = rate_limit::now_ms().saturating_add(retry_after.as_millis() as u64);
             self.cooldown_until.store(until, Ordering::Relaxed);
+            if self.cstcloud_compatibility {
+                let interval = self
+                    .request_interval_ms
+                    .load(Ordering::Relaxed)
+                    .saturating_mul(2)
+                    .clamp(2000, 8000);
+                self.request_interval_ms.store(interval, Ordering::Relaxed);
+                let mut policy = interval.to_le_bytes().to_vec();
+                policy.extend_from_slice(&rate_limit::now_ms().to_le_bytes());
+                if let Err(error) = self.cache_set(rate_limit::PACE_KEY, &policy) {
+                    tracing::warn!(%error, "failed to persist WebDAV pacing");
+                }
+            }
             if let Some((store, account)) = self.cache.clone() {
                 let saved = tokio::task::spawn_blocking(move || {
                     store.cache_set(&account, rate_limit::COOLDOWN_KEY, &until.to_le_bytes())
@@ -191,7 +215,7 @@ impl WebDavClient {
         })
     }
 
-    fn cached_object(&self, path: &str) -> SyncResult<Option<RemoteObject>> {
+    pub(super) fn cached_object(&self, path: &str) -> SyncResult<Option<RemoteObject>> {
         let Some(bytes) = self.cache_get(&format!("object:{path}"))? else {
             return Ok(None);
         };
@@ -891,9 +915,11 @@ mod tests {
         let store = SyncStore::open_at(database.clone(), settings.device_id.clone()).unwrap();
         let account = super::super::account_key(&settings);
         let make_client = || {
-            WebDavClient::new(&settings, "secret".into())
+            let mut client = WebDavClient::new(&settings, "secret".into())
                 .unwrap()
-                .with_store(store.clone(), account.clone())
+                .with_store(store.clone(), account.clone());
+            client.cstcloud_compatibility = true;
+            client
         };
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
@@ -926,6 +952,7 @@ mod tests {
                     .await
                     .unwrap_err(),
             ] {
+                assert_eq!(client.request_interval_ms.load(Ordering::Relaxed), 2000);
                 let delay = error.downcast_ref::<RateLimited>().unwrap().retry_after;
                 assert!(delay > Duration::from_secs(7190) && delay <= Duration::from_secs(7200));
             }

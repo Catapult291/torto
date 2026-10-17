@@ -135,7 +135,7 @@ impl BookSource for ParagraphStructureSource {
                     active
                 }
                 Block::Figure(figure) => {
-                    for caption in &mut figure.captions {
+                    for caption in figure.text_blocks_mut() {
                         if text_structure_is_active(caption, index, &state)
                             && text_kind_is_structurable(caption.kind)
                         {
@@ -452,7 +452,7 @@ fn structurable_text_for_node<'a>(block: &'a Block, node: &str) -> Option<&'a Te
     };
     match block {
         Block::Text(text) => matches(text).then_some(text),
-        Block::Figure(figure) => figure.captions.iter().find(|caption| matches(caption)),
+        Block::Figure(figure) => figure.text_blocks().find(|caption| matches(caption)),
         Block::Quote(quote) => quote.body.iter().find(|body| matches(body)),
         Block::Table(_)
         | Block::Image(_)
@@ -943,55 +943,6 @@ fn attach_footnote_atoms(
     attached
 }
 
-fn mask_leading_list_number(chars: &mut [char]) {
-    let Some(start) = chars
-        .iter()
-        .position(|character| !character.is_whitespace())
-    else {
-        return;
-    };
-    let closer = match chars[start] {
-        '(' => Some(')'),
-        '（' => Some('）'),
-        '[' => Some(']'),
-        '【' => Some('】'),
-        _ => None,
-    };
-    let digits_start = start + usize::from(closer.is_some());
-    let mut end = digits_start;
-    while chars.get(end).is_some_and(char::is_ascii_digit) {
-        end += 1;
-    }
-    if end == digits_start {
-        return;
-    }
-    if let Some(closer) = closer {
-        if chars.get(end) != Some(&closer) {
-            return;
-        }
-        end += 1;
-    } else if chars
-        .get(end)
-        .is_some_and(|character| matches!(character, '.' | ')' | '）' | '、' | '．'))
-    {
-        end += 1;
-    } else {
-        return;
-    }
-    if chars
-        .get(end)
-        .is_some_and(|character| character.is_whitespace())
-        && chars[end..]
-            .iter()
-            .any(|character| !character.is_whitespace())
-    {
-        // SentenceX treats a numbered item as one unsplittable span. Explicit
-        // sentence structure needs its internal boundaries. Mask only the
-        // segmentation copy, preserving character offsets and the source label.
-        chars[start..end].fill('\u{fffc}');
-    }
-}
-
 fn paragraph_atoms_with_protected_ranges(
     text: &str,
     protected_ranges: &[std::ops::Range<usize>],
@@ -1018,7 +969,6 @@ fn paragraph_atoms_with_protected_ranges(
             }
         }
     }
-    mask_leading_list_number(&mut segmentation_chars);
     let segmentation_text = segmentation_chars.iter().collect::<String>();
     let mut atoms: Vec<ParagraphAtom> = Vec::new();
     let mut start = 0;
@@ -1753,7 +1703,7 @@ mod tests {
     }
 
     #[test]
-    fn list_number_mask_leaves_decimals_formulas_and_asides_unchanged() {
+    fn shared_sentence_ranges_preserve_decimal_formula_and_aside_text() {
         for text in [
             "3.14 is pi.",
             "(8 + 2) is ten.",
@@ -1763,9 +1713,11 @@ mod tests {
             "[8]. A reference.",
             "Figure C.1 is referenced.",
         ] {
-            let mut chars: Vec<_> = text.chars().collect();
-            mask_leading_list_number(&mut chars);
-            assert_eq!(chars.iter().collect::<String>(), text);
+            let atoms = paragraph_atoms_with_protected_ranges(text, &[], &[], "en");
+            assert_eq!(atoms.iter().map(|a| a.text.as_str()).collect::<String>(), text);
+            if text.starts_with("3.14") || text.starts_with("(8 + 2)") || text.starts_with("Figure") {
+                assert_eq!(atoms.len(), 1, "{text}");
+            }
         }
     }
 
@@ -1929,6 +1881,7 @@ mod tests {
             href: href.clone(),
             blocks: vec![
                 Block::Figure(rebook_publication::FigureBlock {
+                    body: Vec::new(),
                     images: Vec::new(),
                     captions: vec![text_block(
                         TextBlockKind::Caption,

@@ -528,6 +528,7 @@ impl ReadingIrParser<'_> {
             };
             before.extend(after);
             self.blocks.push(Block::Figure(FigureBlock {
+                body: Vec::new(),
                 source: image.source.clone(),
                 style: BlockStyle::default(),
                 images: vec![image],

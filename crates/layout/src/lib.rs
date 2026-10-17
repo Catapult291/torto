@@ -14,8 +14,11 @@ mod caption_labels;
 mod formula_images;
 mod image_text;
 mod list_markers;
+#[cfg(test)]
+mod figure_typesetting_tests;
 mod formula_raster;
 mod headings;
+mod text_figures;
 mod hyphen_cache;
 mod note_spacing;
 mod raster_cache;
@@ -39,7 +42,7 @@ pub fn numbered_semantic_footnotes(block: &Block) -> Cow<'_, Block> {
             Block::Text(t) => has(t),
             Block::Quote(q) => q.body.iter().chain(q.attribution.iter()).any(has),
             Block::Table(t) => t.text_blocks().any(has),
-            Block::Figure(f) => f.captions.iter().any(has),
+            Block::Figure(f) => f.text_blocks().any(has),
             Block::Note(n) => n.blocks.iter().any(has_notes),
             _ => false,
         }
@@ -54,21 +57,42 @@ pub fn numbered_semantic_footnotes(block: &Block) -> Cow<'_, Block> {
 
 /// Shared display numbering for a complete semantic block, before pagination.
 pub fn number_semantic_footnotes(block: &mut Block) {
-    number_semantic_footnotes_from(block, &mut 0);
+    number_semantic_footnotes_from(block, &mut ReferenceNumbers::default());
 }
 
-fn number_semantic_footnotes_from(block: &mut Block, next: &mut u32) {
-    fn text(block: &mut TextBlock, next: &mut u32) {
+#[derive(Clone, Copy, Default)]
+struct ReferenceNumbers {
+    footnote: u32,
+    citation: u32,
+    number_citations: bool,
+}
+
+fn number_semantic_footnotes_from(block: &mut Block, next: &mut ReferenceNumbers) {
+    fn text(block: &mut TextBlock, next: &mut ReferenceNumbers) {
         for range in paragraph_footnotes(block) {
-            *next += 1;
+            next.footnote += 1;
             for inline in &mut block.content[range] {
                 if let Inline::Text(run) = inline {
-                    run.style.footnote_number = *next;
+                    run.style.footnote_number = next.footnote;
                 }
             }
         }
+        if !next.number_citations { return; }
+        let mut previous = 0;
+        for inline in &mut block.content {
+            if let Inline::Text(run) = inline {
+                let id = run.style.inline_citation;
+                if id != 0 {
+                    if id != previous { next.citation += 1; }
+                    run.style.citation_number = next.citation;
+                }
+                previous = id;
+            } else {
+                previous = 0;
+            }
+        }
     }
-    fn visit(block: &mut Block, next: &mut u32) {
+    fn visit(block: &mut Block, next: &mut ReferenceNumbers) {
         match block {
             Block::Text(t) => text(t, next),
             Block::Quote(q) => {
@@ -90,7 +114,7 @@ fn number_semantic_footnotes_from(block: &mut Block, next: &mut u32) {
                 }
             }
             Block::Figure(f) => {
-                for p in &mut f.captions {
+                for p in f.text_blocks_mut() {
                     text(p, next);
                 }
             }
@@ -105,14 +129,14 @@ fn number_semantic_footnotes_from(block: &mut Block, next: &mut u32) {
     visit(block, next);
 }
 
-/// Lists and authored paragraph groups each share one numbering scope.
+/// Lists and authored paragraph groups share footnote and citation display scopes.
 pub fn number_list_footnotes(blocks: &mut [Block]) {
     let refs: Vec<_> = blocks.iter().collect();
     let mut groups = semantic_list_groups(&refs);
     groups.extend(semantic_paragraph_groups(&refs));
     for group in groups {
-        let mut next = 0;
-        let mut previous_start = 0;
+        let mut next = ReferenceNumbers { number_citations: true, ..Default::default() };
+        let mut previous_start = next;
         for block in &mut blocks[group] {
             if matches!(block, Block::Text(t) if t.source.is_none()) {
                 number_semantic_footnotes_from(block, &mut previous_start.clone());
@@ -844,6 +868,7 @@ fn has_embedded_bitmap_glyphs(font: &FontRef<'_>) -> bool {
 /// Brush carried through Parley without coupling layout to a paint backend.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TextBrush {
+    pub media_reference: Option<rebook_publication::media_references::MediaKind>,
     pub color: Rgba,
     pub underline: bool,
     pub baseline: TextBaseline,
@@ -861,6 +886,7 @@ impl TextBrush {
         underline: bool,
         baseline: TextBaseline,
         footnote_reference_group: u32,
+        media_reference: Option<rebook_publication::media_references::MediaKind>,
     ) -> Self {
         Self {
             color,
@@ -868,6 +894,7 @@ impl TextBrush {
             baseline,
             footnote_reference: footnote_reference_group != 0,
             footnote_reference_group,
+            media_reference,
         }
     }
 }
@@ -896,10 +923,19 @@ pub struct PageLayout {
 /// Positioned page content.
 pub enum PageItem {
     Text(TextPlacement),
+    /// Background of a structured text figure; child text remains selectable.
+    FigureBody(FigureBodyPlacement),
     Quote(QuotePlacement),
     Table(TablePlacement),
     Image(ImagePlacement),
     Separator(SeparatorPlacement),
+}
+
+pub struct FigureBodyPlacement {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
 }
 
 /// Unified-typesetting decoration for one page slice of a semantic quotation.
@@ -1096,6 +1132,11 @@ fn collect_layout_blocks<'a>(
             if !hidden {
                 collect_layout_blocks(&note.blocks, reader_style, output);
             }
+            continue;
+        }
+        if let Block::Figure(figure) = block && !figure.body.is_empty()
+            && reader_style.typesetting.mode != TypesettingMode::Unified {
+            collect_layout_blocks(&figure.body, reader_style, output);
             continue;
         }
         if should_layout_flow_block(block, reader_style) {
@@ -1561,11 +1602,15 @@ impl LayoutEngine {
             let mut groups = semantic_list_groups(&layout_blocks);
             groups.extend(semantic_paragraph_groups(&layout_blocks));
             for group in groups {
-                let mut next = 0;
-                let mut previous_start = 0;
+                let mut next = ReferenceNumbers { number_citations: true, ..Default::default() };
+                let mut previous_start = next;
                 for block in &mut numbered_blocks[group] {
-                    // The per-block pass already owns blocks with notes; don't
-                    // clone image-free prose merely to visit an empty scope.
+                    if matches!(block.as_ref(), Block::Text(t) if t.content.iter()
+                        .any(|i| matches!(i, Inline::Text(r) if r.style.inline_citation != 0))) {
+                        block.to_mut();
+                    }
+                    // Own citation-only items here; the per-block pass already
+                    // owns footnotes. Leave prose without references borrowed.
                     if let Cow::Owned(block) = block {
                         if matches!(block, Block::Text(t) if t.source.is_none()) {
                             number_semantic_footnotes_from(block, &mut previous_start.clone());
@@ -1653,7 +1698,8 @@ impl LayoutEngine {
                         block_index += 1;
                         continue;
                     }
-                    if unified_reflow && block.kind == TextBlockKind::Caption {
+                    if unified_reflow && (block.kind == TextBlockKind::Caption
+                        || block.kind == TextBlockKind::QuoteAttribution && is_media_source(block)) {
                         let captions = consecutive_captions(&layout_blocks[block_index..]);
                         for (mut prepared, resolved) in self.shape_figure_captions(
                             source,
@@ -1929,6 +1975,9 @@ impl LayoutEngine {
                         paginator.push_fixed_page_replacement(&prepared, replacement)?;
                     }
                 }
+                Block::Figure(figure) if !figure.body.is_empty() => self.push_text_figure(
+                    &mut paginator, source, figure, reader_style,
+                )?,
                 Block::Figure(figure) => self.push_figure(
                     &mut paginator,
                     source,
@@ -2231,6 +2280,7 @@ impl LayoutEngine {
         preserve_bold: Option<bool>,
     ) -> Result<(PreparedText, Cow<'a, TextBlock>), LayoutError> {
         let note = caption.kind != TextBlockKind::Caption;
+        let source_note = note && is_media_source(caption);
         let mut resolved = if unified_reflow && note {
             let mut text = caption.clone();
             text.kind = TextBlockKind::Caption;
@@ -2241,10 +2291,10 @@ impl LayoutEngine {
                 preserve_bold,
             )
             .into_owned();
-            resolved.style.align = caption
-                .style
-                .authored_alignment
-                .unwrap_or(TextAlignment::Start);
+            resolved.style.align = if source_note { TextAlignment::End } else {
+                caption.style.authored_alignment.unwrap_or(TextAlignment::Start)
+            };
+            if source_note { resolved.style.logical_alignment = false; }
             Cow::Owned(resolved)
         } else {
             resolve_text_block_with_caption_emphasis(
@@ -2261,9 +2311,8 @@ impl LayoutEngine {
         let mut prepared =
             self.shape_text_from_source(source, &resolved, reader_style, content_width)?;
         if unified_reflow
-            && !note
-            && authored_alignment.is_none()
-            && caption_has_natural_wrap(&prepared)
+            && ((source_note && content_visible_lines(&prepared).take(2).count() > 1)
+                || (!note && authored_alignment.is_none() && caption_has_natural_wrap(&prepared)))
         {
             resolved.to_mut().style.align = TextAlignment::Start;
             prepared =
@@ -2416,6 +2465,18 @@ impl LayoutEngine {
                     let sources = Arc::clone(&prepared.source_spans);
                     *prepared =
                         self.shape_text_from_source(source, resolved, reader_style, content_width)?;
+                    prepared.source_spans = sources;
+                    prepared.lines = edge_content_lines(prepared);
+                }
+            }
+        }
+        let source_parts = captions.iter().filter(|caption| is_media_source(caption)).count();
+        if unified_reflow && source_parts > 1 {
+            for (prepared, resolved) in &mut shaped {
+                if is_media_source(resolved) && resolved.style.align != TextAlignment::Start {
+                    resolved.to_mut().style.align = TextAlignment::Start;
+                    let sources = Arc::clone(&prepared.source_spans);
+                    *prepared = self.shape_text_from_source(source, resolved, reader_style, content_width)?;
                     prepared.source_spans = sources;
                     prepared.lines = edge_content_lines(prepared);
                 }
@@ -2781,7 +2842,7 @@ impl LayoutEngine {
             None
         };
         let typography = &reader_style.typography;
-        let (text, mut spans, inline_images, source_text_start, citations, ruby_specs) =
+        let (text, mut spans, inline_images, source_text_start, citations, ruby_specs, image_text_ranges) =
             prepare_inline_content(
                 block,
                 reader_style.foreground,
@@ -2914,19 +2975,6 @@ impl LayoutEngine {
                 parley::OverflowWrap::BreakWord
             },
         );
-        if image_text && layout.lines().any(|line| line.items().any(|item| {
-            let PositionedLayoutItem::GlyphRun(run) = item else { return false };
-            let range = run.run().text_range();
-            (source_spans.is_empty() || source_spans.iter().any(|span| span.source.start.text_offset == span.source.end.text_offset
-                && span.range.start < range.end && span.range.end > range.start)
-            )
-                && run.glyphs().any(|glyph| glyph.id == 0)
-        })) {
-            let mut original = block.clone();
-            for inline in &mut original.content { if let Inline::Image(run) = inline { run.image.ocr_text = None; } }
-            return self.shape_text_with_sources(&original, reader_style, content_width, minimum_width,
-                inline_rasters, original_source_spans, optimize_line_breaks, formula_context);
-        }
         self.apply_text_indents(
             &mut layout,
             block,
@@ -3134,6 +3182,21 @@ impl LayoutEngine {
                     optimized = true;
                 }
             }
+        }
+        let mut missing_images = std::collections::HashSet::new();
+        if image_text { for line in layout.lines() { for run in line.runs() {
+            for cluster in run.clusters().filter(|c| c.glyphs().any(|g| g.id == 0)) {
+                let range = cluster.text_range();
+                for (index, span) in &image_text_ranges {
+                    if span.start < range.end && span.end > range.start { missing_images.insert(*index); }
+                }
+            }
+        } } }
+        if !missing_images.is_empty() {
+            let mut original = block.clone();
+            for index in missing_images { if let Inline::Image(run) = &mut original.content[index] { run.image.ocr_text = None; } }
+            return self.shape_text_with_sources(&original, reader_style, content_width, minimum_width,
+                inline_rasters, original_source_spans, optimize_line_breaks, formula_context);
         }
         let alignment = table_shaping::resolved_text_alignment(&layout, block, optimized);
         layout.align(alignment, AlignmentOptions::default());
@@ -3514,7 +3577,7 @@ impl LayoutEngine {
         builder.push_default(StyleProperty::LineHeight(LineHeight::FontSizeRelative(
             line_height,
         )));
-        let default_brush = TextBrush::new(foreground, false, TextBaseline::Normal, 0);
+        let default_brush = TextBrush::new(foreground, false, TextBaseline::Normal, 0, None);
         builder.push_default(StyleProperty::Brush(default_brush));
 
         for span in spans {
@@ -3552,6 +3615,7 @@ impl LayoutEngine {
                     span.style.underline,
                     span.style.baseline,
                     span.footnote_reference_group,
+                    span.style.media_reference,
                 )),
                 span.range.clone(),
             );
@@ -3952,7 +4016,7 @@ fn resolve_text_block_with_caption_emphasis<'a>(
     resolved.style.indent = if context == TextContext::Flow {
         match block.kind {
             TextBlockKind::Paragraph => {
-                base_size * paragraph_indent_em(profile, reader_style.writing_system)
+                base_size * paragraph_indent_em(profile, display_system)
             }
             TextBlockKind::Blockquote if block.style.indent > f32::EPSILON => base_size * 2.0,
             TextBlockKind::Blockquote => 0.0,
@@ -4016,6 +4080,10 @@ fn resolve_text_block_with_caption_emphasis<'a>(
         match inline {
             Inline::Text(run) => {
                 run.style.color = Rgba::BLACK;
+                // Unified typesetting owns automatic word breaking too. A
+                // book-wide CSS `hyphens: none` must not disable the reader's
+                // dictionary; technical runs are still excluded during shaping.
+                run.style.hyphenation = rebook_publication::HyphenationMode::Auto;
                 // Unified typesetting starts from a neutral decoration layer.
                 // Semantic/application decorations can opt back in explicitly.
                 run.style.underline = false;
@@ -4023,6 +4091,7 @@ fn resolve_text_block_with_caption_emphasis<'a>(
                     * run
                         .style
                         .inline_size_scale
+                        .filter(|_| !block.kind.is_heading())
                         .filter(|value| value.is_finite() && *value > 0.0)
                         .unwrap_or(1.0);
                 run.style.size_scale = match run.style.baseline {
@@ -4065,11 +4134,13 @@ fn resolve_text_block_with_caption_emphasis<'a>(
                         .base
                         .first()
                         .and_then(|r| r.style.inline_size_scale)
+                        .filter(|_| !block.kind.is_heading())
                         .filter(|value| value.is_finite() && *value > 0.0)
                         .unwrap_or(1.0);
                 for base in &mut run.base {
                     base.style.size_scale = scale
                         * base.style.inline_size_scale
+                            .filter(|_| !block.kind.is_heading())
                             .filter(|value| value.is_finite() && *value > 0.0)
                             .unwrap_or(1.0);
                     base.style.color = Rgba::BLACK;
@@ -4720,10 +4791,18 @@ fn consecutive_captions(blocks: &[&Block]) -> Vec<TextBlock> {
     blocks
         .iter()
         .map_while(|block| match block {
-            Block::Text(caption) if caption.kind == TextBlockKind::Caption => Some(caption.clone()),
+            Block::Text(caption) if caption.kind == TextBlockKind::Caption
+                || caption.kind == TextBlockKind::QuoteAttribution && is_media_source(caption) => Some(caption.clone()),
             _ => None,
         })
         .collect()
+}
+
+fn is_media_source(caption: &TextBlock) -> bool {
+    let text: String = caption.content.iter().flat_map(Inline::text_runs).map(|run| run.text.as_str()).collect();
+    let text = text.trim_start().to_lowercase();
+    ["source:", "sources:", "source：", "credit:", "credits:", "credit：", "来源:", "来源：", "图片来源:", "图片来源："]
+        .iter().any(|prefix| text.starts_with(prefix))
 }
 
 fn caption_authored_alignment(
@@ -4838,7 +4917,9 @@ fn prepare_inline_content(
     usize,
     Vec<InlineCitationPlacement>,
     Vec<RubySpec>,
+    Vec<(usize, Range<usize>)>,
 ) {
+    let mut image_text_ranges = Vec::new();
     let mut ruby_specs = Vec::new();
     let mut citations = Vec::new();
     let mut text = String::new();
@@ -4853,7 +4934,7 @@ fn prepare_inline_content(
     let prefix = if block.style.authored_list_marker.is_some() {
         String::new()
     } else {
-        list_marker_prefix(block.kind)
+        list_markers::prefix(block).unwrap_or_else(|| list_marker_prefix(block.kind))
     };
     if !prefix.is_empty() {
         let start = text.len();
@@ -4977,7 +5058,8 @@ fn prepare_inline_content(
                     style.baseline = TextBaseline::Normal;
                 } else if style.inline_citation != 0 {
                     let original: String = block.content[inline_index..].iter().take_while(|inline| matches!(inline, Inline::Text(r) if r.style.inline_citation == style.inline_citation)).filter_map(|i| match i { Inline::Text(r) => Some(r.text.as_str()), _ => None }).collect();
-                    let label = format!("[{}]", style.inline_citation);
+                    let number = if style.citation_number == 0 { style.inline_citation } else { style.citation_number };
+                    let label = format!("[{number}]");
                     text.push_str(&label);
                     for _ in label.chars().count()..original.chars().count() {
                         text.push('\u{2060}');
@@ -5199,6 +5281,7 @@ fn prepare_inline_content(
                 if unified_math && let Some(ocr) = &run.image.ocr_text {
                     let start = text.len();
                     text.push_str(ocr.display_text());
+                    image_text_ranges.push((inline_index, start..text.len()));
                     spans.push(StyledRange { ruby: None, range: start..text.len(),
                         style: image_text::style(block, inline_index, run.size_scale, fallback_color),
                         footnote_reference_group: 0, hyphenation_suppressed: ocr.literal });
@@ -5254,6 +5337,7 @@ fn prepare_inline_content(
         source_text_start,
         citations,
         ruby_specs,
+        image_text_ranges,
     )
 }
 
@@ -6073,6 +6157,7 @@ impl Paginator {
                     text.origin_y + metrics.block_max_coord.max(line_box_bottom)
                 }),
             PageItem::Quote(quote) => Some(quote.y + quote.height),
+            PageItem::FigureBody(body) => Some(body.y + body.height),
             PageItem::Image(image) => Some(image.y + image.height),
             PageItem::Table(table) => Some(table.y + table.height),
             PageItem::Separator(separator) => Some(separator.y + 1.0),
@@ -6659,7 +6744,7 @@ mod tests {
         };
         assert_eq!(paragraph_footnotes(&block).len(), 12);
         for _ in 0..2 {
-            let (text, spans, _, _, citations, _) = prepare_inline_content(
+            let (text, spans, _, _, citations, _, _) = prepare_inline_content(
                 &block,
                 Rgba::BLACK,
                 &ReaderTypography::default(),
@@ -6749,7 +6834,7 @@ mod tests {
         };
         let svg_options = resvg::usvg::Options::default();
 
-        let (focus_text, spans, _, _, _, _) = prepare_inline_content(
+        let (focus_text, spans, _, _, _, _, _) = prepare_inline_content(
             &block,
             Rgba::BLACK,
             &ReaderTypography::default(),
@@ -6778,7 +6863,7 @@ mod tests {
             )
         );
 
-        let (classic_text, disabled_spans, _, _, _, _) = prepare_inline_content(
+        let (classic_text, disabled_spans, _, _, _, _, _) = prepare_inline_content(
             &block,
             Rgba::BLACK,
             &ReaderTypography::default(),
@@ -7014,7 +7099,7 @@ mod tests {
         let typography = ReaderTypography::default();
         let svg_options = resvg::usvg::Options::default();
 
-        let (text, _, images, _, _, _) = prepare_inline_content(
+        let (text, _, images, _, _, _, _) = prepare_inline_content(
             &block,
             Rgba::BLACK,
             &typography,
@@ -7074,7 +7159,7 @@ mod tests {
         let typography = ReaderTypography::default();
         let svg_options = resvg::usvg::Options::default();
 
-        let (_, _, images, _, _, _) = prepare_inline_content(
+        let (_, _, images, _, _, _, _) = prepare_inline_content(
             &block,
             Rgba::BLACK,
             &typography,
@@ -9865,6 +9950,7 @@ mod tests {
             .filter_map(|item| match item {
                 PageItem::Text(text) => Some(text.inline_images.len()),
                 PageItem::Quote(_)
+                | PageItem::FigureBody(_)
                 | PageItem::Table(_)
                 | PageItem::Image(_)
                 | PageItem::Separator(_) => None,
@@ -10275,6 +10361,7 @@ mod tests {
                     image_bounds = Some((image.x, image.x + image.width));
                 }
                 PageItem::Quote(_) => {}
+                PageItem::FigureBody(_) => {}
                 PageItem::Separator(_) => {}
             }
         }
@@ -10339,7 +10426,7 @@ mod tests {
             .iter()
             .filter_map(|item| match item {
                 PageItem::Text(text) => Some(text.origin_x),
-                PageItem::Quote(_)
+                PageItem::Quote(_) | PageItem::FigureBody(_)
                 | PageItem::Table(_)
                 | PageItem::Image(_)
                 | PageItem::Separator(_) => None,
@@ -10597,6 +10684,7 @@ mod tests {
             id: SpineItemId::new("chapter").unwrap(),
             href: PublicationUrl::parse("chapter.xhtml").unwrap(),
             blocks: vec![Block::Figure(rebook_publication::FigureBlock {
+                body: Vec::new(),
                 images: vec![ImageBlock {
                     ocr_text: None,
                     formula_image: false,
@@ -10667,6 +10755,7 @@ mod tests {
             style: BlockStyle::default(), source: None,
         };
         let block = Block::Figure(rebook_publication::FigureBlock {
+            body: Vec::new(),
             images: vec![ImageBlock {
                 ocr_text: None, formula_image: false, formula: None,
                 href: PublicationUrl::parse("table.png").unwrap(), alt: "Table".into(),
@@ -10765,6 +10854,38 @@ mod tests {
             (unified_caption_top - (unified_image.y + unified_image.height) - expected_gap).abs()
                 < 0.01
         );
+    }
+
+    #[test]
+    fn media_sources_right_align_one_line_and_left_align_multiple_lines() {
+        let source = EmptySource::new("source-alignment");
+        let mut engine = LayoutEngine::new();
+        let style = ReaderStyle { typesetting: ReaderTypesetting::unified(), ..Default::default() };
+        let source_block = |text: &str| TextBlock {
+            kind: TextBlockKind::QuoteAttribution,
+            content: vec![Inline::Text(TextRun { text: text.into(), style: Default::default(), link: None })],
+            style: BlockStyle { authored_alignment: Some(TextAlignment::Center), align: TextAlignment::Center, ..Default::default() }, source: None,
+        };
+        let short = source_block("Source: A.");
+        let long = source_block("Source: A very long photograph credit with authors, publisher and licensing information that needs several lines.");
+        let mut forced = short.clone();
+        forced.content.extend([Inline::Break, Inline::Text(TextRun { text: "A second credit.".into(), style: Default::default(), link: None })]);
+        for (text, expected) in [(&short, TextAlignment::End), (&long, TextAlignment::Start), (&forced, TextAlignment::Start)] {
+            let (_, resolved) = engine.shape_figure_caption(&source, text, &style, 200.0, true, false).unwrap();
+            assert_eq!(resolved.style.align, expected);
+        }
+        let (_, authored) = engine.shape_figure_caption(&source, &short, &ReaderStyle::default(), 200.0, false, false).unwrap();
+        assert_eq!(authored.style.align, TextAlignment::Center);
+        let blocks = [Block::Text(short.clone()), Block::Text(long.clone())];
+        let layout = engine.layout_blocks(&source, &blocks, LayoutViewport::new(500, 1000).unwrap(), &style).unwrap();
+        let texts: Vec<_> = layout.pages.iter().flat_map(|page| &page.items).filter_map(|item| if let PageItem::Text(t)=item {Some(t)}else{None}).collect();
+        // A multi-paragraph source uses left alignment as one multi-line group.
+        assert!(texts.iter().all(|text| text.layout.get(text.lines.start).unwrap().metrics().offset.abs() < 0.01));
+        let caption = TextBlock { kind: TextBlockKind::Caption, ..source_block("Figure 1 Short caption") };
+        let parts = [caption, short];
+        let group = engine.shape_figure_captions(&source, &parts, &style, 500.0, true).unwrap();
+        assert_eq!(group[0].1.style.align, TextAlignment::Center);
+        assert_eq!(group[1].1.style.align, TextAlignment::End);
     }
 
     #[test]

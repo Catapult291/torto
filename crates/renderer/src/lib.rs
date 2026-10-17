@@ -953,6 +953,10 @@ impl PageDisplayList {
     pub fn source_content_bounds(&self, ranges: &[SourceRange]) -> Option<Rect> {
         self.source_rects(ranges)
             .into_iter()
+            .chain(self.text_regions.iter().filter_map(|region| {
+                let TextRegion::Shaped(region) = region else { return None };
+                region.marker_bounds_for_sources(ranges)
+            }))
             .chain(self.image_source_rects(ranges))
             .chain(self.source_table_bounds(ranges))
             .chain(self.source_quote_bounds(ranges))
@@ -1489,6 +1493,9 @@ struct ShapedTextRegion {
     text: Arc<str>,
     source_text_start: usize,
     source_text_end: usize,
+    /// Generated list marker owned by this first source fragment, excluded
+    /// from selection/copy but included in semantic focus bounds.
+    marker_end: usize,
     fragmented: bool,
     lines: Range<usize>,
     origin_x: f32,
@@ -1506,6 +1513,25 @@ struct DiscretionaryHyphen {
 }
 
 impl ShapedTextRegion {
+    fn marker_bounds_for_sources(&self, ranges: &[SourceRange]) -> Option<Rect> {
+        if self.marker_end == 0 || !ranges.iter().any(|range| {
+            self.byte_range_for_source(range).is_some_and(|bytes| {
+                bytes.start == self.source_text_start && bytes.end > bytes.start
+            })
+        }) {
+            return None;
+        }
+        let selection = Selection::new(
+            Cursor::from_byte_index(&self.layout, 0, Affinity::Downstream),
+            Cursor::from_byte_index(&self.layout, self.marker_end, Affinity::Upstream),
+        );
+        selection.geometry(&self.layout).into_iter()
+            .filter(|(_, line)| self.lines.contains(line))
+            .map(|(rect, _)| Rect::new(rect.x0, rect.y0, rect.x1, rect.y1)
+                + Vec2::new(self.origin_x.into(), self.origin_y.into()))
+            .reduce(|left, right| left.union(right))
+    }
+
     fn cursor_distance(&self, x: f32, y: f32) -> usize {
         let Some(visible) = self.visible_byte_range() else {
             return usize::MAX;
@@ -2416,6 +2442,13 @@ impl DisplayListCompiler {
                 parent_text_region = None;
             }
             match item {
+                PageItem::FigureBody(body) => {
+                    commands.push(DisplayCommand::FillRect(FillRectCommand {
+                        rect: Rect::new(body.x.into(), body.y.into(),
+                            (body.x + body.width).into(), (body.y + body.height).into()),
+                        color: Color::WHITE,
+                    }));
+                }
                 PageItem::Text(text) => {
                     let starts = (
                         commands.len(),
@@ -2695,6 +2728,7 @@ fn compile_table_commands(
 
 fn page_item_top(item: &PageItem) -> Option<f32> {
     match item {
+        PageItem::FigureBody(body) => Some(body.y),
         PageItem::Text(text) => text
             .layout
             .get(text.lines.start)
@@ -2708,6 +2742,7 @@ fn page_item_top(item: &PageItem) -> Option<f32> {
 
 fn page_item_bottom(item: &PageItem) -> Option<f32> {
     match item {
+        PageItem::FigureBody(body) => Some(body.y + body.height),
         PageItem::Text(text) => text
             .lines
             .end
@@ -2788,8 +2823,9 @@ fn fixed_page_mask_color(
 fn shaped_text_regions(text: &TextPlacement) -> impl Iterator<Item = TextRegion> + '_ {
     // Only actual links participate. Caption labels retain their neutral, bold
     // presentation, and external/work references cannot acquire invisible hits.
-    // Hit testing follows the link color, independently of decorative underlines.
+    // Hit testing follows explicit media semantics, independently of color.
     let mut links = Vec::new();
+    let mut equations: Vec<std::ops::Range<usize>> = Vec::new();
     let mut excluded = Vec::new();
     // A shaped run can contain several brushes. Its whole text_range is not
     // the range of an individual colored/footnote GlyphRun. Inspect clusters
@@ -2801,8 +2837,14 @@ fn shaped_text_regions(text: &TextPlacement) -> impl Iterator<Item = TextRegion>
         let brush = cluster.style().brush;
         if brush.footnote_reference || brush.baseline != rebook_publication::TextBaseline::Normal {
             excluded.push(cluster.text_range());
-        } else if brush.color.blue > brush.color.red {
+        } else if brush.media_reference.is_some() {
             links.push(cluster.text_range());
+            if brush.media_reference == Some(rebook_publication::media_references::MediaKind::Equation) {
+                let range = cluster.text_range();
+                if let Some(last) = equations.last_mut().filter(|last| last.end == range.start) {
+                    last.end = range.end;
+                } else { equations.push(range); }
+            }
         }
     }
     links.sort_unstable_by_key(|range| range.start);
@@ -2832,7 +2874,18 @@ fn shaped_text_regions(text: &TextPlacement) -> impl Iterator<Item = TextRegion>
             let media_references = if links.is_empty() {
                 Vec::new().into()
             } else {
-                rebook_publication::media_references::link_references(media_text)
+                let mut references = rebook_publication::media_references::link_references(media_text);
+                for equation in &equations {
+                    if equation.start >= range.start && equation.end <= range.end
+                        && let Some(key) = rebook_publication::media_references::equation_number(&text.text[equation.clone()])
+                    {
+                        let bare = equation.start - range.start..equation.end - range.start;
+                        if !references.iter().any(|r| r.range == bare) {
+                            references.push(rebook_publication::media_references::MediaReference { range: bare, key });
+                        }
+                    }
+                }
+                references
                     .into_iter().map(|mut reference| {
                         reference.range.start += range.start;
                         reference.range.end += range.start;
@@ -2857,6 +2910,7 @@ fn shaped_text_regions(text: &TextPlacement) -> impl Iterator<Item = TextRegion>
                 text: Arc::clone(&text.text),
                 source_text_start: range.start,
                 source_text_end: range.end,
+                marker_end: if range.start == text.source_text_start { text.source_text_start } else { 0 },
                 fragmented: !text.source_spans.is_empty(),
                 lines: text.lines.clone(),
                 origin_x: text.origin_x,
@@ -3522,6 +3576,7 @@ mod tests {
             layout_context.ranged_builder(&mut font_context, text.as_ref(), 1.0, false);
         builder.push_default(StyleProperty::FontSize(18.0));
         builder.push_default(StyleProperty::Brush(TextBrush {
+            media_reference: None,
             color: Rgba::BLACK,
             underline: false,
             baseline: TextBaseline::Normal,
@@ -3530,6 +3585,7 @@ mod tests {
         }));
         builder.push(
             StyleProperty::Brush(TextBrush {
+                media_reference: None,
                 color: Rgba::BLACK,
                 underline: false,
                 baseline: TextBaseline::Superscript,
@@ -3653,6 +3709,7 @@ mod tests {
             layout_context.ranged_builder(&mut font_context, text.as_ref(), 1.0, false);
         builder.push_default(StyleProperty::FontSize(18.0));
         builder.push_default(StyleProperty::Brush(TextBrush {
+            media_reference: None,
             color: Rgba::BLACK,
             underline: false,
             baseline: TextBaseline::Normal,
@@ -3749,6 +3806,7 @@ mod tests {
             layout_context.ranged_builder(&mut font_context, text.as_ref(), 1.0, false);
         builder.push_default(StyleProperty::FontSize(18.0));
         builder.push_default(StyleProperty::Brush(TextBrush {
+            media_reference: None,
             color: Rgba::BLACK,
             underline: false,
             baseline: TextBaseline::Normal,
@@ -3808,6 +3866,7 @@ mod tests {
             layout_context.ranged_builder(&mut font_context, text.as_ref(), 1.0, false);
         builder.push_default(StyleProperty::FontSize(18.0));
         builder.push_default(StyleProperty::Brush(TextBrush {
+            media_reference: None,
             color: Rgba::BLACK,
             underline: false,
             baseline: TextBaseline::Normal,
@@ -3903,6 +3962,7 @@ mod tests {
             layout_context.ranged_builder(&mut font_context, text.as_ref(), 1.0, false);
         builder.push_default(StyleProperty::FontSize(18.0));
         builder.push_default(StyleProperty::Brush(TextBrush {
+            media_reference: None,
             color: Rgba::BLACK,
             underline: false,
             baseline: TextBaseline::Normal,
@@ -3986,6 +4046,7 @@ mod tests {
             layout_context.ranged_builder(&mut font_context, text.as_ref(), 1.0, false);
         builder.push_default(StyleProperty::FontSize(18.0));
         builder.push_default(StyleProperty::Brush(TextBrush {
+            media_reference: None,
             color: Rgba::BLACK,
             underline: false,
             baseline: TextBaseline::Normal,
@@ -4074,6 +4135,7 @@ mod tests {
             layout_context.ranged_builder(&mut font_context, text.as_ref(), 1.0, false);
         builder.push_default(StyleProperty::FontSize(18.0));
         builder.push_default(StyleProperty::Brush(TextBrush {
+            media_reference: None,
             color: Rgba::BLACK,
             underline: false,
             baseline: TextBaseline::Normal,
@@ -4133,12 +4195,14 @@ mod tests {
                 origin_x: 24.0,
                 origin_y: 24.0,
                 available_width: 180.0,
-                source: Some(source),
+                source: Some(source.clone()),
                 inline_images: Arc::from([]),
             })],
         };
-        let fragment = DisplayListCompiler
-            .compile(&page)
+        let display = DisplayListCompiler.compile(&page);
+        let semantic = display.source_content_bounds(std::slice::from_ref(&source)).unwrap();
+        assert!(semantic.x0 <= 24.01, "semantic focus must include the generated marker");
+        let fragment = display
             .selection_fragment(0, "•\u{00a0}".len()..text.len())
             .unwrap();
         let first_rect = fragment
@@ -4359,6 +4423,7 @@ mod tests {
             layout_context.ranged_builder(&mut font_context, text.as_ref(), 1.0, false);
         builder.push_default(StyleProperty::FontSize(18.0));
         builder.push_default(StyleProperty::Brush(TextBrush {
+            media_reference: None,
             color: Rgba::BLACK,
             underline: false,
             baseline: TextBaseline::Normal,
@@ -4549,6 +4614,7 @@ mod tests {
             layout_context.ranged_builder(&mut font_context, text.as_ref(), 1.0, false);
         builder.push_default(StyleProperty::FontSize(14.0));
         builder.push_default(StyleProperty::Brush(TextBrush {
+            media_reference: None,
             color: Rgba::BLACK,
             underline: false,
             baseline: TextBaseline::Normal,

@@ -9,7 +9,7 @@ fn chars(block: &Block) -> usize {
         Block::Text(t) => text(t),
         Block::Quote(q) => q.body.iter().chain(q.attribution.iter()).map(text).sum(),
         Block::Table(t) => t.text_blocks().map(text).sum(),
-        Block::Figure(f) => f.captions.iter().map(text).sum(),
+        Block::Figure(f) => f.text_blocks().map(text).sum(),
         Block::Note(n) => n.blocks.iter().map(chars).sum(),
         Block::Image(i) => i.alt.chars().count(),
         _ => 0,

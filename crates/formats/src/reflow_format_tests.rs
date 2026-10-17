@@ -356,7 +356,7 @@ fn local_thinking_systems_ordinary_captions_use_automatic_alignment() {
             .blocks
             .iter()
             .flat_map(|block| match block {
-                Block::Figure(figure) => figure.captions.iter().collect::<Vec<_>>(),
+                Block::Figure(figure) => figure.text_blocks().collect::<Vec<_>>(),
                 Block::Text(text) if text.kind == TextBlockKind::Caption => vec![text],
                 _ => vec![],
             })
@@ -487,21 +487,15 @@ fn caption_alignment_uses_css_values_and_inheritance_with_arbitrary_class_names(
                 })
                 .unwrap();
             assert!(
-                figure
-                    .captions
-                    .iter()
+                figure.text_blocks()
                     .any(|caption| caption.style.authored_alignment == Some(TextAlignment::Center))
             );
             assert!(
-                figure
-                    .captions
-                    .iter()
+                figure.text_blocks()
                     .any(|caption| caption.style.authored_alignment == Some(TextAlignment::Start))
             );
             assert!(
-                figure
-                    .captions
-                    .iter()
+                figure.text_blocks()
                     .any(|caption| caption.style.authored_alignment == Some(TextAlignment::End))
             );
             let style = ReaderStyle {
@@ -518,7 +512,7 @@ fn caption_alignment_uses_css_values_and_inheritance_with_arbitrary_class_names(
                         &style,
                     )
                     .unwrap();
-                for caption in &figure.captions {
+                for caption in figure.text_blocks() {
                     let source_range = caption.source.as_ref().unwrap();
                     let text = layout
                         .pages
@@ -607,9 +601,7 @@ fn kindle_conversion_retains_css_tables_figures_inline_order_and_links() {
             })
             .unwrap();
         assert_eq!(
-            figure
-                .captions
-                .iter()
+            figure.text_blocks()
                 .map(crate::reflow::text)
                 .collect::<Vec<_>>(),
             ["Line one", "Line two"]

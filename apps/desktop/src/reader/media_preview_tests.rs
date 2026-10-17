@@ -301,6 +301,7 @@ fn job(source: Arc<dyn BookSource>, at: usize, key: &str) -> Job {
     Job {
         generation: 1,
         source,
+        catalog: None,
         origin,
         key: media_references::references(key)[0].key.clone(),
         cursor: Cursor::default(),
@@ -326,6 +327,33 @@ fn lookup_uses_links_and_local_scope_without_loading_images() {
         .resolve(&job(source.clone(), 1, "Figure 1"), &|| true)
         .unwrap();
     assert_eq!(local.section, 1);
+}
+
+#[test]
+fn structured_figures_preview_text_and_tables_with_caption_and_source() {
+    let source=source(&["<html><body><p>See Figure 4.3.</p><div><ol start='6'><li><p>Solve x = 2</p></li></ol><table><tr><td>Text cell</td></tr></table></div><p>Figure 4.3 Nested example</p><p>Source: Authors.</p></body></html>"]);
+    let request=job(source.clone(),0,"Figure 4.3");
+    let selected=Index::default().resolve(&request,&||true).unwrap();
+    assert_eq!(source.resources.load(Ordering::Relaxed),0);
+    let result=render(&request,selected,&||true).unwrap();
+    assert_eq!(result.captions,["Figure 4.3 Nested example","Source: Authors."]);
+    assert!(result.image.pixels.len()*4<=PIXEL_BUDGET);
+    assert!(result.size[1]>80);
+    assert!(result.image.pixels.iter().any(|p|p.r()<100));
+    assert_eq!(source.resources.load(Ordering::Relaxed),0);
+}
+#[test]
+fn short_text_figure_preview_fits_its_padded_body() {
+    let source = source(&["<html><body><p>See Figure 2.1.</p><figure><div><p>Short diagram</p><p style='text-align:right'>Right aligned</p></div><figcaption>Figure 2.1 Text example</figcaption></figure></body></html>"]);
+    let request = job(source.clone(), 0, "Figure 2.1");
+    let selected = Index::default().resolve(&request, &|| true).unwrap();
+    let result = render(&request, selected, &|| true).unwrap();
+    assert!(result.size[0] < 600, "short diagrams must not retain a full-width blank column");
+    assert!(result.size[1] > 70);
+    assert_eq!(result.image.pixels[0], egui::Color32::WHITE);
+    assert!(result.image.pixels.iter().any(|p| p.r() < 100));
+    assert_eq!(result.captions, ["Figure 2.1 Text example"]);
+    assert_eq!(source.resources.load(Ordering::Relaxed), 0);
 }
 #[test]
 fn ambiguous_global_numbers_and_list_of_figures_never_pick_a_target() {
@@ -514,7 +542,10 @@ fn unverified_translation_reference_cannot_borrow_a_nearby_links_shaped_run() {
 fn local_book_media_preview() {
     let publication =
         rebook_formats::open_file(std::env::var("TORTO_MEDIA_BOOK").unwrap()).unwrap();
-    let source = publication.source();
+    let original = publication.source();
+    let catalog = Arc::new(super::super::media_links::Source::new(original.clone(), original));
+    catalog.prepare_for_test();
+    let source: Arc<dyn BookSource> = catalog.clone();
     let wanted = media_references::references(
         &std::env::var("TORTO_MEDIA_KEY").unwrap_or("Figure 4.5".into()),
     )[0]
@@ -544,6 +575,7 @@ fn local_book_media_preview() {
     let mut request = Job {
         generation: 1,
         source,
+        catalog: Some(catalog),
         origin,
         key: wanted,
         cursor: Cursor::default(),
@@ -593,7 +625,7 @@ fn local_book_media_preview() {
             ready.image.pixels.len() * 4,
             ready.captions
         );
-        assert!(!ready.captions.is_empty());
+        if request.key.kind != MediaKind::Equation { assert!(!ready.captions.is_empty()); }
         assert!(ready.image.pixels.len() * 4 <= PIXEL_BUDGET);
         if count == 0
             && let Ok(path) = std::env::var("TORTO_MEDIA_PNG")
@@ -634,7 +666,9 @@ fn local_book_media_preview() {
         }
         assert!(count < 100);
     }
-    if let Block::Figure(figure) = &section.blocks[selected.block] {
+    if let Block::Figure(figure) = &section.blocks[selected.block]
+        && figure.body.is_empty()
+    {
         assert_eq!(
             count,
             figure.images.len(),

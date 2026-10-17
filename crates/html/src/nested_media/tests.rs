@@ -30,7 +30,7 @@ fn ordinary_figure_caption_wrappers_preserve_order_without_duplicates() {
         panic!()
     };
     assert_eq!(
-        figure.captions.iter().map(content).collect::<Vec<_>>(),
+        figure.text_blocks().map(content).collect::<Vec<_>>(),
         ["First caption.", "Second caption.", "Final caption."]
     );
 }

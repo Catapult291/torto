@@ -226,6 +226,64 @@ mod tests {
     }
 
     #[test]
+    fn list_reference_numbers_match_body_popup_and_click_targets_after_splitting() {
+        let (base, _, _) = super::super::semantic_layout::tests::fixture();
+        for list in [
+            "<ul><li>First <em>Author 2020</em><a href='#n1'><sup>40</sup></a><ul><li>Nested <em>Author 2020</em><a href='#n2'><sup>41</sup></a></li></ul></li><li>Last <em>Author 2020</em><a href='#n3'><sup>42</sup></a></li></ul>",
+            "<dl><dt>Term <em>Author 2020</em><a href='#n1'><sup>40</sup></a></dt><dd>Description <em>Author 2020</em><a href='#n2'><sup>41</sup></a></dd><dt>Other term <em>Author 2020</em><a href='#n3'><sup>42</sup></a></dt></dl>",
+        ] {
+            let html=format!("<html><body><p>Introduction <em>Author 2020</em><a href='#n0'><sup>39</sup></a></p>{list}<ol><li>Separate <em>Author 2020</em><a href='#n4'><sup>43</sup></a></li></ol><p>After.</p></body></html>");
+            let html=html.replace("<a href='#n1'><sup>40</sup></a>",""); // A citation-only item also needs scope numbering.
+            let mut section=rebook_html::parse_section(&html,&base.source.book().sections[0], |_|None).unwrap();
+            for block in &mut section.blocks {
+                if let Block::Text(text)=block { for inline in &mut text.content {
+                    if let Inline::Text(run)=inline && run.text.contains("2020") { run.style.inline_citation=1; }
+                } }
+            }
+            let groups=rebook_layout::semantic_list_groups(&section.blocks.iter().collect::<Vec<_>>());
+            assert_eq!(groups.len(),2);
+            let mut r=super::super::semantic_layout::tests::fixture_with_blocks(section.blocks.clone()).0;
+            r.scroll_viewport=Some(ScrollViewportState {size:egui::vec2(800.0,2000.0),offset_y:0.0});
+            let layout=r.current_scroll_layout().unwrap();
+            r.rebuild_focus_units(&layout);
+            let unit=r.focus_units.iter().find(|u|u.text.contains("Introduction")).unwrap();
+            let group_range=unit.list_group.as_ref().unwrap().range.clone();
+            let notes=unit.popup_footnotes().to_vec();
+            assert_eq!(notes.iter().filter(|n|n.citation.is_some()).map(|n|n.number).collect::<Vec<_>>(),vec![1,2,3,4]);
+            assert_eq!(notes.iter().filter(|n|n.citation.is_none()).map(|n|n.number).collect::<Vec<_>>(),vec![1,2,3]);
+            assert!(notes.iter().filter(|n|n.citation.is_none()).all(|n|n.owner.is_some()),"later items retain their return targets");
+            assert!(notes.iter().filter_map(|n|n.citation.as_ref()).all(|(_,id)|*id==1),"source citation IDs remain local");
+            assert_eq!(notes.iter().filter_map(|n|n.stable_id).collect::<HashSet<_>>().len(),7);
+            let mut labels=Vec::new();
+            let mut marker_numbers=Vec::new();
+            let mut engine=rebook_layout::LayoutEngine::with_fonts(crate::fonts::embedded_reader_fonts().iter().cloned());
+            let mut style=r.reader.style().clone();
+            style.focus_footnote_icons=true;
+            let painted=engine.layout_blocks(r.source.as_ref(),&section.blocks,LayoutViewport::new(800,600).unwrap(),&style).unwrap();
+            for page in &painted.pages { for item in &page.items {
+                if let rebook_layout::PageItem::Text(text)=item { for reference in text.citations.iter() {
+                    if !reference.owner.as_ref().is_some_and(|owner|unit.paint_ranges.contains(owner)) { continue; }
+                    let label=text.text[reference.range.clone()].replace('\u{2060}',"");
+                    if reference.number & 0x2000_0000 != 0 { marker_numbers.push(label); }
+                    else { labels.push(label); assert_eq!(reference.number,1); }
+                } }
+            } }
+            assert_eq!(labels,vec!["[1]","[2]","[3]","[4]"]);
+            assert_eq!(marker_numbers,vec!["1","2","3"]);
+            let classic=r.resolve_semantic_scope_footnotes(&section.blocks,groups[0].end-1);
+            assert!(classic==notes,"classic popup uses the same scope as focus mode");
+            assert!(r.resize_focus_lists(60.0));
+            let parts=r.focus_units.iter().filter(|u|u.list_group.as_ref().is_some_and(|g|g.range==group_range)).collect::<Vec<_>>();
+            assert!(parts.len()>1,"the list must actually split for this check");
+            for part in parts {
+                assert!(part.popup_footnotes()==notes);
+            }
+            let second=r.resolve_semantic_scope_footnotes(&section.blocks,groups[1].start);
+            assert_eq!(second.iter().map(|n|n.number).collect::<Vec<_>>(),vec![1,1]);
+        }
+    }
+
+    #[test]
     #[ignore = "requires TORTO_ALIGNMENT_BOOK; validates the actual Beauty EPUB's centered group"]
     fn local_beauty_group_keeps_important_center_alignment_through_shaping() {
         let path=std::env::var("TORTO_ALIGNMENT_BOOK").unwrap();

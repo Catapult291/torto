@@ -1,5 +1,21 @@
 use super::*;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn symbol_text_round_trips_without_becoming_protocol_markup() {
+        for symbol in ["<", ">", "&lt;", "⺅㇏", "a\u{301}", "<t-img-9/>"] {
+            let encoded=encode_text(symbol);
+            assert!(!encoded.contains(['<','>']));
+            assert_eq!(decode_text(&encoded),symbol);
+            let tagged=format!("<t-img-0 keep=\"1\">{encoded}</t-img-0>");
+            let token=at(&tagged,0).unwrap();
+            assert!(valid_pair(&token,&token));
+        }
+    }
+}
+
 pub(super) struct Token<'a> {
     pub id: usize,
     pub range: std::ops::Range<usize>,
@@ -42,10 +58,19 @@ pub(super) fn tokens(text: &str) -> Result<Vec<Token<'_>>, ()> {
 pub(super) fn push(output: &mut String, index: usize, run: &rebook_publication::InlineImageRun) {
     if let Some(text) = &run.image.ocr_text {
         output.push_str(&format!("<t-img-{index}{}>{}</t-img-{index}>",
-            if text.literal { " keep=\"1\"" } else { "" }, text.text));
+            if text.literal { " keep=\"1\"" } else { "" }, encode_text(&text.text)));
     } else {
         output.push_str(&format!("<t-img-{index}/>"));
     }
+}
+
+fn encode_text(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+pub(super) fn decode_text(text: &str) -> String {
+    // Decode exactly one layer; a literal "&lt;" must remain that text.
+    text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
 }
 
 pub(super) fn valid_pair(expected: &Token<'_>, actual: &Token<'_>) -> bool {

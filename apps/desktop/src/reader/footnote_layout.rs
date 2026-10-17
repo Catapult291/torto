@@ -189,6 +189,8 @@ pub(super) fn website_tooltip(response: &egui::Response, anchor: egui::Rect, url
 
 #[derive(Default)]
 pub(super) struct FootnoteRenderer {
+    media_context: Option<rebook_publication::SourceRange>,
+    media_revision: u64,
     engine: Option<LayoutEngine>,
     cache: Vec<(
         String,
@@ -196,6 +198,7 @@ pub(super) struct FootnoteRenderer {
         f32,
         f32,
         Option<(usize, egui::Color32, f32)>,
+        (Option<rebook_publication::SourceRange>, u64),
         Arc<FootnoteLayout>,
     )>,
 }
@@ -221,6 +224,13 @@ impl OutlinePen for SvgPath {
 }
 
 impl FootnoteRenderer {
+    pub(super) fn set_media_context(&mut self, source: &dyn BookSource, origin: Option<&rebook_publication::SourceRange>) {
+        let revision = source.media_reference_revision();
+        if self.media_context.as_ref() != origin || self.media_revision != revision {
+            self.media_context = origin.cloned();
+            self.media_revision = revision;
+        }
+    }
     #[cfg(test)]
     pub fn layout(
         &mut self,
@@ -373,8 +383,9 @@ impl FootnoteRenderer {
             blue: color.b(),
             alpha: color.a(),
         };
-        if let Some((_, _, _, _, _, layout)) = self.cache.iter().find(|(t, s, w, indent, m, _)| {
-            t == text && s == &style && *w == width && *indent == first_indent && *m == marker
+        let media_key = (self.media_context.clone(), source.media_reference_revision());
+        if let Some((_, _, _, _, _, _, layout)) = self.cache.iter().find(|(t, s, w, indent, m, media, _)| {
+            t == text && s == &style && *w == width && *indent == first_indent && *m == marker && media == &media_key
         }) {
             return Ok(layout.clone());
         }
@@ -435,6 +446,7 @@ impl FootnoteRenderer {
             let color = crate::ui::footnote_link_color();
             for block in &mut blocks {
                 if let Block::Text(text) = block {
+                    source.prepare_media_references(&mut text.content, self.media_context.as_ref());
                     rebook_publication::media_references::style_links(&mut text.content, rebook_publication::Rgba { red: color.r(), green: color.g(), blue: color.b(), alpha: color.a() });
                 }
             }
@@ -653,6 +665,7 @@ impl FootnoteRenderer {
             width,
             first_indent,
             marker,
+            media_key,
             result.clone(),
         ));
         Ok(result)

@@ -4,6 +4,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 
 pub(super) const COOLDOWN_KEY: &str = "rate-limit-until-ms";
+pub(super) const PACE_KEY: &str = "rate-limit-pace-v1";
+
+// Recover cautiously, one step per six quiet hours, including across app restarts.
+pub(super) fn pace_interval(bytes: &[u8], now: u64) -> u64 {
+    let Ok(bytes) = <[u8; 16]>::try_from(bytes) else {
+        return 1000;
+    };
+    let interval = u64::from_le_bytes(bytes[..8].try_into().unwrap()).clamp(1000, 8000);
+    let at = u64::from_le_bytes(bytes[8..].try_into().unwrap());
+    (interval >> (now.saturating_sub(at) / (6 * 60 * 60 * 1000)).min(3)).max(1000)
+}
 pub(super) const DEFAULT_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 
 /// Preserve the server's retry deadline across the worker/UI boundary.
@@ -90,5 +101,17 @@ mod tests {
         assert_eq!(remaining(&bytes, 1500), None);
         assert_eq!(remaining(&bytes, 1600), None);
         assert_eq!(remaining(b"invalid", 1000), None);
+    }
+
+    #[test]
+    fn pacing_survives_restarts_and_recovers_gradually() {
+        let at = 1_000_u64;
+        let mut bytes = 8_000_u64.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&at.to_le_bytes());
+        assert_eq!(pace_interval(&bytes, at), 8000);
+        assert_eq!(pace_interval(&bytes, at + 6 * 60 * 60 * 1000), 4000);
+        assert_eq!(pace_interval(&bytes, at + 12 * 60 * 60 * 1000), 2000);
+        assert_eq!(pace_interval(&bytes, at + 24 * 60 * 60 * 1000), 1000);
+        assert_eq!(pace_interval(b"invalid", at), 1000);
     }
 }

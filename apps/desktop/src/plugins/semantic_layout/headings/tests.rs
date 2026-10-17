@@ -248,6 +248,7 @@ fn stale_unnumbered_heading_annotations_do_not_apply_or_discard_other_headings()
     let result = Recognition {
         fingerprint: fingerprint(&original),
         formulas_checked: true,
+        image_text_revision: crate::plugins::semantic_layout::formulas::TEXT_REVISION,
         skipped_groups: 0,
         annotations: original
             .blocks
@@ -296,6 +297,7 @@ fn headings_preserve_translation_sources_toc_and_toggle() {
     let overlay = SemanticLayoutSource::new(translations.clone(), original.clone());
     let result = Recognition {
         formulas_checked: true,
+        image_text_revision: crate::plugins::semantic_layout::formulas::TEXT_REVISION,
         fingerprint: fingerprint(&section),
         skipped_groups: 0,
         annotations: vec![Annotation::SectionHeading {

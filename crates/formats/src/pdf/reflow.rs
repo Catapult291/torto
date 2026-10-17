@@ -798,7 +798,7 @@ fn relocate(stored: &mut StoredSection, id: SpineItemId, href: PublicationUrl) {
                 for i in &mut f.images {
                     range(&mut i.source, id);
                 }
-                for t in &mut f.captions {
+                for t in f.text_blocks_mut() {
                     text(t, id, old, href);
                 }
             }

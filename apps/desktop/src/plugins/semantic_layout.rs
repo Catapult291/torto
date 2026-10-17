@@ -194,6 +194,8 @@ impl QuoteAlignment {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Recognition {
     #[serde(default)]
+    image_text_revision: u32,
+    #[serde(default)]
     formulas_checked: bool,
     fingerprint: String,
     annotations: Vec<Annotation>,
@@ -366,7 +368,7 @@ impl SemanticLayoutSource {
         if missing_path.is_some_and(|path| !path.try_exists().unwrap_or(true)) {
             return None;
         }
-        let recognition = load_recognition_with_hash(original, identity, hash);
+        let recognition = load_recognition_inner(original, identity, hash, false);
         if let Ok(current) = self.cache_identity.read()
             && current.as_ref() == Some(identity)
             && let Ok(mut misses) = self.recognition_misses.write()
@@ -487,10 +489,16 @@ impl SemanticLayoutSource {
     }
 
     pub(crate) fn has_recognition(&self, index: usize, hash: &str) -> bool {
+        self.state.read().ok().is_some_and(|state|
+            state.get(&index).is_some_and(|result| result.fingerprint == hash))
+    }
+
+    // Image rechecks must not make existing semantic/translation snapshots unready.
+    pub(crate) fn has_current_recognition(&self, index: usize, hash: &str) -> bool {
         self.state
             .read()
             .ok()
-            .is_some_and(|state| state.get(&index).is_some_and(|r| r.fingerprint == hash))
+            .is_some_and(|state| state.get(&index).is_some_and(|r| r.fingerprint == hash && r.image_text_revision >= formulas::TEXT_REVISION))
     }
 
     #[cfg(test)]
@@ -572,19 +580,23 @@ impl BookSource for SemanticLayoutSource {
             }
         }
         if let Some((original, hash)) = snapshot.as_ref() {
-            if let Some(recognition) = recognition.filter(|result| result.fingerprint == *hash) {
+            let full = recognition.as_ref().filter(|result| result.fingerprint == *hash);
+            if let Some(recognition) = full {
                 for annotation in &recognition.annotations {
-                    if headings::annotation_eligible(&original, annotation) {
+                    if image_policy_allows(&recognition, annotation) && headings::annotation_eligible(&original, annotation) {
                         compose(&mut section.blocks, annotation);
                     }
                 }
-            } else if let Some(results) = partial {
+            }
+            if full.is_none_or(|result| result.image_text_revision < formulas::TEXT_REVISION)
+                && let Some(results) = partial {
                 for recognition in results
                     .values()
                     .filter(|result| result.fingerprint == *hash)
                 {
                     for annotation in &recognition.annotations {
-                        if headings::annotation_eligible(&original, annotation) {
+                        if full.is_some() && image_annotation_href(annotation).is_none() { continue; }
+                        if image_policy_allows(&recognition, annotation) && headings::annotation_eligible(&original, annotation) {
                             compose(&mut section.blocks, annotation);
                         }
                     }
@@ -837,7 +849,7 @@ fn request_contract_fingerprint() -> &'static str {
                 citations::PROMPT,
                 formulas::PROMPT,
                 formulas::TRANSCRIBE_PROMPT,
-                formulas::options(),
+                formulas::chapter_cache_options(),
                 completion_options(&RecognitionRoles {
                     quotes: true,
                     captions: false,
@@ -983,18 +995,38 @@ fn recognition_path(identity: &Value, hash: &str) -> Option<PathBuf> {
     cache_path(&digest(format!("chapter:{identity}:{hash}").as_bytes()))
 }
 
+#[cfg(test)]
 fn load_recognition(section: &Section, identity: &Value) -> Option<Recognition> {
     let hash = fingerprint(section);
     load_recognition_with_hash(section, identity, &hash)
 }
 
+#[cfg(test)]
 fn load_recognition_with_hash(
     section: &Section,
     identity: &Value,
     hash: &str,
 ) -> Option<Recognition> {
+    load_recognition_inner(section, identity, hash, true)
+}
+
+fn image_annotation_href(annotation: &Annotation) -> Option<&PublicationUrl> {
+    match annotation {
+        Annotation::ImageText { href, .. } | Annotation::ImageFormula { href, .. }
+        | Annotation::UnreadableFormula { href } => Some(href),
+        _ => None,
+    }
+}
+
+fn image_policy_allows(recognition: &Recognition, annotation: &Annotation) -> bool {
+    recognition.image_text_revision >= formulas::TEXT_REVISION || image_annotation_href(annotation).is_none()
+}
+
+fn load_recognition_inner(section: &Section, identity: &Value, hash: &str, current_images: bool) -> Option<Recognition> {
     let bytes = std::fs::read(recognition_path(identity, hash)?).ok()?;
     let mut result: Recognition = serde_json::from_slice(&bytes).ok()?;
+    if current_images && result.image_text_revision < formulas::TEXT_REVISION
+        && !formulas::candidates(section).is_empty() { return None }
     result
         .annotations
         .retain(|annotation| headings::annotation_eligible(section, annotation));
@@ -1211,8 +1243,26 @@ async fn recognize_inner(
     let target = target.unwrap_or(0..section.blocks.len());
     let target_section = scope_section(section, target.clone());
     if let Some(identity) = &identity
-        && let Some(cached) = load_recognition(section, identity)
+        && let Some(mut cached) = load_recognition_inner(section, identity, &fingerprint, false)
     {
+        if cached.image_text_revision < formulas::TEXT_REVISION
+            && let Some(source) = book_source
+        {
+            let client = crate::http::builder().timeout(Duration::from_secs(90)).build().map_err(|e|e.to_string())?;
+            let (images, failed) = formulas::recognize(&client, provider, model,
+                settings.semantic_layout.reasoning_effort, source, &target_section).await;
+            // Negative and failed checks must also remove old replacements.
+            // Recompose from authored images until a current result is safe.
+            // This cache is scoped by its target identity. Never carry any
+            // unchecked legacy image annotation into the new policy revision.
+            cached.annotations.retain(|a| image_annotation_href(a).is_none());
+            cached.annotations.extend(images);
+            cached.image_text_revision = formulas::TEXT_REVISION;
+            cached.skipped_groups += failed;
+            if failed == 0 && let Some(path) = recognition_path(identity, &fingerprint) {
+                let _ = crate::persistence::write_json_atomic(&path, &cached);
+            }
+        }
         return Ok(cached);
     }
     let mut annotations = Vec::new();
@@ -1361,6 +1411,7 @@ async fn recognize_inner(
     }
     let result = Recognition {
         formulas_checked,
+        image_text_revision: crate::plugins::semantic_layout::formulas::TEXT_REVISION,
         fingerprint,
         annotations,
         skipped_groups,
@@ -2036,6 +2087,7 @@ fn compose_figure(selected: Vec<Block>, before: bool, source: Option<SourceRange
         }
     }
     Block::Figure(FigureBlock {
+        body: Vec::new(),
         images,
         captions,
         caption_position: if before {

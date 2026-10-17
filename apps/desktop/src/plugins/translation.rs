@@ -452,7 +452,7 @@ fn translatable_blocks(section: &Section, is_pdf: bool) -> Vec<TranslationBlockI
                 );
             }
             Block::Figure(figure) => {
-                blocks.extend(figure.captions.iter().enumerate().filter_map(
+                blocks.extend(figure.text_blocks().enumerate().filter_map(
                     |(caption_index, caption)| {
                         translatable_text(caption).map(|text| TranslationBlockInput {
                             block_index,
@@ -509,7 +509,7 @@ fn visit_note_text_blocks(
             }
         }
         Block::Figure(figure) => {
-            for caption in &figure.captions {
+            for caption in figure.text_blocks() {
                 visit(*segment_index, caption);
                 *segment_index += 1;
             }
@@ -550,7 +550,7 @@ fn visit_note_text_blocks_mut(
             }
         }
         Block::Figure(figure) => {
-            for caption in &mut figure.captions {
+            for caption in figure.text_blocks_mut() {
                 visit(*segment_index, caption);
                 *segment_index += 1;
             }
@@ -596,7 +596,7 @@ fn note_text_source_range_at(note: &NoteBlock, target_index: usize) -> Option<&S
                 None
             }
             Block::Figure(figure) => {
-                for caption in &figure.captions {
+                for caption in figure.text_blocks() {
                     if let Some(range) = find_text(caption) {
                         return Some(range);
                     }
@@ -667,8 +667,8 @@ fn translation_input_source_range(
     }
     if let (Block::Figure(figure), Some(segment_index)) = (block, segment_index) {
         return figure
-            .captions
-            .get(segment_index)
+            .text_blocks()
+            .nth(segment_index)
             .and_then(|caption| caption.source.as_ref())
             .or(figure.source.as_ref());
     }
@@ -1049,7 +1049,7 @@ fn translated_figure(
     translations: &HashMap<usize, String>,
     mode: TranslationMode,
 ) -> FigureBlock {
-    for (caption_index, caption) in figure.captions.iter_mut().enumerate() {
+    for (caption_index, caption) in figure.text_blocks_mut().enumerate() {
         let Some(translated) = translations.get(&caption_index) else {
             continue;
         };
@@ -1891,7 +1891,7 @@ fn append_translated_span(
                     && let (Some(ocr), Some(text)) = (&mut run.image.ocr_text, token.text)
                     && !ocr.literal
                 {
-                    ocr.translated = Some(text.to_owned());
+                        ocr.translated = Some(image_tags::decode_text(text));
                 }
                 content.push(restored);
                 rest = &rest[token.range.end..];
@@ -4033,6 +4033,7 @@ mod tests {
     #[test]
     fn figure_captions_are_translated_without_detaching_them_from_the_image() {
         let figure = FigureBlock {
+            body: Vec::new(),
             images: Vec::new(),
             captions: vec![TextBlock {
                 kind: TextBlockKind::Caption,
@@ -4072,6 +4073,28 @@ mod tests {
             text_block_text(&bilingual.captions[0]),
             "Original caption\n翻译图注"
         );
+    }
+
+    #[test]
+    fn structured_figure_translation_keeps_child_sources_and_target_language() {
+        let base=source();
+        let descriptor=&base.book().sections[0];
+        let section=rebook_html::parse_section("<html><body><div><p id='body'>An example.</p><ol><li><p>A list item.</p></li></ol></div><p>Figure 4.3 Example</p><p>Source: Authors.</p></body></html>",descriptor,|_|None).unwrap();
+        let source=TranslationBookSource::new(Arc::new(TestSource { book:base.book().clone(), section:section.clone() }),TranslationMode::Replace);
+        source.set_enabled(true).unwrap();
+        source.set_target_language("简体中文").unwrap();
+        let inputs=source.translatable_blocks(0).unwrap();
+        assert_eq!(inputs.len(),4);
+        let translations:Vec<_>=inputs.iter().enumerate().map(|(i,input)|BlockTranslation { block_index:input.block_index, segment_index:input.segment_index, text:format!("译文{i}") }).collect();
+        source.store_batch(0,&translations).unwrap();
+        let translated=source.parse_section(0).unwrap();
+        let Block::Figure(figure)=&translated.blocks[0] else { panic!("figure") };
+        let original:Vec<_>=section.blocks[0].text_blocks().collect();
+        for (i,text) in figure.text_blocks().enumerate() {
+            assert_eq!(text_block_text(text),format!("译文{i}"));
+            assert_eq!(text.source,original[i].source);
+            assert!(text.content.iter().flat_map(Inline::text_runs).all(|r|r.style.display_writing_system==Some(rebook_publication::WritingSystem::Cjk)));
+        }
     }
 
     #[test]

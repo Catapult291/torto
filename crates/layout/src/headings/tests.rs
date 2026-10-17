@@ -235,6 +235,37 @@ fn internal_heading_breaks_keep_subtitles_and_source_offsets() {
 }
 
 #[test]
+fn wide_and_split_run_heading_gaps_have_one_space_of_advance() {
+    for gap in ["\u{2003}", "\u{2003} \n ", "   ", "\t\u{00a0}"] {
+        let original = format!("Chapter 4{gap}Writing and editing");
+        let mut heading = block("heading", &original, TextBlockKind::Heading(1));
+        heading.content = vec![
+            Inline::Text(TextRun { text: "Chapter 4".into(), style: Default::default(), link: None }),
+            Inline::Text(TextRun { text: gap.replace('\n', ""), style: Default::default(), link: None }),
+        ];
+        if gap.contains('\n') { heading.content.push(Inline::Break); }
+        heading.content.push(Inline::Text(TextRun {
+            text: "Writing and editing".into(), style: Default::default(), link: None,
+        }));
+        let actual = layout(&[Block::Text(heading.clone())], true, 1200);
+        let mut baseline = block("expected", "Chapter 4 Writing and editing", TextBlockKind::Heading(1));
+        clear_keyword_sizes(&mut baseline);
+        let expected = layout(&[Block::Text(baseline)], true, 1200);
+        let text = |layout: &crate::SectionLayout| layout.pages[0].items.iter().find_map(|item| {
+            if let PageItem::Text(text) = item { Some((text.text.chars().count(), text.layout.width())) } else { None }
+        }).unwrap();
+        let (count, width) = text(&actual);
+        assert_eq!(count, original.chars().count());
+        assert!((width - text(&expected).1).abs() < 0.1, "gap={gap:?}: {width} vs {}", text(&expected).1);
+        let classic = layout(&[Block::Text(heading)], false, 1200);
+        let classic_text = classic.pages[0].items.iter().find_map(|item| match item {
+            PageItem::Text(text) => Some(text.text.as_ref()), _ => None,
+        }).unwrap();
+        assert_eq!(classic_text.replace('\n', ""), original.replace('\n', ""));
+    }
+}
+
+#[test]
 fn long_joined_headings_wrap_and_unrelated_companions_are_not_consumed() {
     let ordinal = block("ordinal", "Appendix C", TextBlockKind::HeadingOrdinal(1));
     let title = block(

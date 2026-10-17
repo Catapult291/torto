@@ -19,9 +19,7 @@ pub(super) fn register_floats(
         let Block::Figure(figure) = block else {
             continue;
         };
-        let nodes = figure
-            .captions
-            .iter()
+        let nodes = figure.text_blocks()
             .filter_map(|c| c.source.as_ref())
             .map(|s| s.start.node.as_str())
             .collect::<HashSet<_>>();
@@ -157,7 +155,7 @@ fn merge(
     let mut nodes = HashSet::from([new_node.clone()]);
     for block in &moved.section.blocks {
         if let Block::Figure(f) = block {
-            for t in &f.captions {
+            for t in f.text_blocks() {
                 if let Some(s) = &t.source {
                     nodes.insert(s.start.node.clone());
                 }
@@ -453,6 +451,7 @@ mod tests {
             },
         };
         Block::Figure(FigureBlock {
+            body: Vec::new(),
             images: vec![ImageBlock {
                 ocr_text: None,
                 formula_image: false,
@@ -702,7 +701,7 @@ mod tests {
                 let Block::Figure(figure) = block else {
                     continue;
                 };
-                let caption = figure.captions.iter().map(plain).collect::<String>();
+                let caption = figure.text_blocks().map(plain).collect::<String>();
                 let caption = caption.split_whitespace().collect::<Vec<_>>().join(" ");
                 let case = if caption.starts_with("Figure 2.8 ") {
                     8

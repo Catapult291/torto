@@ -61,7 +61,7 @@ fn local_semantic_phase_probe() {
                     match block {
                         Block::Text(text) => result.push(text),
                         Block::Quote(quote) => result.extend(quote.body.iter().chain(quote.attribution.iter())),
-                        Block::Figure(figure) => result.extend(figure.captions.iter()),
+                        Block::Figure(figure) => result.extend(figure.text_blocks()),
                         Block::Table(table) => result.extend(table.text_blocks()),
                         Block::Note(note) => texts(&note.blocks, result),
                         _ => {}

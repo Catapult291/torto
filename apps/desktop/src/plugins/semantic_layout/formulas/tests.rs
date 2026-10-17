@@ -1,11 +1,73 @@
 use super::*;
 
 #[test]
+#[ignore = "requires TORTO_INLINE_IMAGE_BOOK; checks Text Entry replacement fidelity with the configured AI endpoint"]
+fn live_text_entry_image_replacement_fidelity() {
+    let opened = rebook_formats::open_file(std::env::var("TORTO_INLINE_IMAGE_BOOK").unwrap()).unwrap();
+    let source = opened.source();
+    let settings = PluginSettings::load_default().unwrap();
+    let model_override = std::env::var("TORTO_IMAGE_FIDELITY_MODEL").ok();
+    let (provider, model) = if let Some(model) = model_override.as_deref() {
+        (settings.providers.iter().find(|p| p.models.iter().any(|m| m.id==model))
+            .expect("override model must already be configured"), model)
+    } else { settings.semantic_layout_endpoint().unwrap() };
+    println!("Image replacement fidelity model: {model}");
+    let mut pending = Vec::new();
+    let mut expected = Vec::new();
+    for index in 0..source.book().sections.len() {
+        let section = source.parse_section(index).unwrap();
+        for candidate in candidates(&section) {
+            let path = candidate.image.href.path();
+            let visual_sequence = (1..=6).any(|n| path.ends_with(&format!("_u03-0{n}-9780123735911.jpg")));
+            let kana = candidate.context.contains("Cree and Cherokee");
+            if !visual_sequence && !kana { continue; }
+            let resource = source.resource(&candidate.image.href).unwrap();
+            let url = image_url(decode(&resource.bytes).unwrap()).unwrap();
+            expected.push(kana);
+            pending.push(batch::Pending { key: path.into(), path: None,
+                aliases: vec![candidate.image.href.clone()], candidate, url });
+        }
+    }
+    assert_eq!(expected.iter().filter(|safe| !**safe).count(), 6);
+    assert_eq!(expected.iter().filter(|safe| **safe).count(), 2);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let client = crate::http::builder().timeout(Duration::from_secs(90)).build().unwrap();
+    let mut mismatches = Vec::new();
+    for (items, expected) in pending.chunks(batch::MAX_IMAGES).zip(expected.chunks(batch::MAX_IMAGES)) {
+        let results = runtime.block_on(batch::request_batch(&client, provider, model,
+            settings.semantic_layout.reasoning_effort, items)).unwrap();
+        for ((item, safe), response) in items.iter().zip(expected).zip(results) {
+            let response = response.expect("missing image judgment");
+            let mut annotations = Vec::new();
+            let mut failed = 0;
+            record(Some(&response), &item.candidate.image.href, &mut annotations, &mut failed);
+            println!("{}: status={}, replacement_safe={}, annotations={}", item.key,
+                response.status, response.replacement_safe, annotations.len());
+            assert_eq!(failed, 0);
+            if !annotations.is_empty() != *safe { mismatches.push(item.key.clone()); }
+        }
+    }
+    assert!(mismatches.is_empty(), "incorrect replacement judgments: {mismatches:?}");
+}
+
+#[test]
+fn literal_radicals_strokes_and_punctuation_are_text_without_normalization() {
+    for text in ["⺅", "㇏", "丨", "ㄅ", "ᄀ", "ə\u{301}", "↔", "<", ">", "⼀"] {
+        let response=Response { revision: TEXT_REVISION, replacement_safe: true,status:"recognized_text".into(),text:Some(text.into()),literal:true,
+            latex:None,equation_number:None,transient:false};
+        assert!(response.formula().is_ok(),"{text}");
+        assert_eq!(response.text.as_deref(),Some(text));
+    }
+    assert!(request_prompt().contains("CJK radicals"));
+    assert!(validate_text("\u{fffd}").is_err());
+}
+
+#[test]
 fn text_results_preserve_images_and_do_not_become_formulas() {
     use super::super::tests::{image, section};
     let original = section(vec![image("text")]);
     let candidate = candidates(&original).pop().unwrap();
-    let response = Response { text: Some("か".into()), literal: true, transient: false,
+    let response = Response { revision: TEXT_REVISION, replacement_safe: true, text: Some("か".into()), literal: true, transient: false,
         status: "recognized_text".into(), latex: None, equation_number: None };
     let mut annotations = Vec::new();
     let mut failed = 0;
@@ -21,7 +83,10 @@ fn text_results_preserve_images_and_do_not_become_formulas() {
     assert!(image.image.formula.is_none());
     assert_eq!(image.image.ocr_text.as_ref().unwrap().text, "か");
     assert_eq!(text.source, candidate.image.source);
-    for invalid in ["", "<b>x</b>", "\u{fffd}", "x\0y"] { assert!(validate_text(invalid).is_err()); }
+    for invalid in ["", "\u{fffd}", "x\0y"] { assert!(validate_text(invalid).is_err()); }
+    // Literal code and comparison symbols are safe text; the translation
+    // protocol escapes them before wrapping them in t-img tags.
+    assert!(validate_text("<b>x</b>").is_ok());
     assert!(validate_text("か き\nÁ").is_ok());
 }
 
@@ -114,7 +179,7 @@ fn formula_transcriptions_must_render_and_keep_negative_results_empty() {
         );
     }
     assert!(
-        Response {
+        Response { revision: TEXT_REVISION, replacement_safe: true,
             text: None,
             literal: false,
             transient: false,
@@ -127,7 +192,7 @@ fn formula_transcriptions_must_render_and_keep_negative_results_empty() {
         .is_none()
     );
     assert!(
-        Response {
+        Response { revision: TEXT_REVISION, replacement_safe: true,
             text: None,
             literal: false,
             transient: false,
@@ -171,6 +236,7 @@ fn formula_annotations_preserve_resources_and_protect_unreadable_images() {
             0,
             Recognition {
                 formulas_checked: true,
+                image_text_revision: crate::plugins::semantic_layout::formulas::TEXT_REVISION,
                 fingerprint: fingerprint(&raw),
                 annotations: vec![annotation],
                 skipped_groups: 0

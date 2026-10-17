@@ -10,6 +10,7 @@ pub(super) struct Prepared {
     pub batch_plans: HashMap<usize, Arc<batching::SectionPlan>>,
     pub hashes: HashMap<usize, String>,
     pub inputs: HashMap<usize, Vec<(crate::plugins::TranslationBlockInput, SourceRange)>>,
+    pub title_links: HashMap<(usize,usize),Vec<String>>,
 }
 
 struct CachedSource {
@@ -107,11 +108,22 @@ pub(super) fn prepare_with_plans(
         &mut batch_plans,
         &demand.iter().map(|(index, _)| *index).collect(),
     );
+    let originals = source.sections.into_inner().unwrap();
+    let mut title_links = HashMap::new();
+    if with_translation {
+        for (index, section) in &originals {
+            for block in 0..section.blocks.len() {
+                let rows = super::super::title_translations::linked_rows(section,block,toc);
+                if !rows.is_empty() { title_links.insert((*index,block),rows); }
+            }
+        }
+    }
     Prepared {
         with_translation,
         raw,
         demand,
-        originals: source.sections.into_inner().unwrap(),
+        originals,
+        title_links,
         batch_plans,
         hashes,
         inputs,

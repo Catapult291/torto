@@ -70,9 +70,7 @@ fn compound_caption_preserves_titles_body_order_and_individual_anchors() {
     assert_eq!(figure.images.len(), 1);
     assert_eq!(figure.captions.len(), 3);
     assert!(
-        figure
-            .captions
-            .iter()
+        figure.text_blocks()
             .all(|c| c.kind == TextBlockKind::Caption)
     );
     assert_close(

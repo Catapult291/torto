@@ -32,7 +32,7 @@ pub(super) fn texts<'a>(blocks: &'a [Block], out: &mut Vec<&'a TextBlock>) {
                 out.push(t)
             }
             Block::Quote(q) => out.extend(q.body.iter().filter(|t| t.source.is_some())),
-            Block::Figure(f) => out.extend(f.captions.iter().filter(|t| t.source.is_some())),
+            Block::Figure(f) => out.extend(f.text_blocks().filter(|t| t.source.is_some())),
             Block::Table(t) => out.extend(t.text_blocks().filter(|t| t.source.is_some())),
             Block::Note(n) => texts(&n.blocks, out),
             _ => {}

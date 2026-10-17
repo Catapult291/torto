@@ -217,8 +217,8 @@ mod tests {
             state
                 .observe(
                     probe(Some(60_000), None),
-                    now + Duration::from_secs(62),
-                    62_000
+                    now + Duration::from_secs(70),
+                    70_000
                 )
                 .unwrap()
                 .mode,
@@ -293,7 +293,7 @@ mod tests {
             running: false,
         };
         let now = Instant::now();
-        for tick in 0..15 {
+        for tick in 0..60 {
             assert!(
                 state
                     .observe(
@@ -307,9 +307,9 @@ mod tests {
         assert_eq!(
             state
                 .observe(
-                    probe(Some(15_000), None),
-                    now + Duration::from_secs(15),
-                    15_000
+                    probe(Some(60_000), None),
+                    now + Duration::from_secs(60),
+                    60_000
                 )
                 .unwrap()
                 .mode,

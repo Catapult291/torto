@@ -95,8 +95,8 @@ fn clear_keyword_sizes(block: &mut TextBlock) {
     }
 }
 
-/// Soften just the ordinal-to-title boundary, retaining all source characters
-/// and subtitle breaks. The display/copy offset mapping remains one-to-one.
+/// Normalize heading gaps and soften the ordinal-to-title break, retaining
+/// source character counts and intentional subtitle breaks.
 pub(super) fn normalize_internal(block: &mut TextBlock) {
     if !matches!(block.kind, TextBlockKind::Heading(_))
         || block
@@ -115,43 +115,60 @@ pub(super) fn normalize_internal(block: &mut TextBlock) {
             _ => unreachable!(),
         })
         .collect();
-    let Some(start) = text.find(['\n', '\r']) else {
-        return;
-    };
-    let tail = &text[start..];
-    let end = start + tail.len() - tail.trim_start().len();
-    if heading_ordinal_key(&text[..start]).is_none()
-        || !text[end..].chars().any(char::is_alphabetic)
-    {
+    let softened = text.find(['\n', '\r']).and_then(|start| {
+        let tail = &text[start..];
+        let end = start + tail.len() - tail.trim_start().len();
+        (heading_ordinal_key(&text[..start]).is_some()
+            && text[end..].chars().any(char::is_alphabetic))
+            .then_some(start..end)
+    });
+    let mut chars: Vec<_> = text
+        .char_indices()
+        .map(|(at, ch)| {
+            if softened.as_ref().is_some_and(|range| range.contains(&at)) {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect();
+    let mut start = 0;
+    while start < chars.len() {
+        if !chars[start].is_whitespace() || matches!(chars[start], '\n' | '\r') {
+            start += 1;
+            continue;
+        }
+        let mut end = start + 1;
+        while end < chars.len()
+            && chars[end].is_whitespace()
+            && !matches!(chars[end], '\n' | '\r')
+        {
+            end += 1;
+        }
+        // Keep a single normal space, with zero-width padding before it so
+        // line wrapping and every following source offset remain intact.
+        chars[start..end - 1].fill('\u{2060}');
+        chars[end - 1] = ' ';
+        start = end;
+    }
+    if chars.iter().copied().eq(text.chars()) {
         return;
     }
-    let mut byte = 0;
+    let mut chars = chars.into_iter();
     for inline in &mut block.content {
         match inline {
             Inline::Text(run) => {
-                run.text = run
-                    .text
-                    .chars()
-                    .map(|ch| {
-                        let at = byte;
-                        byte += ch.len_utf8();
-                        if (start..end).contains(&at) && matches!(ch, '\n' | '\r') {
-                            ' '
-                        } else {
-                            ch
-                        }
-                    })
-                    .collect();
+                run.text = chars.by_ref().take(run.text.chars().count()).collect();
             }
             Inline::Break => {
-                if (start..end).contains(&byte) {
+                let ch = chars.next().unwrap();
+                if ch != '\n' {
                     *inline = Inline::Text(TextRun {
-                        text: " ".into(),
+                        text: ch.to_string(),
                         style: Default::default(),
                         link: None,
                     });
                 }
-                byte += 1;
             }
             _ => unreachable!(),
         }

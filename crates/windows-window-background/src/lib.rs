@@ -117,7 +117,7 @@ pub use windows::WindowBackground;
 #[cfg(target_os = "windows")]
 mod frame;
 #[cfg(target_os = "windows")]
-pub use frame::{FrameLayout, WindowFrame, WindowPlacement};
+pub use frame::{FrameLayout, WindowFrame, WindowPlacement, WindowTransition};
 
 #[cfg(target_os = "windows")]
 #[allow(unsafe_code)]

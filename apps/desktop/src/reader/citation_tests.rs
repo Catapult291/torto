@@ -63,7 +63,7 @@ fn popup_preserves_appearance_order_and_merges_styled_citation_parts() {
     let items = text_block_focus_footnotes(&block);
     assert_eq!(items.len(), 3);
     assert!(
-        matches!(&items[0],FocusFootnoteSource::Citation{text,source,number:1} if text=="(Smith, 2020)" && source==&range)
+        matches!(&items[0],FocusFootnoteSource::Citation{text,source,number:1,..} if text=="(Smith, 2020)" && source==&range)
     );
     assert!(matches!(&items[1],FocusFootnoteSource::Inline(t, 1) if t=="Note content"));
     assert!(matches!(

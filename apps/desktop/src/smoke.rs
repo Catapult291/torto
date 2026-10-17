@@ -10,6 +10,7 @@ struct Check {
     expects_book: bool,
     exercise_minimize: bool,
     exercise_resize: bool,
+    exercise_fullscreen: bool,
     state: Mutex<State>,
 }
 #[derive(Default)]
@@ -24,6 +25,9 @@ struct State {
     resize_step: usize,
     resize_at: Option<Instant>,
     presentation_checks: u64,
+    fullscreen_step: usize,
+    fullscreen_at: Option<Instant>,
+    windowed_size: Option<[u32; 2]>,
 }
 
 impl State {
@@ -65,6 +69,8 @@ pub(crate) fn start(
             expects_book,
             exercise_minimize,
             exercise_resize: std::env::var_os("TORTO_SMOKE_RESIZE").is_some(),
+            exercise_fullscreen: cfg!(target_os = "windows")
+                && std::env::var_os("TORTO_SMOKE_FULLSCREEN").is_some(),
             state: Mutex::new(State::default()),
         })
         .map_err(|_| "smoke check already initialized")?;
@@ -79,6 +85,62 @@ pub(crate) fn start(
 
 pub(crate) fn enabled() -> bool {
     CHECK.get().is_some()
+}
+
+/// Use the production F11 path, checking both maximized and normal restoration.
+#[cfg(target_os = "windows")]
+pub(crate) fn fullscreen_tick(
+    window: &winit::window::Window,
+    fullscreen: bool,
+) -> Result<bool, String> {
+    let Some(check) = CHECK.get().filter(|check| check.exercise_fullscreen) else {
+        return Ok(false);
+    };
+    let (step, normal) = {
+        let mut state = check.state.lock().unwrap();
+        if state.frames < 2
+            || state.fullscreen_step >= 7
+            || state
+                .fullscreen_at
+                .is_some_and(|at| at.elapsed() < Duration::from_millis(200))
+        {
+            return Ok(false);
+        }
+        let step = state.fullscreen_step;
+        if step == 0 {
+            let size = window.inner_size();
+            state.windowed_size = Some([size.width, size.height]);
+        }
+        state.fullscreen_step += 1;
+        state.fullscreen_at = Some(Instant::now());
+        (step, state.windowed_size.unwrap())
+    };
+    stage(&format!("fullscreen-step-{step}"));
+    match step {
+        0 => window.set_maximized(true),
+        1 if !fullscreen && window.is_maximized() => return Ok(true),
+        2 | 5 if fullscreen => return Ok(true),
+        3 if !fullscreen && window.is_maximized() => window.set_maximized(false),
+        4 | 6 if !fullscreen && !window.is_maximized() => {
+            let size = window.inner_size();
+            if [size.width, size.height] != normal {
+                return Err(format!(
+                    "F11 lost normal bounds: expected {normal:?}, got {size:?}"
+                ));
+            }
+            if step == 4 {
+                return Ok(true);
+            }
+        }
+        _ => {
+            return Err(format!(
+                "F11 restoration failed at step {step}: fullscreen={fullscreen}, maximized={}",
+                window.is_maximized()
+            ));
+        }
+    }
+    window.request_redraw();
+    Ok(false)
 }
 
 /// Exercise the same viewport command as the caption button, then restore the
@@ -345,6 +407,10 @@ pub(crate) fn finish(error: Option<&str>) -> Result<(), String> {
             (check.exercise_resize && state.resize_step != 14)
                 .then_some("resize/maximize/restore check did not complete")
         })
+        .or_else(|| {
+            (check.exercise_fullscreen && state.fullscreen_step != 7)
+                .then_some("fullscreen/maximized/normal restoration check did not complete")
+        })
         .or_else(|| (!state.completed).then_some("exited before startup check completed"));
     let report = serde_json::json!({
         "success": error.is_none(), "error": error, "pid": std::process::id(),
@@ -352,6 +418,7 @@ pub(crate) fn finish(error: Option<&str>) -> Result<(), String> {
         "book": check.expects_book, "frames": state.frames,
         "minimize_check": check.exercise_minimize, "minimize_restored": state.restored,
         "resize_check": check.exercise_resize, "resize_steps": state.resize_step,
+        "fullscreen_check": check.exercise_fullscreen, "fullscreen_steps": state.fullscreen_step,
         "presentation_checks": state.presentation_checks,
         "elapsed_ms": check.started.elapsed().as_millis(),
     });

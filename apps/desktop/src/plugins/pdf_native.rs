@@ -59,7 +59,8 @@ pub(crate) fn selected_result_available(book_id: &str) -> io::Result<bool> {
     }
 }
 
-pub(crate) fn open(book_id: &str) -> io::Result<Option<ReflowSource>> {
+/// Only current generations may be read or offered for synchronization.
+pub(crate) fn sync_pointer(book_id: &str) -> io::Result<Option<Vec<u8>>> {
     let root = directory(book_id)?;
     let bytes = match fs::read(root.join("current.json")) {
         Ok(b) => b,
@@ -75,7 +76,13 @@ pub(crate) fn open(book_id: &str) -> io::Result<Option<ReflowSource>> {
     if pointer.version != pdf_reflow::VERSION {
         return Ok(None);
     }
-    ReflowSource::open(&root.join(&pointer.generation), book_id)
+    Ok(Some(bytes))
+}
+
+pub(crate) fn open(book_id: &str) -> io::Result<Option<ReflowSource>> {
+    let Some(bytes) = sync_pointer(book_id)? else { return Ok(None) };
+    let pointer: Current = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    ReflowSource::open(&directory(book_id)?.join(&pointer.generation), book_id)
         .map(Some)
         .map_err(io::Error::other)
 }
@@ -252,6 +259,29 @@ pub(crate) fn export(book_id: &str) -> io::Result<Option<Vec<(String, Vec<u8>)>>
     Ok(Some(files))
 }
 
+/// An incompatible derived cache is optional, unlike malformed current data.
+/// Read only the stable envelope before deserializing a version-specific IR.
+pub(crate) fn import_sync(book_id: &str, files: Vec<(String, Vec<u8>)>) -> io::Result<Option<u32>> {
+    #[derive(Deserialize)]
+    struct Identity { id: String }
+    #[derive(Deserialize)]
+    struct Envelope { version: u32, book: Identity, original: Identity }
+    let manifests = files.iter().filter(|(name, _)| name == "manifest.json").collect::<Vec<_>>();
+    if manifests.len() != 1 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Native PDF archive must have one manifest"));
+    }
+    let manifest: Envelope = serde_json::from_slice(&manifests[0].1)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if manifest.book.id != book_id || manifest.original.id != book_id {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Native PDF manifest book identity mismatch"));
+    }
+    if manifest.version != pdf_reflow::VERSION {
+        return Ok(Some(manifest.version));
+    }
+    import(book_id, files)?;
+    Ok(None)
+}
+
 pub(crate) fn import(book_id: &str, files: Vec<(String, Vec<u8>)>) -> io::Result<()> {
     let root = directory(book_id)?;
     let generation = uuid::Uuid::new_v4().to_string();
@@ -304,6 +334,37 @@ mod tests {
     use rebook_publication::*;
 
     #[test]
+    fn sync_skips_incompatible_ir_without_replacing_a_readable_generation() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let files = fixture(&id);
+        assert_eq!(import_sync(&id, files.clone()).unwrap(), None);
+        let root = directory(&id).unwrap();
+        let pointer = fs::read(root.join("current.json")).unwrap();
+        for version in [pdf_reflow::VERSION - 1, pdf_reflow::VERSION + 1] {
+            // Different IR schemas need not deserialize with this reader.
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "version": version, "book": {"id": id}, "original": {"id": id},
+                "obsolete_ir": true
+            })).unwrap();
+            assert_eq!(import_sync(&id, vec![("manifest.json".into(), bytes)]).unwrap(), Some(version));
+            assert_eq!(fs::read(root.join("current.json")).unwrap(), pointer);
+            assert_eq!(export(&id).unwrap().unwrap(), files);
+        }
+        let malformed = vec![("manifest.json".into(), b"invalid".to_vec())];
+        assert!(import_sync(&id, malformed).is_err());
+        let wrong_book = serde_json::to_vec(&serde_json::json!({
+            "version": 1, "book": {"id": "other"}, "original": {"id": "other"}
+        })).unwrap();
+        assert!(import_sync(&id, vec![("manifest.json".into(), wrong_book)]).is_err());
+        let current_invalid = serde_json::to_vec(&serde_json::json!({
+            "version": pdf_reflow::VERSION, "book": {"id": id}, "original": {"id": id}
+        })).unwrap();
+        assert!(import_sync(&id, vec![("manifest.json".into(), current_invalid)]).is_err());
+        assert_eq!(fs::read(root.join("current.json")).unwrap(), pointer);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     #[ignore = "requires TORTO_TEST_NATIVE_GENERATION pointing to the local Pick, Click, Flick! cache"]
     #[allow(
         clippy::too_many_lines,
@@ -332,7 +393,7 @@ mod tests {
                 .flat_map(|(_, section)| &section.blocks)
                 .flat_map(|block| match block {
                     Block::Text(text) => vec![text],
-                    Block::Figure(figure) => figure.captions.iter().collect(),
+                    Block::Figure(figure) => figure.text_blocks().collect(),
                     _ => Vec::new(),
                 })
                 .flat_map(|text| &text.content)

@@ -191,6 +191,7 @@ fn chapter_book_with_progress(
         session,
         DesktopReaderResources {
             source: structure_source.clone(),
+            media_source: None,
             rewrite_source,
             translation_source,
             semantic_source,

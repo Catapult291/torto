@@ -131,7 +131,7 @@ impl HtmlContext {
                     .chain(q.attribution.iter_mut())
                     .for_each(|t| text(t, notes)),
                 Block::Table(t) => t.text_blocks_mut().for_each(|t| text(t, notes)),
-                Block::Figure(f) => f.captions.iter_mut().for_each(|t| text(t, notes)),
+                Block::Figure(f) => f.text_blocks_mut().for_each(|t| text(t, notes)),
                 Block::Note(n) => n.blocks.iter_mut().for_each(|b| visit(b, notes)),
                 _ => {}
             }

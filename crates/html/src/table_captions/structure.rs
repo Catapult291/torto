@@ -207,7 +207,7 @@ pub(super) fn targets(caption: Node<'_, '_>, media: Node<'_, '_>) -> bool {
 pub(super) fn previous_number(block: &Block) -> Option<String> {
     let texts: Vec<_> = match block {
         Block::Table(table) => table.before.iter().chain(&table.after).collect(),
-        Block::Figure(figure) => figure.captions.iter().collect(),
+        Block::Figure(figure) => figure.text_blocks().collect(),
         _ => return None,
     };
     texts.into_iter().find_map(|text| {

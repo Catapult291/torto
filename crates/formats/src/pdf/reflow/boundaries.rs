@@ -92,7 +92,7 @@ fn nodes(block: &Block, out: &mut HashSet<String>) {
             for i in &f.images {
                 add(&i.source);
             }
-            for t in &f.captions {
+            for t in f.text_blocks() {
                 add(&t.source);
             }
         }

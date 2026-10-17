@@ -50,6 +50,7 @@ fn hmm_book_formula_quotes_become_display_formulas_and_restore_when_disabled() {
             fingerprint: fingerprint(&original),
             annotations,
             formulas_checked: true,
+            image_text_revision: crate::plugins::semantic_layout::formulas::TEXT_REVISION,
             skipped_groups: 0
         }
     ));
@@ -450,6 +451,7 @@ fn translation_restores_prepared_math_and_disabled_layout_restores_source_runs()
         fingerprint: fingerprint(&original),
         annotations,
         formulas_checked: true,
+        image_text_revision: crate::plugins::semantic_layout::formulas::TEXT_REVISION,
         skipped_groups: 0,
     };
     let mut prepared = original.clone();

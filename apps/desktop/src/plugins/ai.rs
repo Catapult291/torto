@@ -2306,9 +2306,7 @@ fn ai_block_content(block: &Block, is_pdf: bool) -> Option<(&SourceRange, String
         }
         Block::Figure(figure) => {
             let source = figure.source.as_ref()?;
-            let caption = figure
-                .captions
-                .iter()
+            let caption = figure.text_blocks()
                 .map(text_block_text)
                 .filter(|text| !text.trim().is_empty())
                 .collect::<Vec<_>>()
@@ -2637,6 +2635,7 @@ mod tests {
             },
         };
         let block = Block::Figure(FigureBlock {
+            body: Vec::new(),
             images: Vec::new(),
             captions: vec![TextBlock {
                 kind: TextBlockKind::Caption,

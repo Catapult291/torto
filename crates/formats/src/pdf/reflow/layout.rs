@@ -1482,6 +1482,7 @@ fn attach_captions(blocks: &mut Vec<Block>) {
             blocks.insert(
                 index,
                 Block::Figure(FigureBlock {
+                    body: Vec::new(),
                     images: vec![image],
                     captions: vec![caption],
                     caption_position: CaptionPosition::After,
@@ -2128,9 +2129,7 @@ mod tests {
                 .iter()
                 .find_map(|block| match block {
                     Block::Figure(figure)
-                        if figure
-                            .captions
-                            .iter()
+                        if figure.text_blocks()
                             .any(|caption| plain(caption).starts_with(label)) =>
                     {
                         Some(figure)

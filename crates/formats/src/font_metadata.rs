@@ -154,7 +154,7 @@ mod tests {
             for block in blocks {
                 match block {
                     Block::Text(t) => text(t, out),
-                    Block::Figure(f) => f.captions.iter().for_each(|t| text(t, out)),
+                    Block::Figure(f) => f.text_blocks().for_each(|t| text(t, out)),
                     Block::Table(t) => t.text_blocks().for_each(|t| text(t, out)),
                     Block::Quote(q) => q
                         .body

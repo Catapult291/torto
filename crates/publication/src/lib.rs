@@ -476,6 +476,28 @@ pub enum Block {
 }
 
 impl Block {
+    /// All selectable text in stable reading order, including composite bodies.
+    pub fn text_blocks(&self) -> Box<dyn Iterator<Item = &TextBlock> + '_> {
+        match self {
+            Self::Text(text) => Box::new(std::iter::once(text)),
+            Self::Quote(quote) => Box::new(quote.body.iter().chain(quote.attribution.iter())),
+            Self::Table(table) => Box::new(table.text_blocks()),
+            Self::Figure(figure) => Box::new(figure.text_blocks()),
+            Self::Note(note) => Box::new(note.blocks.iter().flat_map(Self::text_blocks)),
+            _ => Box::new(std::iter::empty()),
+        }
+    }
+
+    pub fn text_blocks_mut(&mut self) -> Box<dyn Iterator<Item = &mut TextBlock> + '_> {
+        match self {
+            Self::Text(text) => Box::new(std::iter::once(text)),
+            Self::Quote(quote) => Box::new(quote.body.iter_mut().chain(quote.attribution.iter_mut())),
+            Self::Table(table) => Box::new(table.text_blocks_mut()),
+            Self::Figure(figure) => Box::new(figure.text_blocks_mut()),
+            Self::Note(note) => Box::new(note.blocks.iter_mut().flat_map(Self::text_blocks_mut)),
+            _ => Box::new(std::iter::empty()),
+        }
+    }
     /// Returns whether this block belongs to an EPUB footnote definition.
     pub fn is_footnote_definition(&self) -> bool {
         match self {
@@ -489,8 +511,7 @@ impl Block {
                 .text_blocks()
                 .any(|text| text.kind.is_footnote_definition()),
             Self::Figure(figure) => figure
-                .captions
-                .iter()
+                .text_blocks()
                 .any(|caption| caption.kind.is_footnote_definition()),
             Self::Note(_) => true,
             Self::Image(_) | Self::Separator(_) | Self::LineBreak | Self::PageBreak => false,
@@ -924,6 +945,11 @@ impl ImageText {
 /// An authored image figure kept together with its caption.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FigureBlock {
+    /// Ordered structured content for figures authored as text, lists or grids.
+    /// Includes their caption/credit blocks in authored order; legacy image
+    /// figures continue to use `images` and `captions` without duplication.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub body: Vec<Block>,
     /// Images in authored order. The first image is the primary interaction target.
     pub images: Vec<ImageBlock>,
     /// Caption paragraphs in authored order.
@@ -935,6 +961,24 @@ pub struct FigureBlock {
     pub style: BlockStyle,
     /// Stable source anchor for navigation and citation.
     pub source: Option<SourceRange>,
+}
+
+impl FigureBlock {
+    pub fn text_blocks(&self) -> impl Iterator<Item = &TextBlock> {
+        self.body.iter().flat_map(Block::text_blocks).chain(self.captions.iter())
+    }
+
+    pub fn text_blocks_mut(&mut self) -> impl Iterator<Item = &mut TextBlock> {
+        self.body.iter_mut().flat_map(Block::text_blocks_mut).chain(self.captions.iter_mut())
+    }
+
+    /// Outer captions/credits only; captions inside a grid stay in the grid.
+    pub fn caption_blocks(&self) -> impl Iterator<Item = &TextBlock> {
+        self.captions.iter().chain(self.body.iter().filter_map(|block| match block {
+            Block::Text(text) if matches!(text.kind, TextBlockKind::Caption | TextBlockKind::QuoteAttribution) => Some(text),
+            _ => None,
+        }))
+    }
 }
 
 /// Authored placement of a figure caption relative to its images.
@@ -1082,6 +1126,9 @@ impl Default for Rgba {
 /// Renderer-independent inline presentation and semantic subset.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TextStyle {
+    /// Derived, explicit media-link semantics; color alone never makes text clickable.
+    #[serde(skip)]
+    pub media_reference: Option<media_references::MediaKind>,
     /// Display-only provenance: translated prose may only link media numbers
     /// present in its source. Never persist this restriction into authored IR.
     #[serde(skip)]
@@ -1090,6 +1137,10 @@ pub struct TextStyle {
     /// The text run retains the original text; only layout collapses its presentation.
     #[serde(default)]
     pub inline_citation: u32,
+    /// Derived display ordinal within a semantic block; inline_citation remains
+    /// the source-paragraph identity used by translation and click targets.
+    #[serde(skip)]
+    pub citation_number: u32,
     /// Derived display ordinal within the enclosing semantic block.
     #[serde(skip)]
     pub footnote_number: u32,
@@ -1142,7 +1193,9 @@ impl Default for TextStyle {
     fn default() -> Self {
         Self {
             suppress_media_references: false,
+            media_reference: None,
             inline_citation: 0,
+            citation_number: 0,
             footnote_number: 0,
             display_writing_system: None,
             bold: false,
@@ -1265,6 +1318,9 @@ pub enum TextDirection {
 }
 
 /// Portable block style subset, expressed in CSS pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ListMarkerFormat { LowerAlpha, UpperAlpha }
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct BlockStyle {
     /// Ephemeral marker association for a bilingual companion without a source range.
@@ -1289,6 +1345,9 @@ pub struct BlockStyle {
     /// so saved locations, selections and translations use unchanged offsets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authored_list_marker: Option<u32>,
+    /// Authored alphabetic numbering is meaningful in examples and nested lists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_marker_format: Option<ListMarkerFormat>,
     pub align: TextAlignment,
     /// Horizontal alignment explicitly supplied by the publication. This stays
     /// `None` when `align` only contains the reader/parser default, allowing
@@ -1331,6 +1390,7 @@ impl Default for BlockStyle {
             logical_alignment: true,
             list_group: None,
             authored_list_marker: None,
+            list_marker_format: None,
             align: TextAlignment::Start,
             authored_alignment: None,
             semantic_alignment: None,
@@ -1353,6 +1413,10 @@ fn default_logical_alignment() -> bool {
 
 /// Lazy source boundary: parsers produce stable reading IR one section at a time.
 pub trait BookSource: Send + Sync {
+    /// Apply an already prepared, memory-only media catalog to popup content.
+    /// Implementations must never parse sections or load resources here.
+    fn prepare_media_references(&self, _content: &mut Vec<Inline>, _origin: Option<&SourceRange>) {}
+    fn media_reference_revision(&self) -> u64 { 0 }
     /// Lightweight descriptor available immediately after opening.
     fn book(&self) -> &Book;
     /// Optional generation for the parsed content. A source returning `Some`

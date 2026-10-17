@@ -1513,6 +1513,7 @@ href:PublicationUrl::parse("image.png").unwrap(),alt:String::new(),style:Default
         session,
         DesktopReaderResources {
             source,
+            media_source: None,
             rewrite_source,
             translation_source,
             semantic_source,
@@ -2394,9 +2395,7 @@ fn local_chinese_computer_figure_captions() {
                 _ => None,
             })
             .unwrap();
-        let text = figure
-            .captions
-            .iter()
+        let text = figure.text_blocks()
             .map(|c| {
                 c.content
                     .iter()
@@ -2643,9 +2642,7 @@ fn local_hearing_figures_keep_border_after_sentence_structure() {
                 {
                     t.source.clone()
                 }
-                Block::Figure(f) => f
-                    .captions
-                    .iter()
+                Block::Figure(f) => f.text_blocks()
                     .find(|t| crate::plugins::text_block_text(t).contains(marker))
                     .and_then(|t| t.source.clone()),
                 _ => None,

@@ -14,7 +14,7 @@ fn wire_text(message: &Value) -> String {
 }
 use crate::plugins::{BlockTranslation, TranslationBookSource, TranslationMode};
 use rebook_publication::{
-    ImageBlock, Metadata, PublicationId, SourceAnchor, SpineItem, SpineItemId, TextRun,
+    ImageBlock, ImageText, Metadata, PublicationId, SourceAnchor, SpineItem, SpineItemId, TextRun,
 };
 
 pub(super) fn text(id: &str, content: &str) -> Block {
@@ -72,6 +72,45 @@ fn validate(groups: &[Proposal], section: &Section) -> Result<(), String> {
 }
 
 #[test]
+fn old_image_policy_keeps_semantic_groups_and_accepts_current_partial_images() {
+    let mut raw = section(vec![text("a", "First borrowed line"), text("b", "Second borrowed line"), image("glyph")]);
+    for block in &mut raw.blocks[..2] {
+        if let Block::Text(text) = block { text.style.paragraph_group = Some(17); }
+    }
+    let original = original_source(raw.clone());
+    let overlay = SemanticLayoutSource::new(original.clone(), original);
+    let group = annotation(&Proposal::Quote { body: vec![0,1], attribution: None, alignment: None }, &raw);
+    let Block::Image(image) = &raw.blocks[2] else { panic!() };
+    let replacement = Annotation::ImageText { href: image.href.clone(), text: ImageText {
+        text: "legacy transcription".into(), literal: true, translated: None,
+    }};
+    let identity = json!(["old-image-policy-test", uuid::Uuid::new_v4().to_string()]);
+    let path = recognition_path(&identity, &fingerprint(&raw)).unwrap();
+    crate::persistence::write_json_atomic(&path, &Recognition { formulas_checked: true, image_text_revision: 2,
+        fingerprint: fingerprint(&raw), skipped_groups: 0, annotations: vec![group,replacement] }).unwrap();
+    *overlay.cache_identity.write().unwrap() = Some(identity.clone());
+    assert!(load_recognition(&raw, &identity).is_none(), "old image decisions cannot satisfy new requests");
+    assert!(load_recognition_inner(&raw, &identity, &fingerprint(&raw), false).is_some(), "semantic groups remain a valid cache hit");
+    let displayed = overlay.parse_section(0).unwrap();
+    std::fs::remove_file(path).unwrap();
+    assert!(overlay.has_recognition(0, &fingerprint(&raw)));
+    assert!(!overlay.has_current_recognition(0, &fingerprint(&raw)));
+    assert!(matches!(&displayed.blocks[0], Block::Quote(q) if q.body.len()==2));
+    assert_eq!(displayed.blocks[1], raw.blocks[2], "outdated text must remain the authored image");
+    let scoped = scope_section(&raw, 2..3);
+    assert!(overlay.install_scope(0, &fingerprint(&raw), 2..3, Recognition {
+        formulas_checked: true, image_text_revision: formulas::TEXT_REVISION,
+        fingerprint: fingerprint(&scoped), skipped_groups: 0,
+        annotations: vec![Annotation::ImageText { href: image.href.clone(), text: ImageText {
+            text: "か".into(), literal: true, translated: None,
+        }}],
+    }));
+    let current = overlay.parse_section(0).unwrap();
+    assert_eq!(current.blocks[0], displayed.blocks[0], "image recheck must preserve the existing quote");
+    assert!(matches!(&current.blocks[1], Block::Text(t) if matches!(&t.content[0], Inline::Image(r) if r.image.ocr_text.as_ref().unwrap().text=="か")));
+}
+
+#[test]
 fn authored_container_is_sent_whole_and_can_become_an_unattributed_quote() {
     let mut s=section(vec![text("intro","The following is an excerpt:"),text("a","First borrowed line"),text("b","Second borrowed line"),text("after","Narration resumes.")]);
     for b in &mut s.blocks[1..3] { if let Block::Text(t)=b { t.style.paragraph_group=Some(17); } }
@@ -122,6 +161,7 @@ fn protected_semantics_are_not_classification_targets() {
         .is_err()
     );
     let figure = Block::Figure(FigureBlock {
+        body: Vec::new(),
         images: vec![],
         captions: vec![],
         caption_position: CaptionPosition::default(),
@@ -461,6 +501,7 @@ fn translation_indices_survive_semantic_toggle_and_changed_content_is_rejected()
     let overlay = SemanticLayoutSource::new(translations.clone(), original);
     let recognition = Recognition {
         formulas_checked: true,
+        image_text_revision: crate::plugins::semantic_layout::formulas::TEXT_REVISION,
         fingerprint: fingerprint(&section),
         skipped_groups: 0,
         annotations: vec![annotation(
@@ -484,6 +525,7 @@ fn translation_indices_survive_semantic_toggle_and_changed_content_is_rejected()
         0,
         Recognition {
             formulas_checked: true,
+            image_text_revision: crate::plugins::semantic_layout::formulas::TEXT_REVISION,
             fingerprint: "stale".into(),
             ..recognition
         }
@@ -522,6 +564,7 @@ fn scoped_layout_and_translation_commute_without_completing_the_whole_chapter() 
             let scoped = scope_section(&section, 0..2);
             let result = Recognition {
                 formulas_checked: true,
+                image_text_revision: crate::plugins::semantic_layout::formulas::TEXT_REVISION,
                 fingerprint: fingerprint(&scoped),
                 skipped_groups: 0,
                 annotations: vec![annotation(
@@ -551,6 +594,7 @@ fn scoped_layout_and_translation_commute_without_completing_the_whole_chapter() 
                 2..3,
                 Recognition {
                     formulas_checked: true,
+                    image_text_revision: crate::plugins::semantic_layout::formulas::TEXT_REVISION,
                     fingerprint: fingerprint(&remainder),
                     skipped_groups: 0,
                     annotations: vec![],
@@ -563,6 +607,7 @@ fn scoped_layout_and_translation_commute_without_completing_the_whole_chapter() 
                 0,
                 Recognition {
                     formulas_checked: true,
+                    image_text_revision: crate::plugins::semantic_layout::formulas::TEXT_REVISION,
                     fingerprint: "old-content".into(),
                     skipped_groups: 0,
                     annotations: vec![],
@@ -870,6 +915,7 @@ fn cached_negative_results_load_without_a_request_and_content_changes_miss() {
     let path = recognition_path(&identity, &hash).unwrap();
     let result = Recognition {
         formulas_checked: true,
+        image_text_revision: crate::plugins::semantic_layout::formulas::TEXT_REVISION,
         fingerprint: hash.clone(),
         skipped_groups: 0,
         annotations: vec![],
@@ -908,6 +954,7 @@ fn missing_recognition_cache_notices_a_new_file_and_configuration_reset() {
         &path,
         &Recognition {
             formulas_checked: true,
+            image_text_revision: crate::plugins::semantic_layout::formulas::TEXT_REVISION,
             fingerprint: hash.clone(),
             skipped_groups: 0,
             annotations: vec![],

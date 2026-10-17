@@ -206,7 +206,7 @@ pub fn normalize_ocr_with_continuations(
         .iter()
         .flat_map(|block| match block {
             Block::Text(t) => vec![text(t)],
-            Block::Figure(f) => f.captions.iter().map(text).collect(),
+            Block::Figure(f) => f.text_blocks().map(text).collect(),
             _ => vec![],
         })
         .flat_map(|text| {
@@ -279,6 +279,7 @@ pub fn normalize_ocr_with_continuations(
         section.blocks.insert(
             i,
             Block::Figure(FigureBlock {
+                body: Vec::new(),
                 images,
                 captions,
                 caption_position: CaptionPosition::After,

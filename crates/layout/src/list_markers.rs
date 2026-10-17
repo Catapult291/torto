@@ -3,6 +3,38 @@ use std::borrow::Cow;
 
 use rebook_publication::{Inline, TextBlock, TextBlockKind, TextRun};
 
+pub(super) fn prefix(block: &TextBlock) -> Option<String> {
+    let TextBlockKind::ListItem {
+        ordered: true,
+        ordinal,
+        marker_visible: true,
+        ..
+    } = block.kind
+    else {
+        return None;
+    };
+    let format = block.style.list_marker_format?;
+    if ordinal == 0 {
+        return None;
+    }
+    let mut number = ordinal;
+    let mut chars = Vec::new();
+    let base = match format {
+        rebook_publication::ListMarkerFormat::LowerAlpha => b'a',
+        rebook_publication::ListMarkerFormat::UpperAlpha => b'A',
+    };
+    while number > 0 {
+        number -= 1;
+        chars.push(char::from(base + (number % 26) as u8));
+        number /= 26;
+    }
+    chars.reverse();
+    Some(format!(
+        "{}.\u{00a0}",
+        chars.into_iter().collect::<String>()
+    ))
+}
+
 pub(super) fn normalize(block: &TextBlock, unified: bool) -> Cow<'_, TextBlock> {
     let TextBlockKind::ListItem { .. } = block.kind else {
         return Cow::Borrowed(block);

@@ -575,7 +575,7 @@ pub(super) fn clear_markers(blocks: &mut [Block]) {
                 }
             }
             Block::Figure(figure) => {
-                for text in &mut figure.captions {
+                for text in figure.text_blocks_mut() {
                     clear(text);
                 }
             }

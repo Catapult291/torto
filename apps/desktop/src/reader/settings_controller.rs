@@ -220,6 +220,7 @@ impl DesktopReader {
                     self.translation.task.cancel();
                     self.translation.toc_task.cancel();
                     self.translation.toc_labels.clear();
+                    self.translation.canonical_titles.clear();
                 } else if toc_translation_setting_changed && !self.plugin_settings.translate_toc {
                     self.translation.toc_task.cancel();
                 }

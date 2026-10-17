@@ -169,6 +169,65 @@ mod tests {
     }
 
     #[test]
+    fn extracted_image_text_has_focus_units_and_clear_geometry() {
+        use rebook_publication::{Block, ImageText, Inline};
+        let (_, mut section) = html_fixture("<html><body><p>Earlier discussion.</p><p>Image <img src='glyph.png'/> example.</p><p>Later discussion.</p></body></html>");
+        let Block::Text(inline) = &mut section.blocks[1] else { panic!() };
+        let run = inline.content.iter_mut().find_map(|item| match item { Inline::Image(run) => Some(run), _ => None }).unwrap();
+        run.image.ocr_text = Some(ImageText { text: "か".into(), literal: true, translated: None });
+        let mut standalone_run = run.clone();
+        standalone_run.image.ocr_text = Some(ImageText {
+            text: "Original text".into(), literal: false, translated: Some("Translated image text".into()),
+        });
+        let mut standalone = inline.clone();
+        standalone.source.as_mut().unwrap().start.node = "standalone-image".into();
+        let range = standalone.source.as_mut().unwrap();
+        range.end = range.start.clone();
+        standalone_run.image.source = Some(range.clone());
+        standalone.content = vec![Inline::Image(standalone_run)];
+        section.blocks.insert(2, Block::Text(standalone));
+        let mut reader = crate::reader::semantic_layout::tests::fixture_with_blocks(section.blocks).0;
+        reader.focus_style = FocusStyle::SurroundingDim;
+        let layout = reader.current_scroll_layout().unwrap();
+        reader.rebuild_focus_units(&layout);
+        for expected in ["か", "Translated image text"] {
+            let unit = reader.focus_units.iter().find(|unit| unit.text.contains(expected))
+                .unwrap_or_else(|| panic!("missing focus unit for {expected}"));
+            let mut found = false;
+            for (page_index, entry) in layout.pages.iter().enumerate() {
+                if let Some(bounds) = entry.page.source_content_bounds(&unit.paint_ranges) {
+                    let point = egui::pos2(bounds.center().x as f32, layout.content_y(page_index, bounds.center().y as f32));
+                    assert!(clear_unit_rects(unit).any(|rect| rect.contains(point)), "extracted text stays dimmed");
+                    found = true;
+                }
+            }
+            assert!(found, "missing source geometry for {expected}");
+        }
+    }
+
+    #[test]
+    fn text_figure_focus_keeps_generated_list_markers_clear() {
+        let (mut reader, _) = html_fixture("<html><body><p>Earlier discussion.</p><figure><div><ol type='a'><li>What are clouds?</li><li>How are clouds formed?</li><li>List three types of cloud.</li></ol></div><figcaption>Figure 4.3</figcaption></figure><p>Later discussion.</p></body></html>");
+        reader.focus_style = FocusStyle::SurroundingDim;
+        let layout = reader.current_scroll_layout().unwrap();
+        reader.rebuild_focus_units(&layout);
+        let unit = reader.focus_units.iter().find(|unit| unit.text.contains("What are clouds?")).unwrap();
+        let mut markers = 0;
+        for (page_index, entry) in layout.pages.iter().enumerate() {
+            // Semantic bounds include marker glyphs while selectable source
+            // rectangles intentionally continue to begin after the prefix.
+            let bounds = entry.page.source_content_bounds(&unit.paint_ranges).unwrap();
+            let selectable = entry.page.source_rects(&unit.paint_ranges);
+            let selected_left = selectable.iter().map(|rect| rect.x0).fold(f64::INFINITY, f64::min);
+            assert!(bounds.x0 < selected_left - 8.0);
+            let at = egui::pos2(bounds.x0 as f32 + 0.5, layout.content_y(page_index, bounds.center().y as f32));
+            assert!(clear_unit_rects(unit).any(|rect| rect.contains(at)), "generated marker was dimmed");
+            markers += 1;
+        }
+        assert!(markers > 0);
+    }
+
+    #[test]
     fn consecutive_headings_follow_only_the_next_semantic_unit() {
         use rebook_publication::Block;
         for body in [
@@ -334,7 +393,7 @@ mod tests {
                 let captions = match block {
                     Block::Figure(figure) => {
                         figures += 1;
-                        figure.captions.iter().collect::<Vec<_>>()
+                        figure.text_blocks().collect::<Vec<_>>()
                     }
                     Block::Table(table) => {
                         tables += 1;

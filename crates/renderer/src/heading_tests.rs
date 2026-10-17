@@ -135,11 +135,11 @@ fn softened_internal_heading_break_keeps_title_character_offsets() {
     });
     let heading = block(
         "heading",
-        "Chapter 1\nIntroduction",
+        "Chapter 1\u{2003} \n Introduction",
         TextBlockKind::Heading(1),
     );
     let mut title_source = heading.source.clone().unwrap();
-    title_source.start.text_offset += "Chapter 1\n".chars().count() as u64;
+    title_source.start.text_offset += "Chapter 1\u{2003} \n ".chars().count() as u64;
     let style = ReaderStyle {
         typesetting: ReaderTypesetting::unified(),
         spread: SpreadMode::Single,

@@ -3,7 +3,8 @@ use std::time::{Duration, Instant};
 use crate::sync::SyncMode;
 
 const FULL_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
-const MAX_READING_DELAY: Duration = Duration::from_secs(15);
+const READING_QUIET_MS: u64 = 10_000;
+const MAX_READING_DELAY: Duration = Duration::from_secs(60);
 const RETRY_DELAY: Duration = Duration::from_secs(30);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30 * 60);
 
@@ -16,6 +17,8 @@ pub(super) struct SyncSchedule {
     queued: Option<SyncMode>,
     failures: u32,
     rate_limited_until: Option<Instant>,
+    statistics_retry: Option<Instant>,
+    statistics_failures: u32,
 }
 
 impl Default for SyncSchedule {
@@ -29,6 +32,8 @@ impl Default for SyncSchedule {
             queued: None,
             failures: 0,
             rate_limited_until: None,
+            statistics_retry: None,
+            statistics_failures: 0,
         }
     }
 }
@@ -40,15 +45,21 @@ impl SyncSchedule {
 
     pub fn started(&mut self, mode: SyncMode) {
         if matches!(mode, SyncMode::Full { .. })
-            || self.queued == Some(SyncMode::Reading)
+            || mode != SyncMode::Statistics && self.queued == Some(SyncMode::Reading)
             || mode == SyncMode::Derived && self.queued == Some(SyncMode::Derived)
         {
             self.queued = None;
         }
-        self.pending_since = None;
+        if mode != SyncMode::Statistics {
+            self.pending_since = None;
+        }
     }
 
     pub fn request(&mut self, mode: SyncMode) {
+        if mode == SyncMode::Statistics {
+            self.statistics_retry.get_or_insert_with(Instant::now);
+            return;
+        }
         self.queued = Some(match (self.queued, mode) {
             (
                 Some(SyncMode::Full {
@@ -90,7 +101,7 @@ impl SyncSchedule {
         }
         if let Some(latest) = latest_change_ms {
             let since = *self.pending_since.get_or_insert(now);
-            if now_ms.saturating_sub(latest) >= 2_000
+            if now_ms.saturating_sub(latest) >= READING_QUIET_MS
                 || now.duration_since(since) >= MAX_READING_DELAY
             {
                 self.pending_since = None;
@@ -98,6 +109,13 @@ impl SyncSchedule {
             }
         } else {
             self.pending_since = None;
+        }
+        if self
+            .statistics_retry
+            .is_some_and(|deadline| now >= deadline)
+            && now.duration_since(self.last_full) < FULL_CHECK_INTERVAL
+        {
+            return Some(SyncMode::Statistics);
         }
         (now.duration_since(self.last_full) >= FULL_CHECK_INTERVAL).then_some(SyncMode::Full {
             force_statistics: false,
@@ -115,6 +133,24 @@ impl SyncSchedule {
         now: Instant,
         rate_limit: Option<Duration>,
     ) {
+        if mode == SyncMode::Statistics {
+            if success {
+                self.statistics_retry = None;
+                self.statistics_failures = 0;
+            } else {
+                self.statistics_failures = self.statistics_failures.saturating_add(1);
+                let delay = Duration::from_secs(5 * 60)
+                    .saturating_mul(1_u32 << (self.statistics_failures - 1).min(6))
+                    .min(MAX_RETRY_DELAY)
+                    .max(rate_limit.unwrap_or_default());
+                self.statistics_retry = Some(now + delay);
+                if rate_limit.is_some() {
+                    self.retry_after = now + delay;
+                    self.rate_limited_until = Some(self.retry_after);
+                }
+            }
+            return;
+        }
         if success {
             if matches!(mode, SyncMode::Full { .. }) {
                 self.last_full = now;
@@ -183,17 +219,62 @@ mod tests {
             None
         );
         assert_eq!(
-            schedule.next(now + Duration::from_secs(3), 4_000, Some(1_800)),
+            schedule.next(now + Duration::from_secs(11), 12_000, Some(1_800)),
             Some(SyncMode::Reading)
         );
         assert_eq!(
-            schedule.next(now + Duration::from_secs(4), 5_000, Some(5_000)),
+            schedule.next(now + Duration::from_secs(12), 13_000, Some(13_000)),
             None
         );
         assert_eq!(
-            schedule.next(now + Duration::from_secs(19), 20_000, Some(20_000)),
+            schedule.next(now + Duration::from_secs(72), 73_000, Some(73_000)),
             Some(SyncMode::Reading)
         );
+    }
+
+    #[test]
+    fn statistics_failure_retries_alone_and_does_not_block_reading_or_rescan_library() {
+        let mut schedule = SyncSchedule::default();
+        let now = schedule.last_full;
+        schedule.completed(
+            SyncMode::Full {
+                force_statistics: false,
+            },
+            true,
+            now,
+        );
+        schedule.completed(SyncMode::Statistics, false, now);
+        assert_eq!(schedule.next(now + Duration::from_secs(30), 0, None), None);
+        schedule.request(SyncMode::Reading);
+        assert_eq!(
+            schedule.next(now + Duration::from_secs(31), 0, None),
+            Some(SyncMode::Reading)
+        );
+        schedule.completed(SyncMode::Reading, true, now + Duration::from_secs(31));
+        assert_eq!(
+            schedule.next(now + Duration::from_secs(300), 0, None),
+            Some(SyncMode::Statistics)
+        );
+        schedule.completed(SyncMode::Statistics, true, now + Duration::from_secs(300));
+        assert_eq!(schedule.next(now + Duration::from_secs(301), 0, None), None);
+    }
+
+    #[test]
+    fn statistics_rate_limit_is_global_but_queues_no_library_retry() {
+        let mut schedule = SyncSchedule::default();
+        let now = schedule.last_full;
+        schedule.completed_with_limit(
+            SyncMode::Statistics,
+            false,
+            now,
+            Some(Duration::from_secs(600)),
+        );
+        assert_eq!(schedule.next(now + Duration::from_secs(599), 0, None), None);
+        assert_eq!(
+            schedule.next(now + Duration::from_secs(600), 0, None),
+            Some(SyncMode::Statistics)
+        );
+        assert!(schedule.queued.is_none());
     }
 
     #[test]

@@ -6,9 +6,14 @@ use std::io::Cursor;
 
 pub(super) const PROMPT: &str = include_str!("formulas/prompt.md");
 pub(super) const TRANSCRIBE_PROMPT: &str = include_str!("formulas/transcribe.md");
+const SYMBOL_PROMPT: &str = include_str!("formulas/symbols.md");
+const REPLACEMENT_PROMPT: &str = include_str!("formulas/replacement.md");
+pub(super) const TEXT_REVISION: u32 = 5;
 mod batch;
 
-pub(super) fn options() -> Value {
+// Keep the chapter/group identity stable. Image policy has its own revision and
+// fingerprint, so updating it must not invalidate unrelated semantic work.
+pub(super) fn chapter_cache_options() -> Value {
     let item = json!({"type":"object","additionalProperties":false,"properties":{
         "image_id":{"type":"integer","description":"Copy an ID from requested_ids. IDs need not be consecutive."},
         "status":{"type":"string","enum":["recognized","recognized_text","not_formula","unreadable","unreadable_text"],"description":"recognized: the whole image is mathematics or a formal rule. recognized_text: the whole meaningful image is faithful Unicode text, including letters or script examples. not_formula: diagrams, plots, tables, photos, decorations or mixed visual/text images. unreadable: formula details are unclear; unreadable_text: text details are unclear or unsupported. Never infer characters from the surrounding words."},
@@ -25,8 +30,16 @@ pub(super) fn options() -> Value {
     })
 }
 
+pub(super) fn options() -> Value {
+    let mut value = chapter_cache_options();
+    let item = &mut value["output_schema"]["properties"]["results"]["items"];
+    item["properties"]["replacement_safe"] = json!({"type":"boolean", "description":"True only if the proposed text or LaTeX preserves the complete meaning under ordinary reader reflow and typography. Otherwise retain the original image; use not_formula and null content. When uncertain, false."});
+    item["required"].as_array_mut().unwrap().push(json!("replacement_safe"));
+    value
+}
+
 pub(super) fn request_prompt() -> String {
-    format!("{PROMPT}\n{TRANSCRIBE_PROMPT}")
+    format!("{PROMPT}\n{TRANSCRIBE_PROMPT}\n{SYMBOL_PROMPT}\n{REPLACEMENT_PROMPT}")
 }
 
 #[derive(Clone)]
@@ -82,6 +95,7 @@ pub(super) fn candidates(section: &Section) -> Vec<Candidate> {
                 }
                 Block::Note(n) => visit(&n.blocks, result),
                 Block::Figure(figure) => {
+                    visit(&figure.body, result);
                     for caption in &figure.captions { text(caption, result); }
                 }
                 // Captioned figures and diagrams are not formula candidates.
@@ -90,7 +104,10 @@ pub(super) fn candidates(section: &Section) -> Vec<Candidate> {
         }
     }
     fn text(t: &TextBlock, out: &mut Vec<Candidate>) {
-        for i in &t.content {
+        let marker = t.style.authored_list_marker.and_then(|_| t.content.iter().position(|i|
+            !matches!(i, Inline::Text(r) if r.text.trim().is_empty())));
+        for (index,i) in t.content.iter().enumerate() {
+            if marker == Some(index) { continue }
             if let Inline::Image(run) = i {
                 out.push(Candidate {
                     image: run.image.clone(),
@@ -159,6 +176,10 @@ pub(super) fn validate_formula(formula: &ImageFormula) -> Result<(), String> {
 #[serde(deny_unknown_fields)]
 struct Response {
     #[serde(default)]
+    revision: u32,
+    #[serde(default)]
+    replacement_safe: bool,
+    #[serde(default)]
     text: Option<String>,
     #[serde(default)]
     literal: bool,
@@ -171,6 +192,9 @@ struct Response {
 
 impl Response {
     fn formula(&self) -> Result<Option<ImageFormula>, String> {
+        if !self.replacement_safe && matches!(self.status.as_str(), "recognized" | "recognized_text") {
+            return Ok(None);
+        }
         if self.status == "recognized_text" {
             if self.latex.is_some() || self.equation_number.is_some() { return Err("Text result contains formula data".into()) }
             validate_text(self.text.as_deref().ok_or("Missing image text")?)?;
@@ -198,7 +222,7 @@ impl Response {
 
 pub(super) fn validate_text(text: &str) -> Result<(), String> {
     if text.trim().is_empty() || text.len() > 4096
-        || text.contains(['<','>','\u{fffd}'])
+        || text.contains('\u{fffd}')
         || text.chars().any(|c| c.is_control() && c != '\n')
     { return Err("Empty, damaged or unsupported image text".into()) }
     Ok(())
@@ -280,7 +304,7 @@ fn record(
             formula,
         });
     }
-    if response.status == "recognized_text" && response.formula().is_ok() {
+    if response.replacement_safe && response.status == "recognized_text" && response.formula().is_ok() {
         annotations.push(Annotation::ImageText {
             href: href.clone(),
             text: ImageText { text: response.text.clone().unwrap(), literal: response.literal, translated: None },
@@ -376,9 +400,11 @@ pub(super) async fn recognize(
         // The wire contract participates in the fingerprint, not the cache format.
         let key = digest(
             &serde_json::to_vec(&json!([
-                "compact-wire-v1",
+                "replacement-fidelity-v1",
                 PROMPT,
                 TRANSCRIBE_PROMPT,
+                SYMBOL_PROMPT,
+                REPLACEMENT_PROMPT,
                 options(),
                 provider.id,
                 provider.base_url,
@@ -406,7 +432,7 @@ pub(super) async fn recognize(
             .as_ref()
             .and_then(|p| std::fs::read(p).ok())
             .and_then(|b| serde_json::from_slice::<Response>(&b).ok())
-            .filter(|r| r.formula().is_ok());
+            .filter(|r| r.revision == TEXT_REVISION && r.formula().is_ok());
         if let Some(cached) = cached {
             record(
                 Some(&cached),
@@ -509,6 +535,7 @@ pub(super) fn compose(blocks: &mut [Block], href: &PublicationUrl, formula: Opti
             }
             Block::Note(n) => compose(&mut n.blocks, href, formula),
             Block::Figure(figure) => {
+                compose(&mut figure.body, href, formula);
                 for caption in &mut figure.captions { text(caption, href, formula); }
             }
             _ => {}
@@ -555,7 +582,7 @@ pub(super) fn compose_text(blocks: &mut [Block], href: &PublicationUrl, text: &I
             Block::Text(t) => inline(t, href, text),
             Block::Quote(q) => for t in q.body.iter_mut().chain(q.attribution.iter_mut()) { inline(t, href, text); },
             Block::Table(table) => for t in table.text_blocks_mut() { inline(t, href, text); },
-            Block::Figure(figure) => for t in &mut figure.captions { inline(t, href, text); },
+            Block::Figure(figure) => { compose_text(&mut figure.body, href, text); for t in &mut figure.captions { inline(t, href, text); } },
             Block::Note(note) => compose_text(&mut note.blocks, href, text),
             _ => {}
         }

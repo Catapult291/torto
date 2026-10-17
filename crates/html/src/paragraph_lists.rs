@@ -252,6 +252,36 @@ pub(super) fn detect(
 ) -> HashMap<roxmltree::NodeId, ListItem> {
     let mut result = HashMap::new();
     let mut dimensions = HashMap::new();
+    // Native lists also encode bullets/ordinals as images. Repeated small
+    // leading images are marker evidence; an isolated content glyph is not.
+    let native_lists = root.descendants().filter(|n| n.is_element() && matches!(n.tag_name().name(), "ul" | "ol")).map(|list| {
+        let items = list.children().filter(|n| n.has_tag_name("li")).collect::<Vec<_>>();
+        let leading = items.iter().map(|item| item.descendants().skip(1).find(|n|
+            n.is_text() && n.text().is_some_and(|s| !s.trim().is_empty())
+                || n.is_element() && matches!(n.tag_name().name(), "img" | "math")))
+            .collect::<Vec<_>>();
+        (list, items, leading)
+    }).collect::<Vec<_>>();
+    // A one-item list can use the same bullet as the surrounding lists.
+    let mut repeats = HashMap::<&str, usize>::new();
+    for image in native_lists.iter().flat_map(|(_, _, leading)| leading.iter().flatten()).filter(|n| n.has_tag_name("img")) {
+        if let Some(src) = image.attribute("src") { *repeats.entry(src).or_default() += 1; }
+    }
+    for (list, items, leading) in native_lists {
+        for (ordinal, (item, first)) in items.iter().zip(&leading).enumerate() {
+            let Some(image) = first.filter(|n| n.has_tag_name("img")) else { continue };
+            let Some(src) = image.attribute("src") else { continue };
+            let numbered = image.attribute("alt").is_some_and(|s|
+                !s.trim().is_empty() && s.trim().chars().all(|c| c.is_ascii_digit() || ".()、".contains(c)));
+            if (!numbered && repeats.get(src).copied().unwrap_or(0) < 2)
+                || styles.visually_hidden(image) || !text(*item).chars().any(char::is_alphabetic) { continue }
+            let Ok(url) = href.resolve(src) else { continue };
+            let size = *dimensions.entry(url.clone()).or_insert_with(|| image_dimensions(&url));
+            if !size.is_some_and(|[w,h]| w > 0 && h > 0 && w <= 32 && h <= 32 && w <= h*3 && h <= w*3) { continue }
+            result.insert(item.id(), ListItem { group: list.range().start as u64,
+                ordered: list.has_tag_name("ol"), ordinal: ordinal as u32 + 1, depth: 0, prefix_chars: 0 });
+        }
+    }
     let mut reference_nodes = HashSet::new();
     let mut reference_section = false;
     for node in root.descendants().filter(|n| n.is_element()) {

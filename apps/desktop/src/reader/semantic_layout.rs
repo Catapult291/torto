@@ -5,7 +5,7 @@ use crate::plugins::semantic_layout::{
     Recognition, block_ranges, empty_recognition, fingerprint, log_scope, needs_recognition,
     recognition_groups, recognize_visible, scope_section,
 };
-use rebook_publication::{RenditionLayout, Section, SourceRange};
+use rebook_publication::{BookSource, RenditionLayout, Section, SourceRange};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -83,7 +83,8 @@ pub(super) struct SemanticLayoutState {
     groups: Vec<Group>,
     translations: HashMap<Key, BlockTranslation>,
     failed: HashSet<Key>,
-    originals: HashMap<usize, std::sync::Arc<Section>>,
+    pub(super) originals: HashMap<usize, std::sync::Arc<Section>>,
+    pub(super) title_links: HashMap<(usize,usize),Vec<String>>,
     batch_plans: std::cell::RefCell<HashMap<usize, std::sync::Arc<batching::SectionPlan>>>,
     hashes: HashMap<usize, String>,
     inputs: HashMap<usize, Vec<(crate::plugins::TranslationBlockInput, SourceRange)>>,
@@ -255,9 +256,14 @@ impl DesktopReader {
     pub(super) fn invalidate_semantic_plan(&mut self, reason: &str) {
         self.cancel_semantic_request(reason);
         self.cancel_translation_request(reason);
+        self.translation.toc_task.cancel();
+        self.translation.canonical_titles.clear();
+        self.translation.toc_labels.clear();
+        self.queue_toc_translation();
         self.semantic_layout.reflow_version += 1;
         self.semantic_layout.done.clear();
         self.semantic_layout.originals.clear();
+        self.semantic_layout.title_links.clear();
         self.semantic_layout.batch_plans.get_mut().clear();
         self.semantic_layout.hashes.clear();
         self.semantic_layout.inputs.clear();
@@ -275,7 +281,8 @@ impl DesktopReader {
     }
     pub(super) fn stage_translation_batch(&mut self, index: usize, batch: Vec<BlockTranslation>) {
         self.semantic_layout.next_poll = None;
-        for translation in batch {
+        for mut translation in batch {
+            self.canonicalize_title_translation(index, &mut translation);
             self.semantic_layout.translations.insert(
                 (index, translation.block_index, translation.segment_index),
                 translation,
@@ -355,6 +362,11 @@ impl DesktopReader {
             self.cancel_translation_request("translation_config_changed");
             self.semantic_layout.translations.clear();
             self.semantic_layout.failed.clear();
+            if self.semantic_layout.translation_config.is_some() {
+                self.translation.canonical_titles.clear();
+                self.translation.toc_labels.clear();
+                self.translation.toc_task.cancel();
+            }
             self.semantic_layout.translation_config = Some(translation);
             if let Err(error) = self.translation_source.set_target_language(&target) {
                 self.translation.show_error(error, Instant::now());
@@ -367,6 +379,15 @@ impl DesktopReader {
         runtime: &tokio::runtime::Runtime,
         proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
     ) {
+        if let Some(source) = &self.media_preview.links {
+            source.start(runtime, proxy);
+            let ready = source.media_reference_revision();
+            if ready != self.media_preview.links_revision {
+                let changed = ready > 1 || source.changes_display();
+                self.media_preview.links_revision = ready;
+                if changed { self.refresh_semantic_layout(); }
+            }
+        }
         let revision = self.rewrite_source.revision();
         if self.semantic_layout.revision != revision {
             self.invalidate_semantic_plan("source_revision_changed_at_tick");
@@ -469,6 +490,7 @@ impl DesktopReader {
             self.semantic_layout.prepare_worker = None;
             self.semantic_layout.prepare_receiver = None;
             self.semantic_layout.originals = prepared.originals;
+            self.semantic_layout.title_links = prepared.title_links;
             *self.semantic_layout.batch_plans.get_mut() = prepared.batch_plans;
             self.semantic_layout.hashes.extend(prepared.hashes);
             self.semantic_layout.inputs.extend(prepared.inputs);
@@ -539,7 +561,7 @@ impl DesktopReader {
                 let Some(hash) = self.semantic_layout.hashes.get(&index).cloned() else {
                     continue;
                 };
-                let complete = self.semantic_source.has_recognition(index, &hash);
+                let complete = self.semantic_source.has_current_recognition(index, &hash);
                 let visible_sources: Vec<_> = demand
                     .iter()
                     .filter(|(i, _)| *i == index)
@@ -683,6 +705,9 @@ impl DesktopReader {
                 }
             }
         }
+        let reused = missing.iter().filter_map(|((index,_,_),input)|
+            self.reuse_title_translation(*index,input).map(|translation|(*index,translation))).collect::<Vec<_>>();
+        for (index,translation) in reused { self.stage_translation_batch(index,vec![translation]); }
         if self.translation.enabled && self.plugin_settings.translation_endpoint().is_ok() {
             let available = missing
                 .iter()

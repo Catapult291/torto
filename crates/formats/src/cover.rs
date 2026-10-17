@@ -31,7 +31,7 @@ pub(super) fn page_thumbnail(source: &dyn BookSource) -> Option<Vec<u8>> {
             };
             match block {
                 Block::Image(image) => constrain(image),
-                Block::Figure(figure) => figure.images.iter_mut().for_each(constrain),
+                Block::Figure(figure) => { figure.images.iter_mut().for_each(constrain); constrain_images(&mut figure.body); },
                 Block::Note(note) => constrain_images(&mut note.blocks),
                 _ => {}
             }
@@ -255,7 +255,7 @@ mod tests {
                         .sum(),
                     Block::Note(note) => count_ruby(&note.blocks),
                     Block::Table(table) => table.text_blocks().map(count_text).sum(),
-                    Block::Figure(figure) => figure.captions.iter().map(count_text).sum(),
+                    Block::Figure(figure) => figure.text_blocks().map(count_text).sum(),
                     Block::Separator(separator) => separator.text.as_ref().map_or(0, count_text),
                     _ => 0,
                 })

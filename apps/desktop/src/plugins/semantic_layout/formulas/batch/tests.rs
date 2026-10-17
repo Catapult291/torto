@@ -1,9 +1,35 @@
 use super::*;
 
+#[test]
+fn replacement_fidelity_is_required_and_unsafe_text_or_latex_is_terminal() {
+    let item = json!({"image_id":0,"status":"recognized_text","text":"t = 0 sec",
+        "literal":true,"latex":null,"equation_number":null});
+    assert!(parse(&json!({"results":[item.clone()]}).to_string(), &[0]).is_empty());
+    let mut unsafe_text = item;
+    unsafe_text["replacement_safe"] = json!(false);
+    let unsafe_math = json!({"image_id":1,"status":"recognized","replacement_safe":false,
+        "text":null,"literal":true,"latex":"\\text{t = 0 sec}","equation_number":null});
+    let value = json!({"results":[unsafe_text,unsafe_math]});
+    let schema = options();
+    assert!(jsonschema::validator_for(&schema["output_schema"]).unwrap().is_valid(&value));
+    let results = parse(&value.to_string(), &[0,1]);
+    assert_eq!(results.len(), 2);
+    for response in results.values() {
+        assert!(!response.transient);
+        assert!(response.formula().unwrap().is_none());
+        let mut annotations = Vec::new();
+        let mut failed = 0;
+        record(Some(response), &PublicationUrl::parse("image.png").unwrap(), &mut annotations, &mut failed);
+        assert!(annotations.is_empty());
+        assert_eq!(failed, 0);
+    }
+}
+
 fn complete_image_response(mut value: Value) -> Value {
     if let Some(items) = value["results"].as_array_mut() {
         for item in items {
             if let Some(object) = item.as_object_mut() {
+                object.entry("replacement_safe").or_insert(Value::Bool(true));
                 object.entry("text").or_insert(Value::Null);
                 object.entry("literal").or_insert(Value::Bool(false));
             }
@@ -14,14 +40,14 @@ fn complete_image_response(mut value: Value) -> Value {
 
 #[test]
 fn mixed_math_and_unicode_text_results_keep_ids_and_character_examples() {
-    let value = r#"{"results":[{"image_id":2,"status":"recognized_text","text":"か","literal":true,"latex":null,"equation_number":null},{"image_id":0,"status":"recognized","text":null,"literal":false,"latex":"x^2","equation_number":null},{"image_id":1,"status":"not_formula","text":null,"literal":false,"latex":null,"equation_number":null}]}"#;
+    let value = r#"{"results":[{"image_id":2,"status":"recognized_text","replacement_safe":true,"text":"か","literal":true,"latex":null,"equation_number":null},{"image_id":0,"status":"recognized","replacement_safe":true,"text":null,"literal":false,"latex":"x^2","equation_number":null},{"image_id":1,"status":"not_formula","replacement_safe":false,"text":null,"literal":false,"latex":null,"equation_number":null}]}"#;
     let results = parse(value, &[0,1,2]);
     assert_eq!(results.len(), 3);
     assert_eq!(results[&2].text.as_deref(), Some("か"));
     assert!(results[&2].literal);
     assert!(results[&2].formula().unwrap().is_none());
     assert!(results[&0].formula().unwrap().is_some());
-    let damaged = r#"{"results":[{"image_id":2,"status":"recognized_text","text":"<script>bad</script>","literal":false,"latex":null,"equation_number":null}]}"#;
+    let damaged = r#"{"results":[{"image_id":2,"status":"recognized_text","replacement_safe":true,"text":"\ufffd","literal":false,"latex":null,"equation_number":null}]}"#;
     let results = parse(damaged, &[2]);
     assert_eq!(results[&2].status, "unreadable_text");
     assert!(results[&2].transient);
@@ -29,16 +55,16 @@ fn mixed_math_and_unicode_text_results_keep_ids_and_character_examples() {
 
 #[test]
 fn batch_results_match_ids_and_isolate_bad_items() {
-    let item = json!({"image_id":0,"status":"recognized","latex":"x=1","equation_number":null});
+    let item = json!({"image_id":0,"status":"recognized","replacement_safe":true,"latex":"x=1","equation_number":null});
     assert_eq!(
         parse(&json!({"results":[item.clone(),item]}).to_string(), &[0]).len(),
         1
     );
     let result = parse(
         r#"{"results":[
-        {"image_id":2,"status":"not_formula","latex":null,"equation_number":null},
-        {"image_id":0,"status":"recognized","latex":"x=1","equation_number":null},
-        {"image_id":1,"status":"recognized","latex":"$bad$","equation_number":null}
+        {"image_id":2,"status":"not_formula","replacement_safe":false,"latex":null,"equation_number":null},
+        {"image_id":0,"status":"recognized","replacement_safe":true,"latex":"x=1","equation_number":null},
+        {"image_id":1,"status":"recognized","replacement_safe":true,"latex":"$bad$","equation_number":null}
     ]}"#,
         &[0, 1, 2],
     );
@@ -50,9 +76,9 @@ fn batch_results_match_ids_and_isolate_bad_items() {
     assert_eq!(result[&2].status, "not_formula");
     let duplicate = parse(
         r#"{"results":[
-        {"image_id":0,"status":"recognized","latex":"x=1","equation_number":null},
-        {"image_id":0,"status":"recognized","latex":"x=2","equation_number":null},
-        {"image_id":99,"status":"not_formula","latex":null,"equation_number":null}
+        {"image_id":0,"status":"recognized","replacement_safe":true,"latex":"x=1","equation_number":null},
+        {"image_id":0,"status":"recognized","replacement_safe":true,"latex":"x=2","equation_number":null},
+        {"image_id":99,"status":"not_formula","replacement_safe":false,"latex":null,"equation_number":null}
     ]}"#,
         &[0, 1],
     );
@@ -305,7 +331,7 @@ fn run_batch_fixture(replies: Vec<(Value, Vec<usize>)>) -> Vec<Option<Response>>
 }
 
 fn recognized(id: usize, latex: &str) -> Value {
-    json!({"image_id":id,"status":"recognized","latex":latex,"equation_number":null})
+    json!({"image_id":id,"status":"recognized","replacement_safe":true,"latex":latex,"equation_number":null})
 }
 
 #[test]

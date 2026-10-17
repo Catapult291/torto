@@ -129,8 +129,19 @@ fn search_sections(
                     };
                     (layer.text.clone(), source_range, "image-text".into())
                 }
-                Block::Figure(_)
-                | Block::Table(_)
+                Block::Figure(figure) => {
+                    for child in figure.text_blocks() {
+                        if child.source.is_none() { continue; }
+                        let text = text_block_text(child);
+                        for found in matcher.find_iter(&text) {
+                            let (excerpt, excerpt_match) = excerpt(&text, found.start(), found.end(), DEFAULT_CONTEXT_CHARS);
+                            results.push(BookSearchResult { section_index, section_title: section_title.clone(), excerpt, excerpt_match, matched_text: found.as_str().to_owned(), block_kind: text_block_kind(child).to_owned(), range: text_block_match_range(child, found.start(), found.end()) });
+                            if results.len() >= max_results { return Ok(results); }
+                        }
+                    }
+                    continue;
+                }
+                Block::Table(_)
                 | Block::Note(_)
                 | Block::Separator(_)
                 | Block::LineBreak
@@ -433,6 +444,17 @@ mod tests {
     struct SearchSource {
         book: Book,
         sections: Vec<Section>,
+    }
+
+    #[test]
+    fn search_inside_structured_figure_returns_the_child_source() {
+        let descriptor=SpineItem { id:SpineItemId::new("s").unwrap(), href:PublicationUrl::parse("s.xhtml").unwrap(), media_type:"application/xhtml+xml".into(), linear:true, properties:vec![] };
+        let section=rebook_html::parse_section("<html><body><div><p>Example needle text.</p><ol><li><p>Another needle.</p></li></ol></div><p>Figure 4.3 Example</p></body></html>",&descriptor,|_|None).unwrap();
+        let expected:Vec<_>=section.blocks[0].text_blocks().take(2).map(|t|t.source.as_ref().unwrap().start.node.clone()).collect();
+        let source=SearchSource { book:Book { id:PublicationId::new("figure-search").unwrap(), metadata:Metadata::default(), cover:None, sections:vec![descriptor], table_of_contents:vec![] }, sections:vec![section] };
+        let results=search_book(&source,"needle",10).unwrap();
+        assert_eq!(results.len(),2);
+        for (result,node) in results.iter().zip(expected) { assert_eq!(result.range.start.node,node); assert!(result.excerpt.contains("needle")); }
     }
 
     impl BookSource for SearchSource {

@@ -21,12 +21,16 @@ pub use font_faces::FontTraits;
 mod image_context;
 #[cfg(test)]
 mod media_context_tests;
+#[cfg(test)]
+mod semantic_structures_tests;
 mod media_semantics;
 mod nested_media;
 mod paragraph_lists;
+mod definition_lists;
 mod paragraph_groups;
 mod style_query;
 mod table_captions;
+mod structured_figures;
 use font_size::FontSize;
 use style_query::{NodeStyleCache, RuleIndex};
 
@@ -379,6 +383,8 @@ pub fn parse_section_with_resource_metadata(
         parser.push_text_block(root, TextBlockKind::Paragraph, style)?;
     }
 
+    structured_figures::attach_sources(&mut parser.blocks);
+
     #[cfg(debug_assertions)]
     if std::env::var_os("TORTO_PROFILE_HTML").is_some() {
         eprintln!(
@@ -431,6 +437,7 @@ struct ReadingIrParser<'a> {
     paragraph_list_indents: Vec<f32>,
     suppressed_content: bool,
     inside_breadcrumb: bool,
+    inside_hidden_content: bool,
     image_width_contexts: HashMap<roxmltree::NodeId, rebook_publication::ImageContainerWidth>,
     navigation_documents: HashSet<String>,
     ancestor_targets: HashSet<String>,
@@ -471,6 +478,7 @@ impl<'a> ReadingIrParser<'a> {
             paragraph_list_indents: Vec::new(),
             suppressed_content: false,
             inside_breadcrumb: false,
+            inside_hidden_content: false,
             image_width_contexts: HashMap::new(),
             navigation_documents: HashSet::new(),
             ancestor_targets: HashSet::new(),
@@ -488,6 +496,10 @@ impl<'a> ReadingIrParser<'a> {
         while index < children.len() {
             let node = children[index];
             if node.is_element() {
+                if let Some(consumed) = self.try_parse_text_figure(&children[index..])? {
+                    index += consumed;
+                    continue;
+                }
                 if let Some(consumed) = self.try_parse_table_caption_group(&children[index..])? {
                     index += consumed;
                     continue;
@@ -711,6 +723,10 @@ impl<'a> ReadingIrParser<'a> {
                     style,
                     std::mem::replace(&mut collector, InlineCollector::new(false)),
                 );
+                if let Some(consumed) = self.try_parse_text_figure(&children[index..])? {
+                    index += consumed;
+                    continue;
+                }
                 if let Some(consumed) = self.try_parse_table_caption_group(&children[index..])? {
                     index += consumed;
                     continue;
@@ -774,7 +790,8 @@ impl<'a> ReadingIrParser<'a> {
                 text_style,
                 inherited_link.as_ref(),
                 &InlineParseContext::new(&self.section_href, &self.styles, &self.footnote_links)
-                    .with_inline_images(inline_caption),
+                    .with_inline_images(inline_caption)
+                    .with_hidden_content(self.inside_hidden_content || self.inside_note_definition),
                 &mut collector,
             );
             index += 1;
@@ -1019,6 +1036,27 @@ impl<'a> ReadingIrParser<'a> {
         if matches!(name.as_str(), "script" | "style" | "head") {
             return Ok(());
         }
+        if !self.inside_hidden_content && !self.inside_note_definition
+            && self.styles.visually_hidden(node)
+            && !node.descendants().filter(Node::is_element).any(|n|
+                is_semantic_footnote_definition(n)
+                    || is_implicit_note_container(n, &self.footnote_links)
+                    || note_entry_starts_at(n, &self.footnote_links, false))
+        {
+            // Consume the same source IDs as the old parser, without publishing
+            // hidden fallback content or scheduling any resource decoding.
+            let start = self.blocks.len();
+            let anchors = self.anchors.len();
+            let pending = std::mem::take(&mut self.pending_anchors);
+            self.inside_hidden_content = true;
+            let result = self.parse_node(node);
+            self.inside_hidden_content = false;
+            self.blocks.truncate(start);
+            self.anchors.truncate(anchors);
+            self.pending_anchors = pending;
+            self.suppressed_content = true;
+            return result;
+        }
         if name == "nav" && should_suppress_navigation(node, &self.styles) {
             self.suppressed_content = true;
             return Ok(());
@@ -1150,7 +1188,11 @@ impl<'a> ReadingIrParser<'a> {
                     {
                         style.indent = 0.0;
                     }
+                    let start = self.blocks.len();
                     self.push_text_block(node, kind, style)?;
+                    if kind == TextBlockKind::Paragraph {
+                        definition_lists::recover_glossary(node, &mut self.blocks, start);
+                    }
                 }
             }
             "blockquote" => self.parse_semantic_quote(node)?,
@@ -1565,12 +1607,17 @@ impl<'a> ReadingIrParser<'a> {
         ordered: bool,
         depth: u8,
     ) -> Result<(), HtmlError> {
-        let mut ordinal = 1_u32;
+        let properties = self.styles.cascaded_properties(list);
+        let mut ordinal = attribute_local(list, "start").and_then(|s| s.parse::<u32>().ok())
+            .or_else(|| properties.get("counter-reset").and_then(|s| s.split_ascii_whitespace().nth(1)?.parse::<u32>().ok()).map(|n| n.saturating_add(1)))
+            .unwrap_or(1);
+        let marker_format = self.styles.list_marker_format(list);
         for item in list
             .children()
             .filter(|node| node.is_element() && node.tag_name().name().eq_ignore_ascii_case("li"))
         {
             self.queue_node_anchors(item);
+            if let Some(value) = attribute_local(item, "value").and_then(|s| s.parse::<u32>().ok()) { ordinal = value; }
             // A list can contain individual endnotes. Preserve each item's
             // definition boundary (and all its paragraphs) instead of flattening
             // it into ordinary list text inside one chapter-sized note section.
@@ -1583,12 +1630,14 @@ impl<'a> ReadingIrParser<'a> {
                 continue;
             }
             let mut style = self.styles.block_style(item, BlockStyle::default());
+            style.list_marker_format = marker_format;
             style.list_group = list
                 .ancestors()
-                .filter(|node| node.is_element() && matches!(node.tag_name().name(), "ul" | "ol"))
+                .filter(|node| node.is_element() && matches!(node.tag_name().name(), "ul" | "ol" | "dl"))
                 .last()
                 .map(|node| node.range().start as u64);
             style.indent = 0.0;
+            style.authored_list_marker = self.inferred_lists.get(&item.id()).map(|i| i.prefix_chars);
             style.margin_start = style.margin_start.max(24.0 * (f32::from(depth) + 1.0));
             self.push_structured_item(
                 item,
@@ -1611,6 +1660,7 @@ impl<'a> ReadingIrParser<'a> {
             match entry.tag_name().name().to_ascii_lowercase().as_str() {
                 "dt" => self.parse_definition_entry(entry, true, depth)?,
                 "dd" => self.parse_definition_entry(entry, false, depth)?,
+                "div" => self.parse_definition_list(entry, depth)?,
                 _ => self.parse_node(entry)?,
             }
         }
@@ -1625,6 +1675,9 @@ impl<'a> ReadingIrParser<'a> {
     ) -> Result<(), HtmlError> {
         self.queue_node_anchors(entry);
         let mut style = self.styles.block_style(entry, BlockStyle::default());
+        style.list_group = entry.ancestors().filter(|n| n.is_element()
+            && matches!(n.tag_name().name(), "dl" | "ul" | "ol"))
+            .last().map(|n| n.range().start as u64);
         style.indent = 0.0;
         let semantic_indent = 24.0 * (f32::from(depth) + if term { 0.0 } else { 1.0 });
         style.margin_start = style.margin_start.max(semantic_indent);
@@ -1643,8 +1696,9 @@ impl<'a> ReadingIrParser<'a> {
         depth: u8,
     ) -> Result<(), HtmlError> {
         for nested in parent
-            .children()
-            .filter(|child| is_structured_container(*child))
+            .descendants().skip(1)
+            .filter(|child| is_structured_container(*child)
+                && !child.ancestors().skip(1).take_while(|n| *n != parent).any(is_structured_container))
         {
             self.queue_node_anchors(nested);
             match nested.tag_name().name().to_ascii_lowercase().as_str() {
@@ -1661,7 +1715,7 @@ impl<'a> ReadingIrParser<'a> {
         &mut self,
         node: Node<'_, '_>,
         kind: TextBlockKind,
-        style: BlockStyle,
+        mut style: BlockStyle,
     ) -> Result<(), HtmlError> {
         for descendant in node.descendants().skip(1).filter(Node::is_element) {
             if !has_nested_structured_container_ancestor(descendant, node) {
@@ -1676,16 +1730,22 @@ impl<'a> ReadingIrParser<'a> {
             if is_structured_container(child) {
                 continue;
             }
-            collect_inline_node(
+            collect_inline_node_with_block_boundaries(
                 child,
                 text_style,
                 None,
                 &InlineParseContext::new(&self.section_href, &self.styles, &self.footnote_links)
-                    .with_inline_images(inline_images),
+                    .with_inline_images(inline_images)
+                    .with_hidden_content(self.inside_hidden_content || self.inside_note_definition)
+                    .without_nested_lists(),
                 &mut collector,
+                true,
             );
         }
         collector.finish();
+        if let Some(count) = style.authored_list_marker {
+            style.authored_list_marker = Some(paragraph_lists::prefix_length(&collector.content, count));
+        }
         let has_text = !collector.content.is_empty();
         self.push_collected_text_block(kind, style, collector);
 
@@ -1784,7 +1844,8 @@ impl<'a> ReadingIrParser<'a> {
                         &self.styles,
                         &self.footnote_links,
                     )
-                    .with_table_cell_images(),
+                    .with_table_cell_images()
+                    .with_hidden_content(self.inside_hidden_content || self.inside_note_definition),
                     &mut collector,
                 );
                 collector.finish();
@@ -1896,13 +1957,13 @@ impl<'a> ReadingIrParser<'a> {
                     .any(|parent| caption_nodes.contains(&parent))
         });
         if image_nodes.is_empty() || unsupported_caption || unclaimed_text {
-            return self.parse_block_container(figure);
+            return self.parse_structured_figure(figure);
         }
 
         let figure_node = self.allocate_node();
         let figure_source = self.source_range(&figure_node, 0);
         self.bind_pending_anchors(&figure_source.start);
-        let caption_position = figure
+        let mut caption_position = figure
             .descendants()
             .skip(1)
             .find_map(|node| {
@@ -1920,6 +1981,7 @@ impl<'a> ReadingIrParser<'a> {
             })
             .unwrap_or_default();
 
+        let first_image_position = image_nodes.first().map(|n| n.range().start).unwrap_or(0);
         let mut images = Vec::with_capacity(image_nodes.len());
         for image in image_nodes {
             self.queue_node_anchors(image);
@@ -1935,17 +1997,21 @@ impl<'a> ReadingIrParser<'a> {
 
         let mut captions = Vec::new();
         for caption in caption_nodes {
+            if caption_position == CaptionPosition::Before && caption.range().start > first_image_position {
+                caption_position = CaptionPosition::Split(captions.len());
+            }
             self.queue_node_anchors(caption);
             let block_start = self.blocks.len();
             self.parse_block_container(caption)?;
             for block in self.blocks.drain(block_start..) {
                 if let Block::Text(mut caption) = block {
-                    caption.kind = TextBlockKind::Caption;
+                    caption.kind = structured_figures::annotation_kind(&caption);
                     captions.push(caption);
                 }
             }
         }
         self.blocks.push(Block::Figure(FigureBlock {
+            body: Vec::new(),
             images,
             captions,
             caption_position,
@@ -1979,7 +2045,8 @@ impl<'a> ReadingIrParser<'a> {
             self.styles.text_style_for_block(node, kind),
             inherited_link.as_ref(),
             &InlineParseContext::new(&self.section_href, &self.styles, &self.footnote_links)
-                .with_inline_images(inline_images),
+                .with_inline_images(inline_images)
+                    .with_hidden_content(self.inside_hidden_content || self.inside_note_definition),
             &mut collector,
         );
         collector.finish();
@@ -2127,6 +2194,9 @@ impl<'a> ReadingIrParser<'a> {
             self.source_range(&node_id, 0)
         });
         self.bind_pending_anchors(&source.start);
+        if !self.inside_hidden_content && !self.inside_note_definition && self.styles.visually_hidden(node) {
+            return Ok(None);
+        }
         let mut style = self.styles.image_style(node);
         style.container_width = self.image_container_width(node);
         if let Some((margin_before, margin_after)) = container_style {
@@ -2206,7 +2276,7 @@ fn mark_block_as_footnote_definition(block: &mut Block) {
             quote.attribution.iter_mut().for_each(mark);
         }
         Block::Table(table) => table.text_blocks_mut().for_each(mark),
-        Block::Figure(figure) => figure.captions.iter_mut().for_each(mark),
+        Block::Figure(figure) => figure.text_blocks_mut().for_each(mark),
         Block::Note(note) => note
             .blocks
             .iter_mut()
@@ -2754,12 +2824,15 @@ fn is_authored_spacing_paragraph(node: Node<'_, '_>) -> bool {
     has_spacing_marker
 }
 
+#[derive(Clone, Copy)]
 struct InlineParseContext<'a> {
     base: &'a PublicationUrl,
     styles: &'a StyleSheet,
     footnote_links: &'a HashMap<usize, LinkRole>,
     inline_images: bool,
     table_cell_images: bool,
+    include_hidden: bool,
+    skip_lists: bool,
 }
 
 impl<'a> InlineParseContext<'a> {
@@ -2774,11 +2847,23 @@ impl<'a> InlineParseContext<'a> {
             footnote_links,
             inline_images: false,
             table_cell_images: false,
+            include_hidden: false,
+            skip_lists: false,
         }
     }
 
     const fn with_inline_images(mut self, enabled: bool) -> Self {
         self.inline_images = enabled;
+        self
+    }
+
+    const fn with_hidden_content(mut self, enabled: bool) -> Self {
+        self.include_hidden = enabled;
+        self
+    }
+
+    const fn without_nested_lists(mut self) -> Self {
+        self.skip_lists = true;
         self
     }
 
@@ -2807,7 +2892,7 @@ fn inline_image(
     inherited: TextStyle,
     context: &InlineParseContext<'_>,
 ) -> Option<InlineImageRun> {
-    if !image_should_be_inline(node, context) {
+    if !image_should_be_inline(node, context) || (!context.include_hidden && context.styles.visually_hidden(node)) {
         return None;
     }
     let src = attribute_local(node, "src")
@@ -2939,6 +3024,28 @@ fn collect_inline_node_with_block_boundaries(
         return;
     }
     let name = node.tag_name().name().to_ascii_lowercase();
+    if context.skip_lists && matches!(name.as_str(), "ul" | "ol" | "dl") {
+        return;
+    }
+    if !context.include_hidden && context.styles.visually_hidden(node) {
+        // Invisible inline text still owns its historical source offsets.
+        // Mask those scalars instead of shifting later selections/annotations.
+        let mut hidden = InlineCollector::new(collector.preserve_whitespace);
+        hidden.last_was_space = collector.last_was_space;
+        let mut hidden_context = *context;
+        hidden_context.include_hidden = true;
+        collect_inline_node_with_block_boundaries(node, inherited, link, &hidden_context,
+            &mut hidden, preserve_block_boundaries);
+        let count = hidden.content.iter().map(|inline| match inline {
+            Inline::Text(r) => r.text.chars().count(),
+            Inline::Ruby(r) => r.source_char_len(),
+            Inline::Break => 1,
+            _ => 0,
+        }).sum::<usize>();
+        collector.push_text(&"\u{2060}".repeat(count), inherited, link.cloned());
+        collector.last_was_space = hidden.last_was_space;
+        return;
+    }
     if name == "ruby" {
         collect_ruby(node, inherited, link, context, collector);
         return;
@@ -3473,10 +3580,12 @@ impl QuoteLayoutMetrics {
 #[derive(Default)]
 struct StyleSheet {
     rules: Vec<StyleRule>,
+    marker_rules: Vec<(SimpleSelector, Option<rebook_publication::ListMarkerFormat>)>,
     rule_index: RuleIndex,
     // A sheet belongs to one parsed document. Never retain node IDs across
     // section parses, where roxmltree starts numbering nodes again.
     cascaded_cache: RefCell<NodeStyleCache>,
+    visibility_cache: RefCell<HashMap<roxmltree::NodeId, bool>>,
     next_order: usize,
     root_font_size: Option<f32>,
     font_faces: font_faces::FontFaces,
@@ -3499,6 +3608,26 @@ struct SimpleSelector {
 }
 
 impl StyleSheet {
+    fn list_marker_format(&self, list: Node<'_, '_>) -> Option<rebook_publication::ListMarkerFormat> {
+        let properties = self.cascaded_properties(list);
+        let authored = properties.get("list-style-type").map(String::as_str)
+            .or_else(|| attribute_local(list, "type"));
+        match authored {
+            Some("lower-alpha" | "lower-latin" | "a") => Some(rebook_publication::ListMarkerFormat::LowerAlpha),
+            Some("upper-alpha" | "upper-latin" | "A") => Some(rebook_publication::ListMarkerFormat::UpperAlpha),
+            _ => self.marker_rules.iter().rev().find(|(selector,_)| selector.matches(list)).and_then(|(_, format)| *format),
+        }
+    }
+
+    fn visually_hidden(&self, node: Node<'_, '_>) -> bool {
+        if let Some(hidden) = self.visibility_cache.borrow().get(&node.id()) { return *hidden }
+        let hidden = node.attribute("hidden").is_some()
+            || self.cascaded_properties(node).get("display")
+                .is_some_and(|display| display.trim().eq_ignore_ascii_case("none"))
+            || node.ancestors().skip(1).find(Node::is_element).is_some_and(|parent| self.visually_hidden(parent));
+        self.visibility_cache.borrow_mut().insert(node.id(), hidden);
+        hidden
+    }
     #[cfg(test)]
     fn from_document(
         document: &Document<'_>,
@@ -3571,6 +3700,7 @@ impl StyleSheet {
 
     fn add_css_with_base(&mut self, css: &str, base: &PublicationUrl) {
         self.cascaded_cache.get_mut().clear();
+        self.visibility_cache.get_mut().clear();
         self.font_cache.get_mut().clear();
         let css = strip_css_comments(css);
         let mut cursor = 0;
@@ -3587,6 +3717,18 @@ impl StyleSheet {
                 self.has_font_families |= declarations.iter().chain(&important_declarations)
                     .any(|(name,_)| name == "font-family" || name == "font");
                 for raw_selector in prelude.split(',') {
+                    // Generated list counters are read separately: pseudo-element
+                    // styles must never leak onto an ordinary text run.
+                    if let Some(parent) = raw_selector.trim().strip_suffix("::before")
+                        .and_then(|s| s.trim_end().strip_suffix("li"))
+                        .map(|s| s.trim_end().trim_end_matches('>').trim_end())
+                        .and_then(SimpleSelector::parse)
+                    {
+                        let format = declarations.iter().chain(&important_declarations)
+                            .find(|(name, _)| name == "content")
+                            .and_then(|(_, value)| if value.contains("lower-alpha") { Some(rebook_publication::ListMarkerFormat::LowerAlpha) } else if value.contains("upper-alpha") { Some(rebook_publication::ListMarkerFormat::UpperAlpha) } else { None });
+                        self.marker_rules.push((parent, format));
+                    }
                     let Some(selector) = SimpleSelector::parse(raw_selector) else {
                         continue;
                     };

@@ -569,7 +569,12 @@ impl ShelfFeature {
         if !self.sync.settings.enabled {
             return;
         }
-        if self.sync.schedule.rate_limit_deadline(Instant::now()).is_some() {
+        if self
+            .sync
+            .schedule
+            .rate_limit_deadline(Instant::now())
+            .is_some()
+        {
             self.sync.schedule.request(mode);
             return;
         }
@@ -605,7 +610,7 @@ impl ShelfFeature {
             mode,
             settings: self.sync.settings.clone(),
             password: self.sync.password.clone(),
-            books: if mode == SyncMode::Reading {
+            books: if matches!(mode, SyncMode::Reading | SyncMode::Statistics) {
                 Vec::new()
             } else {
                 self.shelf
@@ -804,7 +809,8 @@ impl ShelfFeature {
                         Ok(report)
                     }
                     Err(error) => {
-                        rate_limit = error.downcast_ref::<crate::sync::RateLimited>()
+                        rate_limit = error
+                            .downcast_ref::<crate::sync::RateLimited>()
                             .map(|error| error.retry_after);
                         let detail = format_error_chain(error.as_ref());
                         Err(detail)
@@ -850,9 +856,12 @@ impl ShelfFeature {
             return;
         };
         let success = message.result.is_ok() && self.sync.import_error.is_none();
-        self.sync
-            .schedule
-            .completed_with_limit(task.mode, success, Instant::now(), message.rate_limit);
+        self.sync.schedule.completed_with_limit(
+            task.mode,
+            success,
+            Instant::now(),
+            message.rate_limit,
+        );
         if matches!(task.mode, SyncMode::Full { .. } | SyncMode::Derived)
             || message
                 .result
@@ -862,10 +871,31 @@ impl ShelfFeature {
             self.refresh_read_activity();
         }
         match message.result {
-            Ok(_) => {
+            Ok(report) => {
                 if let Some(error) = self.sync.import_error.take() {
                     self.sync_failed(error);
                     return;
+                }
+                if let Some(error) = report.statistics_error {
+                    self.sync.schedule.completed_with_limit(
+                        SyncMode::Statistics,
+                        false,
+                        Instant::now(),
+                        report.statistics_rate_limit,
+                    );
+                    self.sync_failed(format!(
+                        "{}: {error}",
+                        self.language.text(
+                            "书籍已同步，阅读统计同步失败，将单独重试",
+                            "Books synced; reading statistics failed and will retry separately",
+                        )
+                    ));
+                    return;
+                }
+                if matches!(task.mode, SyncMode::Full { .. }) {
+                    self.sync
+                        .schedule
+                        .completed(SyncMode::Statistics, true, Instant::now());
                 }
                 self.sync.button = SyncButtonState::completed(Instant::now());
             }

@@ -153,7 +153,7 @@ fn formulas_reserve_exact_geometry_and_rasterize_only_when_requested() {
                 }),
             ],
         );
-        let (_, _, eager, _, _, _) = prepare_inline_content(
+        let (_, _, eager, _, _, _, _) = prepare_inline_content(
             &block,
             Rgba::BLACK,
             &typography,
@@ -167,7 +167,7 @@ fn formulas_reserve_exact_geometry_and_rasterize_only_when_requested() {
             None,
         );
         let capture = timing::TimingScope::start().unwrap();
-        let (_, _, lazy, _, _, _) = prepare_inline_content(
+        let (_, _, lazy, _, _, _, _) = prepare_inline_content(
             &block,
             Rgba::BLACK,
             &typography,
@@ -251,6 +251,7 @@ fn figure_caption_inline_and_table_geometry_does_not_depend_on_pixels() {
     let source = Source::new("deferred-geometry");
     let blocks = vec![
         Block::Figure(FigureBlock {
+            body: Vec::new(),
             source: None,
             images: vec![image("figure.png")],
             captions: vec![text(

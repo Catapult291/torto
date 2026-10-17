@@ -25,7 +25,7 @@ use image_dimensions::ImageDimensions;
 
 // Bump when source parsing, structural heuristics, or the stored model changes.
 // Release versions additionally isolate caches from older executables.
-const REVISION: u32 = 5;
+const REVISION: u32 = 8;
 const MAGIC: &[u8; 8] = b"TRDIR\x02\0\0";
 const HEADER_BYTES: usize = 84;
 const MAX_ENTRY_BYTES: usize = 32 * 1024 * 1024;
@@ -288,7 +288,7 @@ fn section_weight(section: &Section) -> usize {
             Block::Text(t) => text(t),
             Block::Quote(q) => q.body.iter().chain(q.attribution.iter()).map(text).sum(),
             Block::Table(t) => t.text_blocks().map(text).sum(),
-            Block::Figure(f) => f.captions.iter().map(text).sum::<usize>() + f.images.len() * 512,
+            Block::Figure(f) => f.captions.iter().map(text).sum::<usize>() + f.body.iter().map(block).sum::<usize>() + f.images.len() * 512,
             Block::Note(n) => n.blocks.iter().map(block).sum(),
             Block::Separator(s) => s.text.as_ref().map_or(0, text),
             _ => 0,

@@ -219,7 +219,7 @@ mod tests {
             section.anchors[0].source.node,
             body.source.as_ref().unwrap().start.node
         );
-        assert!(section.blocks.iter().any(|b| matches!(b, Block::Figure(f) if f.captions.iter().any(|c| rebook_formats::reflow::text(c) == "Figure 1 A real caption."))));
+        assert!(section.blocks.iter().any(|b| matches!(b, Block::Figure(f) if f.text_blocks().any(|c| rebook_formats::reflow::text(c) == "Figure 1 A real caption."))));
     }
 
     #[test]

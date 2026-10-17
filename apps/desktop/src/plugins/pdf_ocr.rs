@@ -3534,7 +3534,7 @@ mod tests {
                     "Figure 2.24",
                 ),
             ] {
-                if let Some(figure_index) = section.blocks.iter().position(|b| matches!(b, Block::Figure(f) if f.captions.iter().any(|t| plain(t).starts_with(expected.2)))) {
+                if let Some(figure_index) = section.blocks.iter().position(|b| matches!(b, Block::Figure(f) if f.text_blocks().any(|t| plain(t).starts_with(expected.2)))) {
                     let Some(Block::Text(body)) = figure_index.checked_sub(1).and_then(|i| section.blocks.get(i)) else { panic!("missing body before {}", expected.2) };
                     assert!(plain(body).contains(expected.0) && plain(body).contains(expected.1), "unjoined {}: {}", expected.2, plain(body));
                     matched += 1;

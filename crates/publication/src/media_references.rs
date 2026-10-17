@@ -8,6 +8,7 @@ use std::{ops::Range, sync::LazyLock};
 pub enum MediaKind {
     Figure,
     Table,
+    Equation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -145,7 +146,128 @@ pub fn references(text: &str) -> Vec<MediaReference> {
             end += all.end();
         }
     }
+    out.extend(equation_references(text));
+    out.sort_by_key(|r| r.range.start);
     out
+}
+
+fn equation_references(text: &str) -> Vec<MediaReference> {
+    static LABEL: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(&format!(
+            r"(?i)(?:\bequations?\s+|\beqs?(?:\.\s*|\s+)|公式\s*|式\s*)[（(]?\s*({NUMBER})\s*[）)]?"
+        ))
+        .unwrap()
+    });
+    static NEXT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(&format!(
+            r"(?i)^\s*(?:、|,|，|and\b|及|和|与)\s*[（(]\s*({NUMBER})\s*[）)]"
+        ))
+        .unwrap()
+    });
+    let mut result = Vec::new();
+    for capture in LABEL.captures_iter(text) {
+        let whole = capture.get(0).unwrap();
+        if text[..whole.start()]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || "方式形模格样".contains(c))
+        {
+            continue;
+        }
+        let n = capture.get(1).unwrap();
+        if text[n.end()..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
+        {
+            continue;
+        }
+        result.push(MediaReference {
+            range: whole.range(),
+            key: MediaKey {
+                kind: MediaKind::Equation,
+                number: number(n.as_str()),
+            },
+        });
+        let mut end = whole.end();
+        while let Some(next) = NEXT.captures(&text[end..]) {
+            let n = next.get(1).unwrap();
+            // Include parentheses in equation continuations, as in Eqs. (3.9) and (3.10).
+            let all = next.get(0).unwrap();
+            let start = text[end..end + n.start()].rfind(['(', '（']).unwrap();
+            result.push(MediaReference {
+                range: end + start..end + all.end(),
+                key: MediaKey {
+                    kind: MediaKind::Equation,
+                    number: number(n.as_str()),
+                },
+            });
+            end += all.end();
+        }
+    }
+    result
+}
+
+/// A bare number is eligible only in a structural equation row or a verified authored link.
+pub fn equation_number(text: &str) -> Option<MediaKey> {
+    static LABEL: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(&format!(r"^\s*[（(]\s*({NUMBER})\s*[）)]\s*$")).unwrap());
+    let capture = LABEL.captures(text)?;
+    Some(MediaKey {
+        kind: MediaKind::Equation,
+        number: number(capture.get(1)?.as_str()),
+    })
+}
+
+/// A standalone mathematical object and its number, without relying on CSS class names.
+pub fn equation_target(block: &crate::Block) -> Option<MediaKey> {
+    match block {
+        crate::Block::Image(image) => {
+            image
+                .formula
+                .as_ref()?
+                .equation_number
+                .as_ref()
+                .and_then(|n| {
+                    equation_number(&format!("({})", n.trim_matches(['(', ')', '（', '）'])))
+                })
+        }
+        crate::Block::Text(text) => {
+            let mut objects = 0;
+            let mut label = String::new();
+            let mut embedded = None;
+            for inline in &text.content {
+                match inline {
+                    Inline::Image(image) if image.image.ocr_text.is_none() => {
+                        objects += 1;
+                        embedded = image
+                            .image
+                            .formula
+                            .as_ref()
+                            .and_then(|f| f.equation_number.as_deref());
+                    }
+                    Inline::Math(_) => objects += 1,
+                    Inline::Text(run) => label.push_str(&run.text),
+                    Inline::Break => label.push(' '),
+                    _ => return None,
+                }
+            }
+            if objects != 1 {
+                return None;
+            }
+            equation_number(&label).or_else(|| {
+                label
+                    .trim()
+                    .is_empty()
+                    .then_some(embedded)
+                    .flatten()
+                    .and_then(|n| {
+                        equation_number(&format!("({})", n.trim_matches(['(', ')', '（', '）'])))
+                    })
+            })
+        }
+        _ => None,
+    }
 }
 
 pub fn caption_label(text: &str) -> Option<MediaReference> {
@@ -229,7 +351,35 @@ fn reference_text(content: &[Inline]) -> String {
 
 /// Source byte ranges with note/image/external-link boundaries respected.
 pub fn inline_references(content: &[Inline]) -> Vec<MediaReference> {
-    link_references(&reference_text(content))
+    let mut refs = link_references(&reference_text(content));
+    let mut offset = 0;
+    for inline in content {
+        if let Inline::Text(run) = inline {
+            if !run.style.suppress_media_references
+                && run.style.inline_role == InlineRole::Normal
+                && run.style.link_role == LinkRole::Normal
+                && run.style.baseline == crate::TextBaseline::Normal
+                && run
+                    .link
+                    .as_ref()
+                    .is_some_and(|href| href.website_url().is_none())
+                && let Some(key) = equation_number(&run.text)
+                && !refs
+                    .iter()
+                    .any(|r| r.range.start <= offset && r.range.end >= offset + run.text.len())
+            {
+                refs.push(MediaReference {
+                    range: offset..offset + run.text.len(),
+                    key,
+                });
+            }
+            offset += run.text.len();
+        } else {
+            offset += 1;
+        }
+    }
+    refs.sort_by_key(|r| r.range.start);
+    refs
 }
 
 /// Retain source-backed media references after translation without asking the
@@ -282,8 +432,7 @@ pub fn restrict_translated_links(content: &mut Vec<Inline>, original: &[Inline])
 
 /// Link appearance is applied only by unified layout, after caption normalization.
 pub fn style_links(content: &mut Vec<Inline>, color: Rgba) {
-    let text = reference_text(content);
-    let refs = link_references(&text);
+    let refs = inline_references(content);
     if refs.is_empty() {
         return;
     }
@@ -322,12 +471,13 @@ pub fn style_links(content: &mut Vec<Inline>, color: Rgba) {
         for pair in cuts.windows(2) {
             let mut part: TextRun = run.clone();
             part.text = run.text[pair[0]..pair[1]].into();
-            if refs
+            if let Some(reference) = refs
                 .iter()
-                .any(|r| r.range.start <= offset + pair[0] && r.range.end >= offset + pair[1])
+                .find(|r| r.range.start <= offset + pair[0] && r.range.end >= offset + pair[1])
             {
                 part.style.color = color;
                 part.style.underline = false;
+                part.style.media_reference = Some(reference.key.kind);
             }
             result.push(Inline::Text(part));
         }
@@ -346,6 +496,39 @@ mod tests {
             style: Default::default(),
             link: None,
         })]
+    }
+
+    #[test]
+    fn equations_need_labels_or_authored_links_and_preserve_parentheses() {
+        let refs = references("Eqs. (3.9) and (3.10); Equation 8.1; 公式（4.2）与式（4.3）");
+        assert_eq!(
+            refs.iter()
+                .map(|r| r.key.number.as_str())
+                .collect::<Vec<_>>(),
+            ["3.9", "3.10", "8.1", "4.2", "4.3"]
+        );
+        assert!(refs.iter().all(|r| r.key.kind == MediaKind::Equation));
+        for text in [
+            "EQ3 and EQ6 devices",
+            "(2020)",
+            "Section 3.1",
+            "方式（3.1）",
+            "(3.1)",
+        ] {
+            assert!(references(text).is_empty(), "{text}");
+        }
+        assert!(is_citation("（见公式（4.2））"));
+        let mut linked = content("(3.10)");
+        if let Inline::Text(run) = &mut linked[0] {
+            run.link = Some(crate::PublicationUrl::parse("chapter.xhtml#formula10").unwrap());
+        }
+        assert_eq!(inline_references(&linked)[0].key.number, "3.10");
+        style_links(&mut linked, Rgba::BLACK);
+        assert_eq!(
+            linked[0].text_runs()[0].style.media_reference,
+            Some(MediaKind::Equation),
+            "click semantics do not depend on link color"
+        );
     }
 
     #[test]

@@ -282,7 +282,7 @@ impl DesktopReader {
         else {
             return Ok(None);
         };
-        let footnotes = self.resolve_focus_footnotes(&section.blocks[block_index]);
+        let footnotes = self.resolve_semantic_scope_footnotes(&section.blocks, block_index);
         Ok((!footnotes.is_empty()).then_some(footnotes))
     }
 

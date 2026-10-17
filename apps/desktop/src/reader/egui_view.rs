@@ -1595,13 +1595,19 @@ impl DesktopReader {
     ) -> bool {
         if !self.focus_body_accepts_actions(interaction_blocked)
             || ctx.text_edit_focused()
-            || !self.current_focus_unit_is_image()
+            || !(self.current_focus_unit_is_image() || self.focus_units.get(self.focus_unit_index).is_some_and(|unit| unit.media_key.is_some()))
             || !supports_image_preview(self.format, self.pdf_ocr.mode)
         {
             return false;
         }
         if !ctx.input_mut(|input| input.consume_shortcut(&self.shortcuts.focus_image_preview)) {
             return false;
+        }
+        if let Some(unit) = self.focus_units.get(self.focus_unit_index)
+            && let Some(key) = unit.media_key.clone()
+        {
+            self.open_media_preview(ctx, unit.range.clone(), key);
+            return true;
         }
         let ranges = self.focus_units[self.focus_unit_index].paint_ranges.clone();
         let hit = self.current_scroll_layout().ok().and_then(|layout| {
@@ -2300,6 +2306,9 @@ impl DesktopReader {
         page_rect: Rect,
         sidebar_progress: f32,
     ) {
+        if self.focus_assistant_popup_visible() {
+            return;
+        }
         let hovered = self.ui.toolbar_motion.value > 0.02 || self.ui.overlay == ReaderOverlay::Menu;
         let screen = ctx.content_rect();
         let floating = !self.ui.sidebar_pinned && sidebar_progress > 0.001;
@@ -2947,6 +2956,7 @@ impl DesktopReader {
                     } else {
                         note.number.to_string()
                     };
+                    self.footnote_layout.set_media_context(self.source.as_ref(), note.owner.as_ref().or_else(|| note.citation.as_ref().map(|(source, _)| source)));
                     self.footnote_layout
                         .layout_aligned_marked(
                             self.source.as_ref(),
@@ -3151,6 +3161,7 @@ impl DesktopReader {
                                                 note.number.to_string()
                                             };
                                             let marker_color = super::render::active_footnote_marker_color();
+                                            self.footnote_layout.set_media_context(self.source.as_ref(), note.owner.as_ref().or_else(|| note.citation.as_ref().map(|(source, _)| source)));
                                             self.footnote_layout.layout_aligned_marked(
                                                 self.source.as_ref(), note.popup_text(), &marker,
                                                 &self.reader.style(), body_font.size, text_color,
@@ -4962,6 +4973,13 @@ impl DesktopReader {
             }
             if let Some(hit) = self.media_reference_at_canvas(x, y) {
                 self.open_media_preview(&response.ctx, hit.source, hit.key);
+                return;
+            }
+            if self.is_focus_mode()
+                && let Some((origin, key)) = self.focus_units.iter().find(|unit| unit.media_key.is_some() && unit.rect.contains(egui::pos2(x, y)))
+                .and_then(|unit| unit.media_key.clone().map(|key| (unit.range.clone(), key)))
+            {
+                self.open_media_preview(&response.ctx, origin, key);
                 return;
             }
             if self.try_open_image_preview(&response.ctx, x, y) {
@@ -8850,6 +8868,7 @@ mod reference_suggestion_label_tests {
             session,
             DesktopReaderResources {
                 source,
+                media_source: None,
                 rewrite_source,
                 translation_source,
                 structure_source,
@@ -9037,6 +9056,7 @@ mod reference_suggestion_label_tests {
                 session,
                 DesktopReaderResources {
                     source,
+                    media_source: None,
                     rewrite_source,
                     translation_source,
                     structure_source,

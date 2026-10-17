@@ -83,6 +83,7 @@ pub(super) fn group_images_and_captions(blocks: Vec<Block>, style: BlockStyle) -
                 }
             }
             result.push(Block::Figure(FigureBlock {
+                body: Vec::new(),
                 images,
                 captions,
                 style,

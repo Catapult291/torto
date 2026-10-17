@@ -2424,14 +2424,13 @@ impl DesktopReader {
         if !self.translation.enabled
             || !self.plugin_settings.translate_toc
             || self.translation.toc_task.is_pending()
-            || !self.translation.toc_labels.is_empty()
         {
             return;
         }
         let mut toc_ids = Vec::new();
         let mut blocks = Vec::new();
         for row in self.reader.toc_items() {
-            if row.label.trim().is_empty() {
+            if row.label.trim().is_empty() || self.translation.toc_labels.contains_key(&row.id) {
                 continue;
             }
             let block_index = toc_ids.len();
@@ -2575,8 +2574,7 @@ impl DesktopReader {
         };
         match message.result {
             Ok(translations) => {
-                self.translation.toc_labels =
-                    translated_toc_labels(&request.toc_ids, &translations);
+                self.accept_toc_titles(&request.toc_ids, &translations);
                 self.translation.clear_error();
             }
             Err(error) => {
@@ -2915,6 +2913,7 @@ fn clip_chat_reference_text(value: &str, max_chars: usize) -> String {
     clipped
 }
 
+#[cfg(test)]
 fn translated_toc_labels(
     toc_ids: &[String],
     translations: &[crate::plugins::BlockTranslation],

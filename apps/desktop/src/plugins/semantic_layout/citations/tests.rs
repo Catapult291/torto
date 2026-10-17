@@ -154,6 +154,7 @@ fn heuristic_and_ai_citations_merge_in_text_order_without_duplicate_marks() {
         Recognition {
             fingerprint: fingerprint(&original),
             formulas_checked: true,
+            image_text_revision: crate::plugins::semantic_layout::formulas::TEXT_REVISION,
             skipped_groups: 0,
             annotations: vec![Annotation::InlineCitations {
                 source: block.source.clone().unwrap(),
@@ -363,6 +364,7 @@ fn assert_prepared_note_translation(original: Section) {
                 .collect(),
         }],
         formulas_checked: true,
+        image_text_revision: crate::plugins::semantic_layout::formulas::TEXT_REVISION,
         skipped_groups: 0,
     };
     let mut prepared = original.clone();
@@ -567,6 +569,7 @@ fn cached_citations_validate_their_source_and_ranges() {
         0,
         Recognition {
             formulas_checked: true,
+            image_text_revision: crate::plugins::semantic_layout::formulas::TEXT_REVISION,
             fingerprint: fingerprint(&s),
             annotations: vec![cached.clone()],
             skipped_groups: 0
@@ -792,6 +795,7 @@ fn translation_pipeline_restores_tagged_citations_and_toggle_hides_only_markers(
     };
     let recognition = Recognition {
         formulas_checked: true,
+        image_text_revision: crate::plugins::semantic_layout::formulas::TEXT_REVISION,
         fingerprint: fingerprint(&original),
         annotations: vec![Annotation::InlineCitations {
             source: block.source.clone().unwrap(),

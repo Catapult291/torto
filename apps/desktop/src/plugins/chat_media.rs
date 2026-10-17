@@ -234,16 +234,13 @@ fn collect_images<'a>(
                     .images
                     .iter()
                     .any(|i| matches_range(i.source.as_ref(), ranges))
-                || figure
-                    .captions
-                    .iter()
+                || figure.text_blocks()
                     .any(|c| matches_range(c.source.as_ref(), ranges));
             if selected {
                 output.extend(&figure.images);
             }
-            for caption in &figure.captions {
-                collect_text_images(caption, ranges, selected, output);
-            }
+            for child in &figure.body { collect_images(child, ranges, selected, output); }
+            for caption in &figure.captions { collect_text_images(caption, ranges, selected, output); }
         }
         Block::Quote(quote) => {
             let selected = parent || matches_range(quote.source.as_ref(), ranges);
@@ -511,6 +508,7 @@ mod tests {
             source: Some(range("paragraph")),
         });
         let figure = Block::Figure(FigureBlock {
+            body: Vec::new(),
             images: vec![image("first.png"), image("second.png")],
             captions: vec![],
             caption_position: CaptionPosition::After,

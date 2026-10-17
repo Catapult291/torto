@@ -12,8 +12,9 @@ pub(crate) fn block_ranges(block: &Block) -> Vec<SourceRange> {
         ),
         Block::Table(t) => ranges.extend(t.text_blocks().filter_map(|text| text.source.clone())),
         Block::Figure(f) => {
+            ranges.extend(f.body.iter().flat_map(block_ranges));
             ranges.extend(f.images.iter().filter_map(|image| image.source.clone()));
-            ranges.extend(f.captions.iter().filter_map(|text| text.source.clone()));
+            ranges.extend(f.text_blocks().filter_map(|text| text.source.clone()));
         }
         Block::Note(n) => ranges.extend(n.blocks.iter().flat_map(block_ranges)),
         _ => {}
@@ -77,6 +78,7 @@ fn annotation_blocks(section: &Section, annotation: &Annotation) -> Vec<usize> {
 pub(crate) fn empty_recognition(section: &Section) -> Recognition {
     Recognition {
         formulas_checked: true,
+        image_text_revision: crate::plugins::semantic_layout::formulas::TEXT_REVISION,
         fingerprint: fingerprint(section),
         annotations: Vec::new(),
         skipped_groups: 0,

@@ -17,6 +17,7 @@ fn blank_lines_have_no_highlight_but_remain_in_copied_text() {
         let mut builder = context.ranged_builder(&mut fonts, &text, 1.0, false);
         builder.push_default(StyleProperty::FontSize(18.0));
         builder.push_default(StyleProperty::Brush(TextBrush {
+            media_reference: None,
             color: Rgba::BLACK,
             underline: false,
             baseline: TextBaseline::Normal,
