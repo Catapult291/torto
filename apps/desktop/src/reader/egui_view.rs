@@ -4648,6 +4648,19 @@ impl DesktopReader {
                         if !self.is_focus_mode() {
                             self.selection_mode_menu(ui);
                         }
+                        ui.separator();
+                        if navigation_button(
+                            ui,
+                            Icon::MessageCircleQuestion,
+                            self.language.text("反馈与建议", "Feedback"),
+                            false,
+                        )
+                        .clicked()
+                        {
+                            self.cancel_text_selection();
+                            self.close_overlay();
+                            self.feedback_requested = true;
+                        }
                     });
             });
         let clicked_outside = self.ui.overlay == ReaderOverlay::Menu

@@ -21,6 +21,7 @@ pub(crate) struct DesktopApp {
     shelf: ShelfFeature,
     reader: Option<DesktopReader>,
     settings: SettingsFeature,
+    feedback: crate::feedback::FeedbackFeature,
     applied_settings_revision: u64,
     pending_reader_notice: Option<String>,
     pending_reader_error: Option<String>,
@@ -46,6 +47,7 @@ impl DesktopApp {
             shelf,
             reader: None,
             settings,
+            feedback: crate::feedback::FeedbackFeature::default(),
             applied_settings_revision: 0,
             pending_reader_notice: None,
             pending_reader_error: None,
@@ -85,6 +87,9 @@ impl DesktopApp {
     /// Whether the reader's chat composer owns the keyboard, which decides
     /// where a pasted clipboard image goes.
     pub(crate) fn chat_composer_accepts_paste(&self, ctx: &egui::Context) -> bool {
+        if self.feedback.is_open() {
+            return false;
+        }
         self.reader
             .as_ref()
             .is_some_and(|reader| reader.chat_composer_accepts_paste(ctx))
@@ -119,13 +124,14 @@ impl DesktopApp {
         self.shelf.poll_background_tasks();
         let open_settings_shortcut = self.settings.applied().shortcuts.open_settings;
         if !self.settings.is_open()
+            && !self.feedback.is_open()
             && ui
                 .ctx()
                 .input_mut(|input| input.consume_shortcut(&open_settings_shortcut))
         {
             self.settings.open();
         }
-        let interaction_blocked = self.settings.is_open();
+        let interaction_blocked = self.settings.is_open() || self.feedback.is_open();
         let plan = if self.shelf.opening_visible() {
             self.shelf.opening_ui(ui, interaction_blocked);
             if !self.shelf.opening_visible()
@@ -154,6 +160,17 @@ impl DesktopApp {
         if settings_requested {
             self.settings.open();
         }
+        let feedback_requested = self.reader.as_mut().map_or_else(
+            || self.shelf.take_feedback_request(),
+            DesktopReader::take_feedback_request,
+        );
+        if feedback_requested {
+            let context = self.reader.as_ref().map_or_else(
+                || crate::feedback::OpenContext::shelf(ui.ctx()),
+                |reader| reader.feedback_context(ui.ctx()),
+            );
+            self.feedback.open(context);
+        }
         if let Some(change) = self
             .reader
             .as_mut()
@@ -168,11 +185,13 @@ impl DesktopApp {
             if window_chrome::geometry(ui.ctx()).header.is_none() {
                 window_chrome::fallback_header(ui);
             }
-            if self.settings.is_open() {
+            if self.settings.is_open() || self.feedback.is_open() {
                 window_chrome::block_drag(ui.ctx());
             }
         }
         settings_overlay(ui.ctx(), &mut self.settings);
+        self.feedback
+            .overlay(ui.ctx(), self.settings.applied().language);
         if ui.ctx().input_mut(|input| {
             input.consume_shortcut(&self.settings.applied().shortcuts.fullscreen)
         }) {
@@ -277,7 +296,7 @@ impl DesktopApp {
     }
 
     pub(crate) fn open_settings(&mut self) {
-        if !self.settings.is_open() {
+        if !self.settings.is_open() && !self.feedback.is_open() {
             self.settings.open();
         }
     }
@@ -320,6 +339,7 @@ impl DesktopApp {
         self.shelf.spawn_pending_tasks(runtime, proxy);
         let shelf_finished = started.elapsed();
         self.settings.spawn_pending_tasks(runtime, proxy);
+        self.feedback.spawn_pending_tasks(runtime, proxy);
         #[cfg(target_os = "windows")]
         self.updater.spawn_pending_tasks(runtime, proxy);
         let settings_finished = started.elapsed();
@@ -340,6 +360,10 @@ impl DesktopApp {
                 ],
             );
         }
+    }
+
+    pub(crate) fn complete_feedback(&mut self, message: crate::feedback::Message) {
+        self.feedback.complete(message);
     }
 
     pub(crate) fn complete_shelf_sync_check(

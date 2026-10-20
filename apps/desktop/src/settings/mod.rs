@@ -17,7 +17,7 @@ use crate::{async_task::TaskSlot, platform::UserEvent};
 mod egui_view;
 mod provider_models;
 
-pub(crate) use egui_view::settings_overlay;
+pub(crate) use egui_view::{choice_button, settings_overlay};
 pub(crate) use provider_models::ProviderModelsMessage;
 use provider_models::{ProviderModelsRequest, fetch_provider_models};
 

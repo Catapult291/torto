@@ -2181,7 +2181,7 @@ fn font_family_label(family: &str, language: Option<AppLanguage>) -> String {
     }
 }
 
-fn choice_button(ui: &mut egui::Ui, text: &str, selected: bool) -> Response {
+pub(crate) fn choice_button(ui: &mut egui::Ui, text: &str, selected: bool) -> Response {
     let font = egui::TextStyle::Button.resolve(ui.style());
     let galley = ui
         .painter()

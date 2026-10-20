@@ -10,6 +10,109 @@ use super::{DesktopReader, FollowUp, SnapshotEffects};
 mod tests;
 
 impl DesktopReader {
+    pub(crate) fn take_feedback_request(&mut self) -> bool {
+        std::mem::take(&mut self.feedback_requested)
+    }
+
+    pub(crate) fn feedback_context(&self, ctx: &egui::Context) -> crate::feedback::OpenContext {
+        use crate::feedback::{Book, Location, Reader, Translation, book_document, clipped};
+        let mut seed = crate::feedback::OpenContext::shelf(ctx);
+        seed.context.source = "reader".into();
+        let original = self
+            .pdf_ocr_controller
+            .as_ref()
+            .map(|controller| controller.original_source());
+        let book = original.as_deref().unwrap_or(self.source.as_ref()).book();
+        let title = clipped(&book.metadata.title, 500);
+        seed.context.book = Some(Book {
+            title: if title.is_empty() {
+                "(missing original title)".into()
+            } else {
+                title
+            },
+            authors: book
+                .metadata
+                .authors
+                .iter()
+                .map(|v| clipped(v, 200))
+                .filter(|v| !v.is_empty())
+                .take(30)
+                .collect(),
+            languages: book
+                .metadata
+                .languages
+                .iter()
+                .map(|v| clipped(v, 40))
+                .filter(|v| !v.is_empty())
+                .take(12)
+                .collect(),
+            format: self.format.label().into(),
+            layout: if book.metadata.layout == RenditionLayout::PrePaginated {
+                "fixed"
+            } else {
+                "reflowable"
+            }
+            .into(),
+        });
+        let active = self
+            .snapshot
+            .active_toc_id
+            .as_ref()
+            .and_then(|id| self.reader.toc_items().iter().find(|item| &item.id == id));
+        let href = self
+            .source
+            .book()
+            .sections
+            .get(self.snapshot.location.section_index)
+            .map(|s| &s.href);
+        seed.context.location = Some(Location {
+            chapter: active
+                .map(|item| clipped(&item.label, 500))
+                .filter(|v| !v.is_empty()),
+            document: href.and_then(|href| book_document(href.path())),
+            anchor: active
+                .and_then(|item| item.target.as_ref())
+                .and_then(|href| href.fragment())
+                .map(|v| clipped(v, 500))
+                .filter(|v| !v.is_empty()),
+            page: (self.format == BookFormat::Pdf
+                && self.source.book().metadata.layout == RenditionLayout::PrePaginated)
+                .then_some(self.snapshot.location.section_index + 1),
+        });
+        let pdf = self.format == BookFormat::Pdf;
+        let reflow = pdf && self.pdf_ocr.mode == super::PdfOcrViewMode::Reflow;
+        if reflow {
+            seed.pdf_id = Some(self.book_id.clone());
+        }
+        seed.context.reader = Some(Reader {
+            mode: if self.is_focus_mode() {
+                "focus"
+            } else {
+                "classic"
+            }
+            .into(),
+            typesetting: if self.reader.style().typesetting.mode
+                == rebook_layout::TypesettingMode::Unified
+            {
+                "unified"
+            } else {
+                "original"
+            }
+            .into(),
+            pdf_reflow: (pdf && !reflow).then(|| "off".into()),
+            translation: Translation {
+                enabled: self.translation.render_enabled,
+                target_language: clipped(
+                    &self.plugin_settings.resolved_target_language(
+                        crate::preferences::AppLanguage::system_translation_target(),
+                    ),
+                    40,
+                ),
+            },
+        });
+        seed
+    }
+
     pub(in crate::reader) fn request_settings(&mut self) {
         self.cancel_text_selection();
         self.close_overlay();

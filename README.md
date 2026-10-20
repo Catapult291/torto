@@ -128,6 +128,7 @@ After installation, import one or more books from the bookshelf and open a book 
 - WebDAV passwords and AI API keys are stored in the operating system's secure credential store rather than ordinary configuration files.
 - AI layout, translation, chat, and OCR use your configured providers. Once enabled, AI layout and translation can automatically send relevant book text or images as you read, including subsection context or upcoming content within their scheduling range.
 - WebDAV traffic goes directly from Torto to the service you choose; there is no Torto-operated relay.
+- Submitting feedback publishes your description and the information shown in the feedback dialog to a public GitHub Issue through TortoTech's feedback service. Reader reports include original book metadata and reading context. See the [privacy policy](PRIVACY.md).
 
 ## Development
 
@@ -141,6 +142,10 @@ cargo test --workspace
 ```
 
 The core reading path is `parser → Reading IR → layout → renderer`. See the [native rendering architecture decision](docs/adr-0001-native-epub-renderer.md), [AI layout batching](docs/ai-layout-batching.md), [AI layout and translation scheduling](docs/ai-layout-scheduling.md), [WebDAV sync protocol](docs/webdav-sync-v1.md), and [known upstream issues](docs/known-upstream-issues.md) for details.
+
+### Desktop feedback service
+
+The shelf toolbar and reader menu open the same feedback dialog. The current development endpoint is `http://100.109.172.125:8083/api/feedback` on the Pi and requires Tailscale connectivity. For a public distribution, set `TORTO_FEEDBACK_URL` to the deployed HTTPS feedback endpoint when building. The same environment variable can override the endpoint at runtime; a saved pending report retains its original endpoint and exact payload for safe retries. The URL must end in `/api/feedback` with no credentials, query or fragment. HTTP is accepted only for private, loopback or Tailscale IP addresses. GitHub App credentials stay on the service and are never bundled with the desktop app.
 
 ## Project status
 

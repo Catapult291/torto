@@ -547,6 +547,7 @@ impl ApplicationHandler<UserEvent> for Application {
             UserEvent::OpenBook(path) => self.app.open_book(&path),
             #[cfg(target_os = "windows")]
             UserEvent::Update(message) => self.app.complete_update(message),
+            UserEvent::Feedback(message) => self.app.complete_feedback(message),
             UserEvent::ShelfImport(message) => self.app.complete_shelf_import(message),
             UserEvent::ShelfOpen(message) => self.app.complete_shelf_open(message, &self.runtime),
             UserEvent::ShelfOpenHeader(message) => self.app.complete_shelf_open_header(message),

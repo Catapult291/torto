@@ -13,6 +13,7 @@ pub(crate) use application::run;
 pub(crate) use clipboard::images_without_text;
 
 pub(crate) enum UserEvent {
+    Feedback(crate::feedback::Message),
     RepaintAfter(std::time::Duration),
     EguiRepaint {
         when: std::time::Instant,

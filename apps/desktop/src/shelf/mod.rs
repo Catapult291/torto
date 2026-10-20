@@ -89,6 +89,7 @@ pub(crate) struct ShelfFeature {
     import_books_shortcut: egui::KeyboardShortcut,
     return_to_shelf_shortcut: egui::KeyboardShortcut,
     settings_requested: bool,
+    feedback_requested: bool,
     cover_textures: covers::CoverCache,
     read_activity: ReadingActivity,
     refresh_generation: u64,
@@ -297,6 +298,7 @@ impl ShelfFeature {
             return_to_shelf_shortcut: crate::preferences::ShortcutPreferences::default()
                 .return_to_shelf,
             settings_requested: false,
+            feedback_requested: false,
             cover_textures: covers::CoverCache::default(),
             read_activity: ReadingActivity::default(),
             refresh_generation: 0,
@@ -433,6 +435,10 @@ impl ShelfFeature {
 
     pub(crate) fn take_settings_request(&mut self) -> bool {
         std::mem::take(&mut self.settings_requested)
+    }
+
+    pub(crate) fn take_feedback_request(&mut self) -> bool {
+        std::mem::take(&mut self.feedback_requested)
     }
 
     pub(crate) fn apply_global_settings(&mut self, settings: &AppliedSettings) {
@@ -1101,14 +1107,14 @@ impl ShelfFeature {
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 let row = ui.max_rect();
-                let actions_left = (row.right() - 160.0).max(row.left());
+                let actions_left = (row.right() - 200.0).max(row.left());
                 #[cfg(target_os = "windows")]
                 {
                     let rect = ui.max_rect();
                     crate::app::window_chrome::exclude(
                         ui.ctx(),
                         egui::Rect::from_min_max(
-                            egui::pos2((rect.right() - 160.0).max(rect.left()), rect.top()),
+                            egui::pos2((rect.right() - 200.0).max(rect.left()), rect.top()),
                             rect.max,
                         ),
                     );
@@ -1127,6 +1133,16 @@ impl ShelfFeature {
                             ui.visuals_mut().disabled_alpha = 1.0;
                         }
                         let settings = icon_button(ui, Icon::Settings);
+                        if ui
+                            .add_enabled_ui(!interaction_blocked, |ui| {
+                                icon_button(ui, Icon::MessageCircleQuestion)
+                            })
+                            .inner
+                            .on_hover_text(self.language.text("反馈与建议", "Feedback"))
+                            .clicked()
+                        {
+                            self.feedback_requested = true;
+                        }
                         if self.sync.settings.enabled
                             && self
                                 .sync
