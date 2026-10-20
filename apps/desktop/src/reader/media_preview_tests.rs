@@ -191,6 +191,76 @@ fn local_book_separate_subfigures_have_distinct_reference_destinations() {
 }
 
 #[test]
+fn focus_shortcut_previews_a_figure_reached_through_a_document_location() {
+    let mut reader = reference_reader("<p>See <a href='#position'>Figure 8.2</a>.</p><p id='position'>Ordinary prose before the picture.</p><figure id='border'><img src='border.png'/><figcaption>Figure 8.2 Decorative border</figcaption></figure>");
+    let ctx = egui::Context::default();
+    preview_key(&mut reader, &ctx, egui::Key::Num0);
+    let active = reader.media_preview.active.as_ref().unwrap();
+    assert_eq!(active.items.len(), 1);
+    assert_eq!(active.key.number, "8.2");
+    let pending = reader.media_preview.worker.as_ref().unwrap().pending.load_full().unwrap();
+    assert!(pending.destination.is_some());
+    let target = Index::default().resolve(&pending, &|| true).unwrap();
+    let section = pending.source.parse_section(target.section).unwrap();
+    let Block::Figure(figure) = &section.blocks[target.block] else { panic!("figure") };
+    assert!(figure.images[0].href.path().ends_with("border.png"));
+}
+
+#[test]
+fn worker_document_fallback_matches_catalog_scope_and_invalid_link_rules() {
+    let source = source(&[
+        "<html><body><p>See <a href='s1.xhtml#position'>Figure 8.2</a>, <a href='s1.xhtml'>Table 8.3</a>, <a href='s1.xhtml#missing'>Figure 8.4</a>, <a href='s1.xhtml#other'>Figure 8.4</a>, <a href='s1.xhtml#position'>Figure 8.5</a> and <a href='s1.xhtml#position'>Figure 9.5</a>.</p><figure><img src='local.png'/><figcaption>Figure 8.2 Local</figcaption></figure></body></html>",
+        "<html><body><p id='position'>Ordinary prose.</p><figure><img src='border.png'/><figcaption>Figure 8.2 Border</figcaption></figure><table><caption>Table 8.3 Results</caption><tr><td>Data</td></tr></table><figure id='other'><img src='other.png'/><figcaption>Figure 8.1 Other</figcaption></figure><figure><img src='unique.png'/><figcaption>Figure 8.4 Unique</figcaption></figure><figure><img src='a.png'/><figcaption>Figure 8.5 First</figcaption></figure><figure><img src='b.png'/><figcaption>Figure 8.5 Second</figcaption></figure></body></html>",
+        "<html><body><figure><img src='remote.png'/><figcaption>Figure 9.5 Elsewhere</figcaption></figure></body></html>",
+    ]);
+    let text = source.sections[0].blocks[0].text_blocks().next().unwrap();
+    let plain = plain(text);
+    for reference in media_references::inline_references(&text.content) {
+        let mut request = job(source.clone(),0,"Figure 8.2");
+        request.key = reference.key.clone();
+        request.origin = text.source.clone().unwrap();
+        request.origin.start.text_offset += plain[..reference.range.start].chars().count() as u64;
+        request.origin.end.text_offset = text.source.as_ref().unwrap().start.text_offset + plain[..reference.range.end].chars().count() as u64;
+        let result = Index::default().resolve(&request, &|| true);
+        if ["8.2", "8.3"].contains(&reference.key.number.as_str()) {
+            assert_eq!(result.unwrap().section, 1);
+        } else {
+            assert!(result.is_err(), "{:?} must not fall back outside its valid document/anchor scope", reference.key);
+        }
+    }
+    assert_eq!(source.resources.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+#[ignore = "requires original BOOKS without barriers chapter-8.xhtml via TORTO_MEDIA_CHAPTER"]
+fn local_book_page_location_resolves_the_original_and_translated_figure_8_2_reference() {
+    let html = std::fs::read_to_string(std::env::var("TORTO_MEDIA_CHAPTER").unwrap()).unwrap().replace("chapter-8.xhtml", "s0.xhtml");
+    let original = source(&[&html]);
+    let catalog = Arc::new(super::super::media_links::Source::new(original.clone(), original.clone()));
+    catalog.prepare_for_test();
+    let text = original.sections[0].blocks.iter().flat_map(Block::text_blocks).find(|text| plain(text).contains("purely decorative") && plain(text).contains("Figure 8.2")).unwrap();
+    let origin = text.source.as_ref().unwrap();
+    let candidates = catalog.preview_references(origin, &text.content);
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].0.number, "8.2");
+    let mut translated = vec![Inline::Text(rebook_publication::TextRun { text: "图片纯粹用作装饰，例如文字周围的边框（图8.2）。".into(), style: Default::default(), link: None })];
+    media_references::restrict_translated_links(&mut translated, &text.content);
+    catalog.prepare_media_references(&mut translated, Some(origin));
+    assert_eq!(catalog.preview_references(origin, &translated)[0].1, candidates[0].1);
+    for supplied in [None, Some(catalog.clone())] {
+        let mut request = job(original.clone(),0,"Figure 8.2");
+        request.origin = origin.clone();
+        request.catalog = supplied;
+        assert_eq!(Index::default().resolve(&request, &|| true).unwrap(), candidates[0].1);
+    }
+    let Block::Figure(figure) = &original.sections[0].blocks[candidates[0].1.block] else { panic!("figure") };
+    assert!(figure.caption_blocks().any(|text| plain(text).contains("Figure 8.2")));
+    assert!(translated.iter().flat_map(Inline::text_runs).any(|run| run.text == "图8.2" && !run.style.suppress_media_references));
+    println!("Figure 8.2 and 图8.2 resolve to the same figure, source={:?}", figure.source);
+    assert_eq!(original.resources.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn numbered_table_shortcut_previews_itself_and_missing_references_do_not_open_a_popup() {
     let mut reader = reference_reader("<p>See Figure 99.</p>");
     let ctx = egui::Context::default();

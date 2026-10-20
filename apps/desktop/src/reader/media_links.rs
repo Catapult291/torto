@@ -6,7 +6,7 @@ use rebook_publication::{
     *,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -33,6 +33,9 @@ struct Catalog {
     by_key: HashMap<MediaKey, Vec<usize>>,
     // Authored links survive translation and popup flattening through source identity.
     links: HashMap<(usize, String), Vec<(MediaKey, PublicationUrl)>>,
+    // Existing non-media anchors used by references. Keep only exceptional links,
+    // rather than retaining every paragraph/page anchor in the book.
+    document_links: HashSet<PublicationUrl>,
 }
 
 fn href_for(content: &[Inline], reference: &MediaReference) -> Result<Option<PublicationUrl>, ()> {
@@ -146,7 +149,44 @@ impl Catalog {
             }
             // No section, image bytes, or layouts are retained by the catalog.
         }
+        let mut pending = HashSet::new();
+        for (key, href) in catalog.links.values().flatten() {
+            let Some(fragment) = href.fragment() else { continue };
+            if pending.contains(href)
+                || catalog.entries.iter().any(|entry| {
+                    source.book().sections[entry.target.section].href.path() == href.path()
+                        && entry.anchors.iter().any(|anchor| anchor == fragment)
+                })
+            { continue; }
+            let candidates = catalog.key_entries(key).into_iter().filter(|entry| {
+                source.book().sections[entry.target.section].href.path() == href.path()
+            }).map(|entry| entry.target.clone());
+            if !matches!(media_preview::select(candidates, key), Ok(Some(_))) { continue; }
+            bytes += href.path().len() + fragment.len() + 128;
+            if bytes > BUDGET { return Err("media catalog budget exceeded".into()); }
+            pending.insert(href.clone());
+        }
+        // Validate only the documents whose otherwise unique media references
+        // missed a media anchor. This exceptional pass stays on the catalog worker.
+        for (index, descriptor) in source.book().sections.iter().enumerate() {
+            if !needed() { return Err("cancelled".into()); }
+            let links: Vec<_> = pending.extract_if(|href| href.path() == descriptor.href.path()).collect();
+            if links.is_empty() { continue; }
+            let section = source.parse_section(index).map_err(|e| e.to_string())?;
+            for href in links {
+                if section.anchors.iter().any(|anchor| Some(anchor.fragment.as_str()) == href.fragment()) {
+                    catalog.document_links.insert(href);
+                }
+            }
+        }
         Ok(catalog)
+    }
+
+    fn key_entries(&self, key: &MediaKey) -> Vec<&Entry> {
+        let fallback = key.number.strip_suffix(|c: char| c.is_ascii_alphabetic())
+            .and_then(|number| self.by_key.get(&MediaKey { kind: key.kind, number: number.into() }));
+        self.by_key.get(key).into_iter().chain(fallback).flatten()
+            .map(|index| &self.entries[*index]).collect()
     }
 
     fn authored(
@@ -174,43 +214,26 @@ impl Catalog {
         key: &MediaKey,
         href: Option<&PublicationUrl>,
     ) -> Option<Target> {
-        let fallback = key
-            .number
-            .strip_suffix(|c: char| c.is_ascii_alphabetic())
-            .and_then(|number| {
-                self.by_key.get(&MediaKey {
-                    kind: key.kind,
-                    number: number.into(),
-                })
-            });
         // Exact/subfigure preference is applied inside each document/chapter
         // scope, rather than letting a remote exact label defeat a local group.
-        let entries: Vec<_> = self
-            .by_key
-            .get(key)
-            .into_iter()
-            .chain(fallback)
-            .flatten()
-            .map(|index| &self.entries[*index])
-            .collect();
+        let entries = self.key_entries(key);
         let select = |entries: Vec<&Entry>| {
             media_preview::select(entries.into_iter().map(|entry| entry.target.clone()), key)
         };
         if let Some(href) = href {
-            return select(
-                entries
-                    .iter()
-                    .copied()
-                    .filter(|entry| {
-                        source.book().sections[entry.target.section].href.path() == href.path()
-                            && href.fragment().is_some_and(|fragment| {
-                                entry.anchors.iter().any(|anchor| anchor == fragment)
-                            })
-                    })
-                    .collect(),
-            )
-            .ok()
-            .flatten();
+            let document: Vec<_> = entries.iter().copied().filter(|entry| {
+                source.book().sections[entry.target.section].href.path() == href.path()
+            }).collect();
+            let exact = select(document.iter().copied().filter(|entry| {
+                href.fragment().is_some_and(|fragment| entry.anchors.iter().any(|anchor| anchor == fragment))
+            }).collect());
+            match exact {
+                Ok(Some(target)) => return Some(target),
+                Err(_) => return None,
+                _ => {}
+            }
+            return (href.fragment().is_none() || self.document_links.contains(href))
+                .then(|| select(document).ok().flatten()).flatten();
         }
         let path = source.book().sections.get(origin)?.href.path();
         let local = select(

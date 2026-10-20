@@ -77,6 +77,46 @@ fn preview_candidates_use_validated_links_and_resolve_same_numbers_by_destinatio
 }
 
 #[test]
+fn document_scoped_links_resolve_unique_numbers_in_original_and_translated_text() {
+    let fixture = fixture(&[
+        "<html><body><p>See <a href='s1.xhtml#position'>Figure 8.2</a> and <a href='s1.xhtml'>Table 8.3</a>.</p><figure><img src='local.png'/><figcaption>Figure 8.2 Local duplicate</figcaption></figure></body></html>",
+        "<html><body><p id='position'>A location in ordinary prose.</p><figure id='border'><img src='border.png'/><figcaption>Figure 8.2 Decorative border</figcaption></figure><table><caption>Table 8.3 Results</caption><tr><td>Data</td></tr></table></body></html>",
+    ]);
+    let source = ready(&fixture);
+    let text = fixture.sections[0].blocks[0].text_blocks().next().unwrap();
+    let before = fixture.parses.load(Ordering::Relaxed);
+    let mut original = text.content.clone();
+    source.prepare_media_references(&mut original, text.source.as_ref());
+    assert_eq!(linked(&mut original), "Figure 8.2Table 8.3");
+    let mut translated = vec![Inline::Text(TextRun { text: "装饰性边框（图8.2），另见表8.3。".into(), style: Default::default(), link: None })];
+    media_references::restrict_translated_links(&mut translated, &text.content);
+    source.prepare_media_references(&mut translated, text.source.as_ref());
+    assert_eq!(linked(&mut translated), "图8.2表8.3");
+    let candidates = source.preview_references(text.source.as_ref().unwrap(), &translated);
+    assert_eq!(candidates.iter().map(|(key,target,_)| (key.number.as_str(),target.section)).collect::<Vec<_>>(), [("8.2",1),("8.3",1)]);
+    assert!(candidates.iter().all(|(_,_,node)| node.is_some()));
+    assert_eq!(source.target_node(text.source.as_ref().unwrap(), &candidates[0].0).unwrap().0, 1);
+    assert_eq!(fixture.parses.load(Ordering::Relaxed), before, "validation and preview collection must not parse on the UI thread");
+    assert_eq!(fixture.resources.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn document_fallback_rejects_missing_wrong_media_ambiguous_and_remote_targets() {
+    let fixture = fixture(&[
+        "<html><body><p>See <a href='s1.xhtml#position'>Figure 8.2</a>, <a href='s1.xhtml#missing'>Figure 8.4</a>, <a href='s1.xhtml#other'>Figure 8.4</a>, <a href='s1.xhtml#position'>Figure 9.5</a> and <a href='missing.xhtml'>Figure 8.4</a>.</p></body></html>",
+        "<html><body><p id='position'>Ordinary prose.</p><figure><img src='a.png'/><figcaption>Figure 8.2 First</figcaption></figure><figure><img src='b.png'/><figcaption>Figure 8.2 Second</figcaption></figure><figure id='other'><img src='c.png'/><figcaption>Figure 8.1 Other</figcaption></figure><figure><img src='d.png'/><figcaption>Figure 8.4 Unique</figcaption></figure></body></html>",
+        "<html><body><figure><img src='e.png'/><figcaption>Figure 9.5 Outside the linked document</figcaption></figure></body></html>",
+    ]);
+    let source = ready(&fixture);
+    let text = fixture.sections[0].blocks[0].text_blocks().next().unwrap();
+    let mut content = text.content.clone();
+    source.prepare_media_references(&mut content, text.source.as_ref());
+    assert_eq!(linked(&mut content), "");
+    assert!(source.preview_references(text.source.as_ref().unwrap(), &content).is_empty());
+    assert_eq!(fixture.resources.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn changed_source_rejects_old_catalog_and_cancelled_build_does_no_work() {
     let fixture = fixture(&[
         "<html><body><p>See Figure 1.</p><figure><img src='a.png'/><figcaption>Figure 1 example</figcaption></figure></body></html>",

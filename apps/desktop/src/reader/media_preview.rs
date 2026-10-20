@@ -471,14 +471,29 @@ impl Index {
         self.add(&origin, origin_index)?;
         if let Some(href) = authored_link(&origin, &job.origin, &job.key)? {
             let mut candidates = Vec::new();
+            let mut document = Vec::new();
+            let mut anchor_exists = href.fragment().is_none();
+            let mut media_anchor = false;
             for (index, _) in source.book().sections.iter().enumerate().filter(|(_, s)| s.href.path() == href.path()) {
                 if !needed() { return Err("Cancelled".into()); }
                 let section = if index == origin_index { origin.clone() }
                     else { source.parse_section(index).map_err(|e| e.to_string())? };
                 self.add(&section, index)?;
-                candidates.extend(self.entries[&index].iter().filter(|t| target_has_anchor(&section, t, &href)).cloned());
+                anchor_exists |= section.anchors.iter().any(|anchor| Some(anchor.fragment.as_str()) == href.fragment());
+                for target in &self.entries[&index] {
+                    if target_has_anchor(&section, target, &href) {
+                        media_anchor = true;
+                        candidates.push(target.clone());
+                    }
+                    document.push(target.clone());
+                }
             }
             if let Some(target) = select(candidates.into_iter(), &job.key)? {
+                return Ok(target);
+            }
+            if anchor_exists && !media_anchor
+                && let Some(target) = select(document.into_iter(), &job.key)?
+            {
                 return Ok(target);
             }
             return Err("The authored media target is unavailable.".into());
