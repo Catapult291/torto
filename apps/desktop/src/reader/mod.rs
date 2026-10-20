@@ -1001,15 +1001,7 @@ struct PendingTocNavigation {
     started: Instant,
 }
 
-struct ImagePreview {
-    motion: media_preview::PreviewMotion,
-    formula: Option<String>,
-    texture: egui::TextureHandle,
-    image: egui::ColorImage,
-    source_size: egui::Vec2,
-    zoom: f32,
-    pan: egui::Vec2,
-}
+use crate::ui::image_preview::ImagePreview;
 
 struct ImagePressCandidate {
     started_at: Instant,

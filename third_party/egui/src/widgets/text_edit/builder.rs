@@ -916,7 +916,13 @@ impl TextEdit<'_> {
                         } else {
                             &state.cursor_purpose
                         };
-                        match cursor_purpose {
+                        if let Some(range) = crate::native_text_input::composition(ui.ctx(), id) {
+                            text_selection::visuals::paint_ime_preedit_text_visuals(
+                                galley_pos, ui, &painter, &galley, row_height,
+                                CCursor::new(range.start)..CCursor::new(range.end),
+                                None, time_since_last_interaction,
+                            );
+                        } else { match cursor_purpose {
                             TextEditCursorPurpose::Selection => {
                                 text_selection::visuals::paint_text_cursor(
                                     ui,
@@ -940,7 +946,7 @@ impl TextEdit<'_> {
                                     time_since_last_interaction,
                                 );
                             }
-                        }
+                        } }
                     }
                     if ui.memory(|mem| mem.owns_ime_events(id)) {
                         // Set IME output (in screen coords) when text is editable and visible
@@ -965,6 +971,17 @@ impl TextEdit<'_> {
             }
         }
 
+        if crate::native_text_input::enabled(ui.ctx()) && response.has_focus() && text_mutable && !password && ui.is_enabled() && ui.is_visible() {
+            let to_global = ui.ctx().layer_transform_to_global(ui.layer_id()).unwrap_or_default();
+            crate::native_text_input::publish(ui.ctx(), crate::native_text_input::Snapshot {
+                id, text: text.as_str().into(),
+                selection: state.cursor.char_range().unwrap_or_default(),
+                rect: to_global * inner_rect,
+                cursor_rect: to_global * cursor_rect(&galley, &state.cursor.char_range().unwrap_or_default().primary, row_height)
+                    .translate(galley_pos.to_vec2() - vec2(galley.rect.left(), 0.0)),
+                multiline, char_limit,
+            });
+        }
         state.clone().store(ui.ctx(), id);
 
         if response.changed() {
@@ -1094,6 +1111,29 @@ fn events(
     };
 
     let mut any_change = false;
+
+    if let Some(edit) = crate::native_text_input::take_edit(ui.ctx(), id) {
+        if !password && ui.is_enabled() && ui.is_visible() && text.is_mutable()
+            && ui.memory(|memory| memory.has_focus(id))
+            && text.as_str() == edit.before.as_ref()
+            && edit.text.chars().count() <= char_limit
+            && usize::from(edit.selection.primary.index) <= edit.text.chars().count()
+            && usize::from(edit.selection.secondary.index) <= edit.text.chars().count()
+            && (multiline || !edit.text.contains(['\r', '\n']))
+        {
+            // A native replacement is one undoable operation, not a stream of
+            // synthetic keystrokes. Composing updates share the original undo point.
+            if crate::native_text_input::composition(ui.ctx(), id).is_none() {
+                state.undoer.lock().add_undo(&(cursor_range, text.as_str().to_owned()));
+            }
+            any_change = text.as_str() != edit.text.as_ref();
+            text.replace_with(&edit.text);
+            cursor_range = edit.selection;
+            state.cursor_purpose = TextEditCursorPurpose::Selection;
+            crate::native_text_input::set_composition(ui.ctx(), id, edit.composition);
+            *galley = layouter(ui, text, wrap_width);
+        }
+    }
 
     let events = ui.input(|i| i.filtered_events(&event_filter));
 
@@ -1235,7 +1275,7 @@ fn events(
                 ..
             } => check_for_mutating_key_press(os, &cursor_range, text, galley, modifiers, *key)
                 .map(CursorMutation::Selection),
-            Event::Ime(ime_event) if owns_ime_events => {
+            Event::Ime(ime_event) if owns_ime_events && !crate::native_text_input::handles_ime(ui.ctx(), id) => {
                 /// Both `ImeEvent::Preedit("")` and `ImeEvent::Commit("")`
                 /// might be emitted from different integrations to signify that
                 /// the current IME composition should be cleared.

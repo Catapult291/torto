@@ -10,6 +10,11 @@ use super::{DesktopReader, FollowUp, SnapshotEffects};
 mod tests;
 
 impl DesktopReader {
+    pub(crate) fn prepare_feedback_request(&mut self) {
+        self.cancel_text_selection();
+        self.close_overlay();
+    }
+
     pub(crate) fn take_feedback_request(&mut self) -> bool {
         std::mem::take(&mut self.feedback_requested)
     }

@@ -1,4 +1,5 @@
 mod http_loader;
+pub(crate) mod image_preview;
 mod icons;
 mod interface_fonts;
 mod loading_spinner;

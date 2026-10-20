@@ -287,6 +287,10 @@ fn shortcut_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                 ShortcutAction::ReturnToShelf,
                 language.text("返回书架", "Back to library"),
             ),
+            (
+                ShortcutAction::OpenFeedback,
+                language.text("反馈问题", "Report an issue"),
+            ),
         ],
     );
     ui.add_space(12.0);

@@ -1,3 +1,9 @@
+use crate::ui::image_preview::update_preview_zoom;
+#[cfg(test)]
+use crate::ui::image_preview::{
+    IMAGE_PREVIEW_MAX_ZOOM, IMAGE_PREVIEW_MIN_ZOOM, clamp_preview_pan,
+    preview_fit_scale, show_image_preview_area, zoom_from_wheel,
+};
 use std::time::{Duration, Instant};
 
 use egui::text::{CCursor, CCursorRange};
@@ -58,10 +64,6 @@ const TOC_ROW_HEIGHT: f32 = chrome::TOC_ROW_HEIGHT;
 const TOC_SCROLL_ID_SALT: &str = "reader-toc-scroll";
 const WHEEL_PAGE_THRESHOLD: f32 = 18.0;
 const WHEEL_TURN_COOLDOWN: Duration = Duration::from_millis(120);
-const IMAGE_PREVIEW_MARGIN: f32 = 48.0;
-const IMAGE_PREVIEW_MIN_ZOOM: f32 = 0.25;
-const IMAGE_PREVIEW_MAX_ZOOM: f32 = 8.0;
-const IMAGE_PREVIEW_WHEEL_SPEED: f32 = 0.0025;
 const IMAGE_LONG_PRESS_DURATION: Duration = Duration::from_millis(500);
 const IMAGE_LONG_PRESS_MAX_TRAVEL: f32 = 8.0;
 
@@ -4652,13 +4654,11 @@ impl DesktopReader {
                         if navigation_button(
                             ui,
                             Icon::MessageCircleQuestion,
-                            self.language.text("反馈与建议", "Feedback"),
+                            self.language.text("反馈问题", "Report an issue"),
                             false,
                         )
                         .clicked()
                         {
-                            self.cancel_text_selection();
-                            self.close_overlay();
                             self.feedback_requested = true;
                         }
                     });
@@ -5119,7 +5119,7 @@ impl DesktopReader {
                 Ok(image) => {
                     self.open_color_image_preview(ctx, image, "reader-formula-preview");
                     if let Some(preview) = &mut self.image_preview {
-                        preview.formula = Some(latex.to_owned());
+                        preview.copy_text = Some(latex.to_owned());
                     }
                 }
                 Err(error) => self.error = Some(format!("Formula preview failed: {error}")),
@@ -5172,25 +5172,11 @@ impl DesktopReader {
         color_image: egui::ColorImage,
         texture_namespace: &str,
     ) {
-        let source_size = Vec2::new(color_image.size[0] as f32, color_image.size[1] as f32);
-        let texture = ctx.load_texture(
-            format!("{texture_namespace}-{}", self.scene_revision),
-            color_image.clone(),
-            egui::TextureOptions::LINEAR,
-        );
         self.cancel_text_selection();
         self.close_focus_footnotes();
         self.selected_image = None;
         self.image_pointer_state = ImagePointerState::Idle;
-        self.image_preview = Some(super::ImagePreview {
-            motion: super::media_preview::PreviewMotion::new(ctx),
-            formula: None,
-            texture,
-            image: color_image,
-            source_size,
-            zoom: 1.0,
-            pan: Vec2::ZERO,
-        });
+        self.image_preview = Some(super::ImagePreview::new(ctx, color_image, texture_namespace));
         ctx.request_repaint();
     }
 
@@ -5242,7 +5228,7 @@ impl DesktopReader {
         }
         let copied_image = if let Some(preview) = &self.image_preview {
             if let Some(latex) = preview
-                .formula
+                .copy_text
                 .as_deref()
                 .filter(|text| !text.trim().is_empty())
             {
@@ -5399,59 +5385,10 @@ impl DesktopReader {
     }
 
     fn image_preview_overlay(&mut self, ctx: &egui::Context) {
-        let mut close = false;
-        let Some(preview) = self.image_preview.as_mut() else {
-            return;
-        };
-        let opacity = preview.motion.opacity(ctx);
-        if preview.motion.is_closing() && opacity <= f32::EPSILON {
+        if self.image_preview.as_mut().is_some_and(|preview| preview.show(ctx)) {
             self.finish_closing_image_preview();
-            // The selection border was painted before this overlay. Draw it once
-            // after releasing the popup, then let the reader return to idle.
+            // Restore the selection border once after the popup releases its texture.
             ctx.request_repaint();
-            return;
-        }
-        let screen = crate::ui::overlay_rect(ctx);
-        let available = Vec2::new(
-            (screen.width() - IMAGE_PREVIEW_MARGIN * 2.0).max(1.0),
-            (screen.height() - IMAGE_PREVIEW_MARGIN * 2.0).max(1.0),
-        );
-        let fit_scale = preview_fit_scale(preview.source_size, available);
-
-        let wheel_delta = ctx.input(preview_wheel_delta);
-        if wheel_delta != 0.0 && !preview.motion.is_closing() {
-            let factor = zoom_from_wheel(preview.zoom, wheel_delta) / preview.zoom;
-            let pointer = ctx
-                .input(|input| input.pointer.hover_pos())
-                .unwrap_or_else(|| screen.center());
-            update_preview_zoom(preview, factor, pointer, screen.center());
-            ctx.request_repaint();
-        }
-
-        let display_size = preview.source_size * fit_scale * preview.zoom;
-        preview.pan = clamp_preview_pan(preview.pan, display_size, available);
-        let image_rect = Rect::from_center_size(screen.center() + preview.pan, display_size);
-        let texture_id = preview.texture.id();
-        let zoom_percent = fit_scale * preview.zoom * 100.0;
-        let interaction = show_image_preview_area(
-            ctx, screen, image_rect, texture_id, zoom_percent, opacity, !preview.motion.is_closing(),
-        );
-        close |= interaction.close;
-
-        if interaction.reset {
-            preview.zoom = 1.0;
-            preview.pan = Vec2::ZERO;
-            ctx.request_repaint();
-        } else if interaction.drag_delta != Vec2::ZERO {
-            preview.pan = clamp_preview_pan(
-                preview.pan + interaction.drag_delta,
-                display_size,
-                available,
-            );
-            ctx.request_repaint();
-        }
-        if close {
-            self.close_image_preview(ctx);
         }
     }
 
@@ -6460,25 +6397,6 @@ fn chat_message_card(
     clicked_citation
 }
 
-fn preview_wheel_delta(input: &egui::InputState) -> f32 {
-    input
-        .raw
-        .events
-        .iter()
-        .filter_map(|event| match event {
-            egui::Event::MouseWheel { unit, delta, .. } => Some(
-                delta.y
-                    * match unit {
-                        egui::MouseWheelUnit::Point => 1.0,
-                        egui::MouseWheelUnit::Line => 40.0,
-                        egui::MouseWheelUnit::Page => 240.0,
-                    },
-            ),
-            _ => None,
-        })
-        .sum()
-}
-
 impl SelectedImage {
     pub(super) fn color_image(&self) -> egui::ColorImage {
         egui::ColorImage::from_rgba_unmultiplied(
@@ -6572,12 +6490,6 @@ fn shortcut_tooltip(
     }
 }
 
-struct ImagePreviewInteraction {
-    close: bool,
-    reset: bool,
-    drag_delta: Vec2,
-}
-
 fn formula_preview_image(latex: &str) -> Result<egui::ColorImage, String> {
     let rendered = rebook_math::math::render_math(latex, 32.0, "#000000", true)?;
     let padding = 12.0;
@@ -6609,87 +6521,6 @@ fn formula_preview_image(latex: &str) -> Result<egui::ColorImage, String> {
         [pixels.width() as usize, pixels.height() as usize],
         pixels.data(),
     ))
-}
-
-fn show_image_preview_area(
-    ctx: &egui::Context,
-    screen: Rect,
-    image_rect: Rect,
-    texture_id: TextureId,
-    zoom_percent: f32,
-    opacity: f32,
-    interactive: bool,
-) -> ImagePreviewInteraction {
-    let backdrop_screen = ctx.content_rect();
-    #[cfg(target_os = "windows")]
-    crate::app::window_chrome::dim_controls(ctx, 190.0 / 255.0 * opacity);
-    let mut interaction = ImagePreviewInteraction {
-        close: false,
-        reset: false,
-        drag_delta: Vec2::ZERO,
-    };
-    egui::Area::new("reader-image-preview".into())
-        .order(egui::Order::Tooltip)
-        .fade_in(false)
-        .fixed_pos(backdrop_screen.min)
-        .constrain(false)
-        .default_size(backdrop_screen.size())
-        .show(ctx, |ui| {
-            if !interactive { ui.disable(); }
-            // Disabling interaction must not add egui's disabled-widget dimming.
-            ui.set_opacity(opacity);
-            ui.set_clip_rect(backdrop_screen);
-            // The backdrop only owns clicks used to close the preview. Registering it for
-            // dragging as well competes with the image's drag response on the same layer.
-            let (backdrop_rect, backdrop) =
-                ui.allocate_exact_size(backdrop_screen.size(), egui::Sense::click());
-            ui.painter()
-                .rect_filled(backdrop_rect, 0.0, Color32::from_black_alpha(190));
-            // Transparent book illustrations often contain black formulas or line art.
-            // Composite them over opaque paper, so the dimmed page cannot show through
-            // and the original ink remains readable in either application theme.
-            ui.painter().rect_filled(image_rect, 0.0, Color32::WHITE);
-            ui.painter().image(
-                texture_id,
-                image_rect,
-                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                Color32::WHITE,
-            );
-            ui.painter().rect_stroke(
-                image_rect,
-                2.0,
-                egui::Stroke::new(1.0, Color32::from_white_alpha(48)),
-                egui::StrokeKind::Inside,
-            );
-
-            let image_response = ui
-                .interact(
-                    image_rect,
-                    ui.id().with("preview-image"),
-                    egui::Sense::click_and_drag(),
-                )
-                .on_hover_cursor(egui::CursorIcon::Grab);
-            if image_response.dragged() {
-                interaction.drag_delta = ctx.input(|input| input.pointer.delta());
-            }
-            interaction.reset = image_response.double_clicked();
-
-            ui.painter().text(
-                Pos2::new(screen.center().x.round(), (screen.bottom() - 24.0).round()),
-                egui::Align2::CENTER_BOTTOM,
-                format!("{zoom_percent:.0}%"),
-                egui::FontId::monospace(crate::ui::scaled_font_size(12.0)),
-                Color32::WHITE,
-            );
-            if backdrop.clicked()
-                && backdrop
-                    .interact_pointer_pos()
-                    .is_some_and(|position| !image_rect.contains(position))
-            {
-                interaction.close = true;
-            }
-        });
-    interaction
 }
 
 #[derive(Clone, Copy)]
@@ -6777,33 +6608,6 @@ fn show_chat_progress(
             }
         });
     }
-}
-
-pub(super) fn preview_fit_scale(source: Vec2, available: Vec2) -> f32 {
-    (available.x / source.x.max(1.0)).min(available.y / source.y.max(1.0))
-}
-
-fn update_preview_zoom(preview: &mut super::ImagePreview, factor: f32, anchor: Pos2, center: Pos2) {
-    let old_zoom = preview.zoom;
-    preview.zoom = (old_zoom * factor).clamp(IMAGE_PREVIEW_MIN_ZOOM, IMAGE_PREVIEW_MAX_ZOOM);
-    let ratio = preview.zoom / old_zoom;
-    preview.pan -= (anchor - (center + preview.pan)) * (ratio - 1.0);
-}
-
-fn zoom_from_wheel(zoom: f32, wheel_delta: f32) -> f32 {
-    (zoom * (wheel_delta * IMAGE_PREVIEW_WHEEL_SPEED).exp())
-        .clamp(IMAGE_PREVIEW_MIN_ZOOM, IMAGE_PREVIEW_MAX_ZOOM)
-}
-
-fn clamp_preview_pan(pan: Vec2, display_size: Vec2, available: Vec2) -> Vec2 {
-    let limit = Vec2::new(
-        (display_size.x - available.x).abs() / 2.0,
-        (display_size.y - available.y).abs() / 2.0,
-    );
-    Vec2::new(
-        pan.x.clamp(-limit.x, limit.x),
-        pan.y.clamp(-limit.y, limit.y),
-    )
 }
 
 fn color32(color: rebook_publication::Rgba) -> Color32 {
@@ -8317,7 +8121,7 @@ mod reference_suggestion_label_tests {
                         );
                         if preview_open {
                             show_image_preview_area(
-                                &ctx,
+                                &ctx, egui::Id::new("reader-image-preview"),
                                 crate::ui::overlay_rect(&ctx),
                                 Rect::from_min_size(
                                     Pos2::new(200.0, 150.0),

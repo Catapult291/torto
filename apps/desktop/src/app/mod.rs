@@ -33,6 +33,20 @@ pub(crate) struct DesktopApp {
 }
 
 impl DesktopApp {
+    pub(crate) fn feedback_accepts_paste(&self) -> bool {
+        self.feedback.accepts_images()
+    }
+
+    pub(crate) fn paste_feedback_images(&mut self) {
+        self.feedback.paste_images();
+    }
+
+    pub(crate) fn complete_feedback_images(&mut self, message: crate::feedback::screenshots::Message) {
+        self.feedback.complete_images(message);
+    }
+    pub(crate) fn complete_feedback_preview(&mut self, message: crate::feedback::screenshots::PreviewMessage) {
+        self.feedback.complete_preview(message);
+    }
     pub(crate) fn startup_error(&self) -> Option<&str> {
         self.pending_reader_error
             .as_deref()
@@ -131,7 +145,10 @@ impl DesktopApp {
         {
             self.settings.open();
         }
-        let interaction_blocked = self.settings.is_open() || self.feedback.is_open();
+        let feedback_shortcut_requested = !self.settings.is_open()
+            && !self.feedback.is_open()
+            && ui.ctx().input_mut(|input| input.consume_shortcut(&self.settings.applied().shortcuts.open_feedback));
+        let interaction_blocked = self.settings.is_open() || self.feedback.is_open() || feedback_shortcut_requested;
         let plan = if self.shelf.opening_visible() {
             self.shelf.opening_ui(ui, interaction_blocked);
             if !self.shelf.opening_visible()
@@ -164,7 +181,10 @@ impl DesktopApp {
             || self.shelf.take_feedback_request(),
             DesktopReader::take_feedback_request,
         );
-        if feedback_requested {
+        if feedback_requested || feedback_shortcut_requested {
+            if let Some(reader) = &mut self.reader {
+                reader.prepare_feedback_request();
+            }
             let context = self.reader.as_ref().map_or_else(
                 || crate::feedback::OpenContext::shelf(ui.ctx()),
                 |reader| reader.feedback_context(ui.ctx()),

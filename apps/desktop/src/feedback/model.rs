@@ -9,7 +9,15 @@ pub(crate) struct Payload {
     #[serde(rename = "type")]
     pub kind: Kind,
     pub description: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub screenshots: Vec<Screenshot>,
     pub context: Context,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Screenshot {
+    pub data: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

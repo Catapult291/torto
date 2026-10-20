@@ -167,6 +167,8 @@ pub(crate) struct ShortcutPreferences {
     pub(crate) toggle_cursor: egui::KeyboardShortcut,
     #[serde(default = "default_open_settings_shortcut")]
     pub(crate) open_settings: egui::KeyboardShortcut,
+    #[serde(default = "default_open_feedback_shortcut")]
+    pub(crate) open_feedback: egui::KeyboardShortcut,
     #[serde(default = "default_import_books_shortcut")]
     pub(crate) import_books: egui::KeyboardShortcut,
     #[serde(default = "default_previous_section_shortcut")]
@@ -216,7 +218,7 @@ impl ShortcutPreferences {
             .any(|binding| shortcut_chord_key_count(binding.modifiers) > MAX_SHORTCUT_KEYS)
     }
 
-    fn bindings(&self) -> [egui::KeyboardShortcut; 25] {
+    fn bindings(&self) -> [egui::KeyboardShortcut; 26] {
         [
             self.fullscreen,
             self.toggle_left_sidebar,
@@ -227,6 +229,7 @@ impl ShortcutPreferences {
             self.return_to_shelf,
             self.toggle_cursor,
             self.open_settings,
+            self.open_feedback,
             self.import_books,
             self.previous_section,
             self.next_section,
@@ -275,6 +278,7 @@ impl Default for ShortcutPreferences {
             return_to_shelf: default_return_to_shelf_shortcut(),
             toggle_cursor: default_toggle_cursor_shortcut(),
             open_settings: default_open_settings_shortcut(),
+            open_feedback: default_open_feedback_shortcut(),
             import_books: default_import_books_shortcut(),
             previous_section: default_previous_section_shortcut(),
             next_section: default_next_section_shortcut(),
@@ -329,6 +333,10 @@ const fn default_toggle_cursor_shortcut() -> egui::KeyboardShortcut {
 
 const fn default_open_settings_shortcut() -> egui::KeyboardShortcut {
     egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Comma)
+}
+
+const fn default_open_feedback_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers { ctrl: true, alt: true, ..egui::Modifiers::NONE }, egui::Key::P)
 }
 
 const fn default_import_books_shortcut() -> egui::KeyboardShortcut {
@@ -813,6 +821,7 @@ mod tests {
     fn legacy_shortcuts_gain_new_action_defaults() {
         let json = r#"{"version":1,"shortcuts":{}}"#;
         let stored: StoredReaderPreferences = serde_json::from_str(json).unwrap();
+        assert_eq!(stored.shortcuts.open_feedback, default_open_feedback_shortcut());
 
         assert_eq!(
             stored.shortcuts.search,

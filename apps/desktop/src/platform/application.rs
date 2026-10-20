@@ -34,7 +34,10 @@ fn app_icon() -> Option<Icon> {
 }
 
 pub(crate) fn run(app: DesktopApp) -> Result<(), Box<dyn std::error::Error>> {
-    let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
+    let mut builder = EventLoop::<UserEvent>::with_user_event();
+    #[cfg(target_os = "windows")]
+    rebook_windows_text_input::configure_event_loop(&mut builder);
+    let event_loop = builder.build()?;
     let proxy = event_loop.create_proxy();
     #[cfg(target_os = "macos")]
     let _open_file_handler = rebook_macos_open_file::install({
@@ -278,6 +281,8 @@ fn is_paste_key(
 }
 
 struct WindowState {
+    #[cfg(target_os = "windows")]
+    native_input: Option<rebook_windows_text_input::TextInput>,
     window: Arc<Window>,
     #[cfg(target_os = "windows")]
     native_background: rebook_windows_window_background::WindowBackground,
@@ -368,7 +373,8 @@ impl Application {
         sync_window_chrome(state, egui_ctx);
         if let Err(error) = state
             .gpu
-            .render(&state.window, app, egui_ctx, &mut state.egui_state)
+            .render(&state.window, app, egui_ctx, &mut state.egui_state,
+                #[cfg(target_os = "windows")] &mut state.native_input)
         {
             tracing::warn!(%error, "failed to present resized window frame");
             state.window.request_redraw();
@@ -462,7 +468,14 @@ impl ApplicationHandler<UserEvent> for Application {
         };
         let mut gpu = gpu;
         gpu.set_clear_color(clear_color());
+        #[cfg(target_os = "windows")]
+        let native_input = match rebook_windows_text_input::TextInput::new(window.clone()) {
+            Ok(input) => Some(input),
+            Err(error) => { tracing::warn!(%error, "TSF unavailable; retaining legacy IME input"); None }
+        };
         let state = WindowState {
+            #[cfg(target_os = "windows")]
+            native_input,
             window,
             #[cfg(target_os = "windows")]
             native_background,
@@ -548,6 +561,8 @@ impl ApplicationHandler<UserEvent> for Application {
             #[cfg(target_os = "windows")]
             UserEvent::Update(message) => self.app.complete_update(message),
             UserEvent::Feedback(message) => self.app.complete_feedback(message),
+            UserEvent::FeedbackImages(message) => self.app.complete_feedback_images(message),
+            UserEvent::FeedbackPreview(message) => self.app.complete_feedback_preview(message),
             UserEvent::ShelfImport(message) => self.app.complete_shelf_import(message),
             UserEvent::ShelfOpen(message) => self.app.complete_shelf_open(message, &self.runtime),
             UserEvent::ShelfOpenHeader(message) => self.app.complete_shelf_open_header(message),
@@ -653,7 +668,10 @@ impl ApplicationHandler<UserEvent> for Application {
         if let WindowEvent::ModifiersChanged(modifiers) = &event {
             self.modifiers = modifiers.state();
         }
-        if is_paste_shortcut(&event, self.modifiers)
+        if is_paste_shortcut(&event, self.modifiers) && self.app.feedback_accepts_paste() {
+            self.app.paste_feedback_images();
+            state.window.request_redraw();
+        } else if is_paste_shortcut(&event, self.modifiers)
             && self.app.chat_composer_accepts_paste(&self.egui_ctx)
         {
             self.app.paste_chat_images(&self.runtime, &self.proxy);
@@ -671,6 +689,8 @@ impl ApplicationHandler<UserEvent> for Application {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Focused(focused) => {
+                #[cfg(target_os = "windows")]
+                if let Some(native) = &mut state.native_input { native.set_focused(focused); }
                 let size = state.window.inner_size();
                 crate::diagnostics::log(
                     "window.focus",
@@ -730,6 +750,8 @@ impl ApplicationHandler<UserEvent> for Application {
                     &mut self.app,
                     &self.egui_ctx,
                     &mut state.egui_state,
+                    #[cfg(target_os = "windows")]
+                    &mut state.native_input,
                 ) {
                     crate::diagnostics::log(
                         "render.fatal",

@@ -30,10 +30,19 @@ pub(crate) struct ClipboardImage {
 /// files are read here, so a screenshot pasted from such a tool lands in the
 /// composer either way.
 pub(crate) fn images_without_text() -> Vec<ClipboardImage> {
+    images(false)
+}
+
+/// Feedback accepts a screenshot even when a capture tool also supplies text.
+pub(crate) fn feedback_images() -> Vec<ClipboardImage> {
+    images(true)
+}
+
+fn images(prefer_image: bool) -> Vec<ClipboardImage> {
     let Ok(mut clipboard) = arboard::Clipboard::new() else {
         return Vec::new();
     };
-    if clipboard.get_text().is_ok_and(|text| !text.is_empty()) {
+    if !prefer_image && clipboard.get_text().is_ok_and(|text| !text.is_empty()) {
         return Vec::new();
     }
     if let Ok(image) = clipboard.get_image() {

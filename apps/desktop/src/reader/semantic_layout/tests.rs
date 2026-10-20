@@ -540,19 +540,9 @@ fn formula_copy_uses_latex_and_ordinary_images_still_copy_pixels() {
     blocked.textures_delta.clear();
     assert!(blocked.platform_output.commands.is_empty());
     let pixels = reader.selected_image.as_ref().unwrap().color_image();
-    reader.image_preview = Some(ImagePreview {
-        motion: super::super::media_preview::PreviewMotion::new(&ctx),
-        formula: Some(r"x^2".into()),
-        texture: ctx.load_texture(
-            "formula-copy-test",
-            pixels.clone(),
-            egui::TextureOptions::default(),
-        ),
-        image: pixels,
-        source_size: egui::vec2(2.0, 1.0),
-        zoom: 1.0,
-        pan: egui::Vec2::ZERO,
-    });
+    let mut preview = ImagePreview::new(&ctx, pixels, "formula-copy-test");
+    preview.copy_text = Some(r"x^2".into());
+    reader.image_preview = Some(preview);
     let mut result = ctx.run_ui(copy(), |ui| reader.copy_shortcut(ui.ctx(), true));
     result.textures_delta.clear();
     assert!(

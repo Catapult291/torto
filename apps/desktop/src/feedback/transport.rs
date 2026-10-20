@@ -2,7 +2,7 @@ use super::model::Draft;
 use reqwest::Url;
 use std::time::Duration;
 
-pub(super) const DEFAULT_ENDPOINT: &str = "http://100.109.172.125:8083/api/feedback";
+pub(super) const DEFAULT_ENDPOINT: &str = "https://read.rethinkos.com/api/feedback";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Issue {
@@ -62,7 +62,7 @@ pub(super) async fn submit(draft: &Draft) -> Outcome {
     let Ok(bytes) = serde_json::to_vec(&draft.payload) else {
         return Outcome::Failed(Failure::Invalid, None);
     };
-    if bytes.len() > 64 * 1024 {
+    if bytes.len() > 9 * 1024 * 1024 {
         return Outcome::Failed(Failure::Invalid, None);
     }
     let client = match crate::http::builder()

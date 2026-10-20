@@ -566,6 +566,7 @@ enum ShortcutAction {
     ReturnToShelf,
     ToggleCursor,
     OpenSettings,
+    OpenFeedback,
     ImportBooks,
     PreviousSection,
     NextSection,
@@ -596,6 +597,7 @@ impl ShortcutAction {
             Self::ReturnToShelf => shortcuts.return_to_shelf,
             Self::ToggleCursor => shortcuts.toggle_cursor,
             Self::OpenSettings => shortcuts.open_settings,
+            Self::OpenFeedback => shortcuts.open_feedback,
             Self::ImportBooks => shortcuts.import_books,
             Self::PreviousSection => shortcuts.previous_section,
             Self::NextSection => shortcuts.next_section,
@@ -626,6 +628,7 @@ impl ShortcutAction {
             Self::ReturnToShelf => shortcuts.return_to_shelf = binding,
             Self::ToggleCursor => shortcuts.toggle_cursor = binding,
             Self::OpenSettings => shortcuts.open_settings = binding,
+            Self::OpenFeedback => shortcuts.open_feedback = binding,
             Self::ImportBooks => shortcuts.import_books = binding,
             Self::PreviousSection => shortcuts.previous_section = binding,
             Self::NextSection => shortcuts.next_section = binding,
@@ -660,6 +663,21 @@ enum UpdateCheckStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn feedback_shortcut_can_be_customized_and_checked_for_conflicts() {
+        let mut shortcuts = ShortcutPreferences::default();
+        assert_eq!(ShortcutAction::OpenFeedback.binding(&shortcuts), egui::KeyboardShortcut::new(
+            egui::Modifiers::CTRL | egui::Modifiers::ALT, egui::Key::P));
+        assert!(!shortcuts.has_conflicts());
+        let custom = egui::KeyboardShortcut::new(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::P);
+        ShortcutAction::OpenFeedback.set_binding(&mut shortcuts, custom);
+        let restored: ShortcutPreferences = serde_json::from_value(serde_json::to_value(&shortcuts).unwrap()).unwrap();
+        assert_eq!(ShortcutAction::OpenFeedback.binding(&restored), custom);
+        let conflicting = shortcuts.open_settings;
+        ShortcutAction::OpenFeedback.set_binding(&mut shortcuts, conflicting);
+        assert!(shortcuts.has_conflicts());
+    }
 
     #[test]
     fn repeated_layout_request_still_reapplies_the_active_reader() {

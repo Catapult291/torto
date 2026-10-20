@@ -1,0 +1,17 @@
+[package]
+name = "rebook-windows-text-input"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+egui.workspace = true
+winit.workspace = true
+windows-core = "0.62.2"
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation", "Win32_System_Com", "Win32_System_Ole",
+    "Win32_System_Variant", "Win32_Graphics_Gdi",
+    "Win32_UI_TextServices", "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }

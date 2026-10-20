@@ -408,6 +408,7 @@ impl GpuState {
         app: &mut DesktopApp,
         egui_ctx: &egui::Context,
         egui_state: &mut egui_winit::State,
+        #[cfg(target_os = "windows")] native_input: &mut Option<rebook_windows_text_input::TextInput>,
     ) -> Result<(), String> {
         let frame_started = std::time::Instant::now();
         if !window_can_render(window) {
@@ -418,7 +419,9 @@ impl GpuState {
         let frame_state = WindowFrameState::capture(window);
         self.resize(frame_state.size);
 
-        let raw_input = self.take_egui_input(window, egui_state);
+        let mut raw_input = self.take_egui_input(window, egui_state);
+        #[cfg(target_os = "windows")]
+        if let Some(native) = native_input { native.begin_frame(egui_ctx, &mut raw_input); }
         let mut viewport_info = root_viewport_info(&raw_input);
         let mut plan = None;
         let previous_texture = self.page_texture();
@@ -431,6 +434,15 @@ impl GpuState {
         // ScaleFactorChanged is applied by begin_pass, so read this only after
         // run_ui instead of using the previous frame's scale.
         let pixels_per_point = egui_ctx.pixels_per_point();
+        #[cfg(target_os = "windows")]
+        if let Some(native) = native_input {
+            if native.end_frame(egui_ctx, pixels_per_point) {
+                output.platform_output.ime = None;
+                // Do not let egui-winit re-associate an IMM context or interrupt
+                // an active TSF composition when updating candidate geometry.
+                egui_state.set_allow_ime(false);
+            }
+        }
         egui_state.handle_platform_output(window, std::mem::take(&mut output.platform_output));
         process_root_viewport_commands(window, egui_ctx, &mut viewport_info, &mut output);
         let platform_finished = frame_started.elapsed();

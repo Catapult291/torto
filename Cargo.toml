@@ -11,6 +11,7 @@ members = [
     "crates/reader",
     "crates/renderer",
     "crates/windows-window-background",
+    "crates/windows-text-input",
 ]
 exclude = [
     "third_party/hayro",

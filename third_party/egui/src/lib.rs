@@ -405,6 +405,7 @@ mod input_state;
 mod interaction;
 pub mod introspection;
 pub mod layers;
+pub mod native_text_input;
 mod layout;
 pub mod load;
 mod memory;

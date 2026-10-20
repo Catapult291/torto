@@ -19,54 +19,7 @@ use std::{
 const INDEX_BUDGET: usize = 2 * 1024 * 1024;
 const PIXEL_BUDGET: usize = 32 * 1024 * 1024;
 
-/// Match the settings dialog's 180 ms fade, retaining pixels until dismissal ends.
-/// Use an absolute deadline so returning to an unfocused window finishes the fade
-/// without leaving a paused animation requesting frames indefinitely.
-pub(super) struct PreviewMotion {
-    opened_at: f64,
-    closing: Option<(f64, f32)>,
-}
-
-impl PreviewMotion {
-    const DURATION: f64 = 0.18;
-
-    pub(super) fn new(ctx: &egui::Context) -> Self {
-        Self {
-            opened_at: ctx.input(|i| i.time),
-            closing: None,
-        }
-    }
-
-    pub(super) fn is_closing(&self) -> bool {
-        self.closing.is_some()
-    }
-
-    fn opacity_at(&self, now: f64) -> f32 {
-        match self.closing {
-            Some((started, from)) => {
-                from * (1.0 - ((now - started) / Self::DURATION).clamp(0.0, 1.0) as f32)
-            }
-            None => ((now - self.opened_at) / Self::DURATION).clamp(0.0, 1.0) as f32,
-        }
-    }
-
-    pub(super) fn close(&mut self, ctx: &egui::Context) {
-        if !self.is_closing() {
-            let now = ctx.input(|i| i.time);
-            self.closing = Some((now, self.opacity_at(now)));
-            ctx.request_repaint();
-        }
-    }
-
-    pub(super) fn opacity(&self, ctx: &egui::Context) -> f32 {
-        let now = ctx.input(|i| i.time);
-        let started = self.closing.map_or(self.opened_at, |(time, _)| time);
-        if now < started + Self::DURATION && ctx.input(|i| i.focused) {
-            ctx.request_repaint_after(std::time::Duration::from_millis(16));
-        }
-        self.opacity_at(now)
-    }
-}
+pub(super) use crate::ui::image_preview::PreviewMotion;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Target {
@@ -1324,7 +1277,7 @@ impl super::DesktopReader {
                         .map(egui::TextureHandle::size_vec2)
                         .collect();
                     let natural = media_paper_size(active.size, &captions);
-                    let fit = super::egui_view::preview_fit_scale(
+                    let fit = crate::ui::image_preview::preview_fit_scale(
                         natural,
                         available.size().max(egui::Vec2::splat(1.0)),
                     );

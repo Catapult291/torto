@@ -1138,7 +1138,7 @@ impl ShelfFeature {
                                 icon_button(ui, Icon::MessageCircleQuestion)
                             })
                             .inner
-                            .on_hover_text(self.language.text("反馈与建议", "Feedback"))
+                            .on_hover_text(self.language.text("反馈问题", "Report an issue"))
                             .clicked()
                         {
                             self.feedback_requested = true;

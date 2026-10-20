@@ -2,6 +2,8 @@ mod application;
 mod clipboard;
 #[cfg(test)]
 mod egui_alpha_tests;
+#[cfg(test)]
+mod native_text_input_tests;
 mod egui_surface;
 mod gpu;
 mod reader_layers;
@@ -11,6 +13,7 @@ mod repaint;
 
 pub(crate) use application::run;
 pub(crate) use clipboard::images_without_text;
+pub(crate) use clipboard::feedback_images;
 
 pub(crate) enum UserEvent {
     Feedback(crate::feedback::Message),
@@ -36,6 +39,8 @@ pub(crate) enum UserEvent {
     ReaderChatStream(crate::reader::ChatStreamMessage),
     ReaderChat(crate::reader::ChatTaskMessage),
     ReaderChatPaste(crate::reader::ChatPasteMessage),
+    FeedbackImages(crate::feedback::screenshots::Message),
+    FeedbackPreview(crate::feedback::screenshots::PreviewMessage),
     ReaderTranslation(crate::reader::TranslationTaskMessage),
     ReaderTocTranslation(crate::reader::TocTranslationTaskMessage),
     ReaderPdfToc(crate::reader::PdfTocTaskMessage),
