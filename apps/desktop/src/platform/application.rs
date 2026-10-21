@@ -34,10 +34,7 @@ fn app_icon() -> Option<Icon> {
 }
 
 pub(crate) fn run(app: DesktopApp) -> Result<(), Box<dyn std::error::Error>> {
-    let mut builder = EventLoop::<UserEvent>::with_user_event();
-    #[cfg(target_os = "windows")]
-    rebook_windows_text_input::configure_event_loop(&mut builder);
-    let event_loop = builder.build()?;
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
     #[cfg(target_os = "macos")]
     let _open_file_handler = rebook_macos_open_file::install({

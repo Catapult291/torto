@@ -110,6 +110,34 @@ fn tsf_reads_complete_multiline_text_in_chunks_even_across_surrogate_pairs() -> 
 }
 
 #[test]
+fn tsf_candidate_geometry_keeps_visible_composition_and_caret_anchors_unclipped() -> Result<()> {
+    let (_, data) = fixture("alpha ni");
+    let mut data = data.borrow_mut();
+    data.start = 8;
+    data.end = 8;
+    data.composition = Some(6..8);
+    let caret = egui::Rect::from_min_size(egui::pos2(100.0, 60.0), egui::vec2(1.0, 20.0));
+    data.snapshot.as_mut().unwrap().cursor_rect = caret;
+    assert_eq!(text_bounds(&data, 6, 8)?, (caret, false));
+    assert_eq!(text_bounds(&data, 8, 8)?, (caret, false));
+    assert_eq!(
+        text_bounds(&data, 0, 5)?,
+        (data.snapshot.as_ref().unwrap().rect, false)
+    );
+    data.snapshot.as_mut().unwrap().cursor_rect = caret.translate(egui::vec2(399.5, 0.0));
+    let (visible, clipped) = text_bounds(&data, 6, 8)?;
+    assert!(
+        !clipped,
+        "caret padding at the editor edge does not hide the composed text"
+    );
+    assert_eq!(visible.right(), 500.0);
+    assert!(visible.width() > 0.0);
+    data.snapshot.as_mut().unwrap().cursor_rect = caret.translate(egui::vec2(500.0, 0.0));
+    assert_eq!(text_bounds(&data, 6, 8)?, (egui::Rect::ZERO, true));
+    Ok(())
+}
+
+#[test]
 fn tsf_enforces_read_write_locks_and_rejects_invalid_utf16_edits() -> Result<()> {
     let (store, data) = fixture("a🙂b");
     assert_eq!(

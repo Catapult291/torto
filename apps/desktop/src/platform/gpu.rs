@@ -438,8 +438,9 @@ impl GpuState {
         if let Some(native) = native_input {
             if native.end_frame(egui_ctx, pixels_per_point) {
                 output.platform_output.ime = None;
-                // Do not let egui-winit re-associate an IMM context or interrupt
-                // an active TSF composition when updating candidate geometry.
+                // TextInput owns native IME enable/disable while TSF is active.
+                // This changes only egui-winit's bookkeeping, so its None output
+                // cannot disable IME or re-associate IMM during composition.
                 egui_state.set_allow_ime(false);
             }
         }

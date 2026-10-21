@@ -1,84 +1,23 @@
 //! Windows TSF host for egui TextEdit. All COM access is confined to the window
 //! thread; there is no polling, global keyboard hook, clipboard or worker I/O.
+//! Keyboard dispatch stays with Windows/winit's IMM/TSF bridge. A second
+//! ITfKeystrokeMgr message filter processes hybrid IMEs' Shift transitions twice.
 #![cfg(windows)]
 
 mod store;
 #[cfg(test)]
 mod tests;
 use egui::native_text_input::{self, Edit, Snapshot};
-use std::{
-    cell::RefCell,
-    rc::{Rc, Weak},
-    sync::Arc,
-};
+use std::{cell::RefCell, rc::Rc, sync::Arc};
 use store::{Data, Store};
 use windows::{
-    Win32::{
-        Foundation::*,
-        System::Com::*,
-        UI::{TextServices::*, WindowsAndMessaging::*},
-    },
+    Win32::{Foundation::*, System::Com::*, UI::TextServices::*},
     core::Interface,
 };
 use winit::{
-    event_loop::EventLoopBuilder,
-    platform::windows::EventLoopBuilderExtWindows,
     raw_window_handle::{HasWindowHandle, RawWindowHandle},
     window::Window,
 };
-
-thread_local! { static ACTIVE: RefCell<Option<(Weak<RefCell<Data>>, ITfKeystrokeMgr)>> = const { RefCell::new(None) }; }
-
-/// Install the winit pre-TranslateMessage filter on the UI thread. Keys consumed
-/// by TSF never become duplicate WM_CHAR / ordinary egui input events.
-pub fn configure_event_loop<T>(builder: &mut EventLoopBuilder<T>) {
-    builder.with_msg_hook(|raw| {
-        // SAFETY: winit supplies a live MSG for the duration of this callback.
-        let message = unsafe { &*raw.cast::<MSG>() };
-        if !matches!(
-            message.message,
-            WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP
-        ) {
-            return false;
-        }
-        ACTIVE.with(|slot| {
-            let Some((data, keys)) = slot.borrow().clone() else {
-                return false;
-            };
-            let Some(data) = data.upgrade() else {
-                return false;
-            };
-            let Some(hwnd) = data
-                .try_borrow()
-                .ok()
-                .filter(|d| d.active && d.snapshot.is_some())
-                .map(|d| d.hwnd)
-            else {
-                return false;
-            };
-            if message.hwnd != hwnd {
-                return false;
-            }
-            // SAFETY: the keystroke manager belongs to this STA; there are no
-            // outstanding RefCell borrows while COM re-enters the text store.
-            unsafe {
-                if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
-                    keys.TestKeyDown(message.wParam, message.lParam)
-                        .is_ok_and(|eat| eat.as_bool())
-                        && keys
-                            .KeyDown(message.wParam, message.lParam)
-                            .is_ok_and(|eat| eat.as_bool())
-                } else {
-                    keys.TestKeyUp(message.wParam, message.lParam)
-                        .is_ok_and(|eat| eat.as_bool())
-                        && keys
-                            .KeyUp(message.wParam, message.lParam)
-                            .is_ok_and(|eat| eat.as_bool())
-                }
-            }
-        })
-    });
-}
 
 pub struct TextInput {
     client: u32,
@@ -139,8 +78,6 @@ impl TextInput {
                     let _ = manager.Deactivate();
                     return Err(error);
                 }
-                let keys = manager.cast::<ITfKeystrokeMgr>()?;
-                ACTIVE.with(|slot| *slot.borrow_mut() = Some((Rc::downgrade(&data), keys)));
                 Ok(Self {
                     client,
                     failed: false,
@@ -264,6 +201,12 @@ impl TextInput {
         unsafe {
             if new_id.is_some() && !self.data.borrow().active {
                 let hwnd = self.data.borrow().hwnd;
+                // winit creates windows with IME disabled. Restoring the native
+                // context is also required by hybrid IMM/TSF input methods for
+                // their candidate UI and Shift mode switching. Do this before
+                // associating our document: enabling IMM can change TSF focus.
+                // Never re-associate IMM on idle frames or composition updates.
+                self._window.set_ime_allowed(true);
                 // SetFocus can synchronously activate the TIP, which must see a
                 // writable store during its OnSetFocus callback, not one frame later.
                 self.data.borrow_mut().active = true;
@@ -275,6 +218,7 @@ impl TextInput {
                     }
                 } else {
                     self.data.borrow_mut().active = false;
+                    self._window.set_ime_allowed(false);
                     self.failed = true;
                 }
             }
@@ -316,8 +260,6 @@ impl TextInput {
             self.context = context;
             self._store = store;
             self.data = data;
-            let keys = self.manager.cast::<ITfKeystrokeMgr>()?;
-            ACTIVE.with(|slot| *slot.borrow_mut() = Some((Rc::downgrade(&self.data), keys)));
             Ok(())
         }
     }
@@ -337,6 +279,7 @@ impl TextInput {
             let _ = associate_focus(&self.manager, hwnd, self.previous.as_ref());
             let _ = self.manager.SetFocus(self.previous.as_ref());
         }
+        self._window.set_ime_allowed(false);
     }
 }
 // AssociateFocus may successfully return a null previous document. The generated
@@ -361,9 +304,6 @@ unsafe fn associate_focus(
 impl Drop for TextInput {
     fn drop(&mut self) {
         self.detach();
-        ACTIVE.with(|slot| {
-            slot.borrow_mut().take();
-        });
         // SAFETY: balancing references/activation on the same STA as new().
         unsafe {
             let _ = self.document.Pop(TF_POPF_ALL);

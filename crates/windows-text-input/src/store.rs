@@ -513,17 +513,14 @@ impl ITextStoreACP_Impl for Store_Impl {
         }
         let data = self.data.borrow();
         data.readable()?;
-        data.range(start, end)?;
-        let snapshot = data.snapshot.as_ref().ok_or(TS_E_NOLAYOUT)?;
-        let caret = start == data.start && end == data.end;
-        let bounds = if caret {
-            snapshot.cursor_rect
-        } else {
-            snapshot.rect
-        };
+        let (bounds, is_clipped) = text_bounds(&data, start, end)?;
         unsafe {
-            *rect = screen_rect(&data, bounds)?;
-            *clipped = (!caret).into();
+            *rect = if bounds == egui::Rect::ZERO {
+                RECT::default()
+            } else {
+                screen_rect(&data, bounds)?
+            };
+            *clipped = is_clipped.into();
         }
         Ok(())
     }
@@ -540,6 +537,30 @@ impl ITextStoreACP_Impl for Store_Impl {
             return Err(E_INVALIDARG.into());
         }
         Ok(self.data.borrow().hwnd)
+    }
+}
+fn text_bounds(data: &Data, start: i32, end: i32) -> Result<(egui::Rect, bool)> {
+    let range = data.range(start, end)?;
+    let snapshot = data.snapshot.as_ref().ok_or(TS_E_NOLAYOUT)?;
+    let at_selection = start == data.start && end == data.end;
+    let in_composition = data.composition.as_ref().is_some_and(|composition| {
+        range.start >= composition.start && range.end <= composition.end
+    });
+    let bounds = if at_selection || in_composition {
+        snapshot.cursor_rect
+    } else {
+        snapshot.rect
+    };
+    // pfClipped describes text visibility, not whether this is the selection
+    // or whether the caret's paint box extends past a padded editor's edge.
+    // The bridge publishes visible editors and a caret anchor, not per-glyph
+    // bounds. Clamp that anchor for placement without marking visible input as
+    // clipped (which hides native candidates). A fully offscreen anchor is hidden.
+    let visible = bounds.intersect(snapshot.rect);
+    if visible.min.x > visible.max.x || visible.min.y > visible.max.y {
+        Ok((egui::Rect::ZERO, true))
+    } else {
+        Ok((visible, false))
     }
 }
 fn screen_rect(data: &Data, rect: egui::Rect) -> Result<RECT> {

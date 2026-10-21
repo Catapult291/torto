@@ -3,7 +3,18 @@ use egui::{
     text::{CCursor, CCursorRange},
     *,
 };
+use windows::Win32::UI::Input::Ime::{HIMC, ImmGetContext, ImmReleaseContext};
+use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_IMMENABLED};
 use windows::core::{Result, implement};
+use winit::platform::windows::EventLoopBuilderExtWindows;
+
+fn ime_context(hwnd: HWND) -> HIMC {
+    let ime = unsafe { ImmGetContext(hwnd) };
+    if !ime.is_invalid() {
+        assert!(unsafe { ImmReleaseContext(hwnd, ime) }.as_bool());
+    }
+    ime
+}
 
 #[implement(ITfEditSession)]
 struct ReplaceSession {
@@ -45,7 +56,6 @@ impl ITfEditSession_Impl for ReplaceSession_Impl {
 fn tsf_real_context_reads_and_replaces_egui_text_and_isolates_old_editor_ranges() -> Result<()> {
     let mut builder = winit::event_loop::EventLoop::builder();
     builder.with_any_thread(true);
-    configure_event_loop(&mut builder);
     let event_loop = builder.build().map_err(|_| E_FAIL)?;
     // Never show or focus a native window: this tests the actual TSF context on
     // its own thread without stealing keyboard focus or sending user data.
@@ -72,6 +82,22 @@ fn tsf_real_context_reads_and_replaces_egui_text_and_isolates_old_editor_ranges(
         native.data.borrow().active,
         "TSF association must succeed even without a previous document"
     );
+    assert_eq!(
+        unsafe { native.context.GetStatus()? }.dwDynamicFlags,
+        0,
+        "TSF must observe the focused editor as writable"
+    );
+    let hwnd = native.data.borrow().hwnd;
+    // A writable TSF store alone is not enough for hybrid IMM/TSF input methods.
+    // winit starts with the window's IMM context disabled; it must be restored
+    // when the native editor takes over, even though legacy IME events are filtered.
+    if unsafe { GetSystemMetrics(SM_IMMENABLED) } != 0 {
+        let ime = ime_context(hwnd);
+        assert!(
+            !ime.is_invalid(),
+            "the focused native editor must enable the window IME context"
+        );
+    }
     let old_context = native.context.clone();
     let called = Rc::new(RefCell::new(false));
     let session: ITfEditSession = ReplaceSession {
@@ -141,5 +167,32 @@ fn tsf_real_context_reads_and_replaces_egui_text_and_isolates_old_editor_ranges(
     assert!(idle.events.is_empty());
     assert!(native_text_input::blocks_submit(&ctx));
     native.data.borrow_mut().composition = None;
+    let snapshot = native.data.borrow().snapshot.clone().unwrap();
+    let context = native.context.clone();
+    let ime = ime_context(hwnd);
+    native.sync(Some(snapshot.clone()), 1.0);
+    assert_eq!(
+        native.context, context,
+        "idle frames must keep the same TSF document"
+    );
+    assert_eq!(
+        ime_context(hwnd),
+        ime,
+        "idle frames must not reset the IME context"
+    );
+    native.set_focused(false);
+    assert!(!native.data.borrow().active);
+    assert!(
+        ime_context(hwnd).is_invalid(),
+        "detaching must release native IME ownership"
+    );
+    native.sync(Some(snapshot), 1.0);
+    assert!(native.data.borrow().active);
+    if unsafe { GetSystemMetrics(SM_IMMENABLED) } != 0 {
+        assert!(
+            !ime_context(hwnd).is_invalid(),
+            "refocusing must restore IME input"
+        );
+    }
     Ok(())
 }
